@@ -1,0 +1,23 @@
+# Dev GP search config (see scripts/run_gp.py).
+universe: sp500-lite
+as_of: "2026-06-01"      # point-in-time universe membership date
+train_fraction: 0.7      # leading fraction of dates used for fitness; the rest is
+                         # a monitoring-only holdout (the LOCKED test split is Phase 3)
+
+gp:
+  population_size: 200
+  generations: 25
+  tournament_size: 3
+  crossover_rate: 0.8
+  subtree_mutation_rate: 0.1
+  point_mutation_rate: 0.1
+  max_depth: 6
+  max_nodes: 40
+  parsimony: 0.001
+  elitism: 1
+  ic_method: spearman
+  min_names: 5
+  horizon: 1
+  min_depth: 2
+  seed: 0
+  time_budget_s: null

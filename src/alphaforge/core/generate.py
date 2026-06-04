@@ -75,6 +75,16 @@ class RandomTreeGenerator:
         )
         return node
 
+    def grow_subtree(
+        self, target: DType, *, max_depth: int, max_nodes: int, grow: bool = True
+    ) -> Node:
+        """Generate a fresh, type-valid subtree of type ``target`` within the given budgets.
+
+        Public entry point for crossover/mutation in :mod:`alphaforge.core.gp`.
+        """
+        node, _ = self._build(target, max(1, max_depth), max(1, max_nodes), grow)
+        return node
+
     def ramped_half_and_half(
         self, n: int, *, min_depth: int = 2, max_depth: int | None = None
     ) -> list[Node]:

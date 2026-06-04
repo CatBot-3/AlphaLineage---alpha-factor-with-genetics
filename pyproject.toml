@@ -17,6 +17,7 @@ dependencies = [
     "requests>=2.31",
     "yfinance>=0.2.40",
     "python-dotenv>=0.21",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
