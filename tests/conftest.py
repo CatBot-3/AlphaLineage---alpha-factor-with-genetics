@@ -99,3 +99,30 @@ def signal_panel():
     volume = pd.DataFrame(1e6 * np.exp(0.3 * latent), index=dates, columns=symbols)
     panel = Panel.from_prices(open=open_, high=high, low=low, close=close, volume=volume)
     return panel, injected
+
+
+@pytest.fixture
+def noise_panel():
+    """A pure-noise panel: random returns and independent random volume, no signal at all."""
+    from alphaforge.core.panel import Panel
+
+    rng = np.random.default_rng(123)
+    n_days, n_syms = 160, 12
+    dates = pd.date_range("2018-01-01", periods=n_days, freq="B")
+    symbols = [f"S{i}" for i in range(n_syms)]
+
+    ret = rng.normal(0.0, 0.02, (n_days, n_syms))
+    close = pd.DataFrame(100.0 * np.cumprod(1.0 + ret, axis=0), index=dates, columns=symbols)
+    open_ = close.shift(1).fillna(close.iloc[0])
+    high = pd.DataFrame(
+        np.maximum(open_.to_numpy(), close.to_numpy()) * (1.0 + rng.uniform(0, 0.01, close.shape)),
+        index=dates,
+        columns=symbols,
+    )
+    low = pd.DataFrame(
+        np.minimum(open_.to_numpy(), close.to_numpy()) * (1.0 - rng.uniform(0, 0.01, close.shape)),
+        index=dates,
+        columns=symbols,
+    )
+    volume = pd.DataFrame(rng.uniform(1e6, 5e6, close.shape), index=dates, columns=symbols)
+    return Panel.from_prices(open=open_, high=high, low=low, close=close, volume=volume)

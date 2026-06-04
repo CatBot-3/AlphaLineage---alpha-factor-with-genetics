@@ -115,6 +115,11 @@ class GP:
         self.history: list[dict[str, float]] = []
         self._cache: dict[str, tuple[float, dict[str, float]]] = {}
 
+    @property
+    def trial_count(self) -> int:
+        """Distinct factors scored so far — the deflation's number of trials."""
+        return len(self._cache)
+
     # --- scoring -----------------------------------------------------------------
     def _score(self, tree: Node) -> tuple[float, dict[str, float]]:
         key = to_json(tree)

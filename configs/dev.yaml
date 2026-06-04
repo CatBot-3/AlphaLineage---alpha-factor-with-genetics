@@ -1,8 +1,10 @@
 # Dev GP search config (see scripts/run_gp.py).
 universe: sp500-lite
 as_of: "2026-06-01"      # point-in-time universe membership date
-train_fraction: 0.7      # leading fraction of dates used for fitness; the rest is
-                         # a monitoring-only holdout (the LOCKED test split is Phase 3)
+# Time-ordered split (fractions of dates). The TEST remainder is locked OOS (invariant 1).
+train: 0.6
+valid: 0.2
+embargo: 5               # gap (trading days) between adjacent segments to prevent leakage
 
 gp:
   population_size: 200
