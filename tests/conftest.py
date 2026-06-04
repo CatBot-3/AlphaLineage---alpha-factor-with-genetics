@@ -32,3 +32,30 @@ def synthetic_prices() -> pd.DataFrame:
         },
         index=idx,
     )
+
+
+@pytest.fixture
+def synthetic_panel():
+    """A deterministic 60-day x 6-symbol panel with all operand fields populated."""
+    from alphaforge.core.panel import Panel
+
+    rng = np.random.default_rng(42)
+    n_days, n_syms = 60, 6
+    dates = pd.date_range("2021-01-01", periods=n_days, freq="B")
+    symbols = [f"S{i}" for i in range(n_syms)]
+
+    rets = rng.normal(0.0005, 0.02, size=(n_days, n_syms))
+    close = pd.DataFrame(100.0 * np.cumprod(1.0 + rets, axis=0), index=dates, columns=symbols)
+    open_ = close.shift(1).fillna(close.iloc[0])
+    high = pd.DataFrame(
+        np.maximum(open_.to_numpy(), close.to_numpy()) * (1.0 + rng.uniform(0, 0.01, close.shape)),
+        index=dates,
+        columns=symbols,
+    )
+    low = pd.DataFrame(
+        np.minimum(open_.to_numpy(), close.to_numpy()) * (1.0 - rng.uniform(0, 0.01, close.shape)),
+        index=dates,
+        columns=symbols,
+    )
+    volume = pd.DataFrame(rng.uniform(1e6, 5e6, close.shape), index=dates, columns=symbols)
+    return Panel.from_prices(open=open_, high=high, low=low, close=close, volume=volume)
