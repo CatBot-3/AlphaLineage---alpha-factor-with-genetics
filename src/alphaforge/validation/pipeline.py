@@ -8,7 +8,7 @@ very end, after a one-shot ``unlock()`` — any earlier access raises.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import pandas as pd
@@ -19,7 +19,7 @@ from alphaforge.core.panel import Panel
 from alphaforge.core.tree import Node
 from alphaforge.validation.deflated_sharpe import deflated_sharpe_ratio, sharpe_ratio
 from alphaforge.validation.pbo import pbo as compute_pbo
-from alphaforge.validation.performance import long_short_returns, returns_matrix
+from alphaforge.validation.performance import tree_returns
 from alphaforge.validation.splits import Split
 
 
@@ -70,12 +70,20 @@ def judge(
     ic_method: str = "spearman",
     min_names: int = 5,
     n_blocks: int = 16,
+    returns_fn: Callable[[Node], pd.Series] | None = None,
+    n_schemes: int = 1,
 ) -> OverfittingReport:
-    """Re-judge ``best_tree`` out-of-sample with a deflated Sharpe and PBO over ``trials``."""
+    """Re-judge ``best_tree`` out-of-sample with a deflated Sharpe and PBO over ``trials``.
+
+    ``returns_fn`` injects the per-tree return series (default: gross long-short; pass a
+    cost-aware closure to deflate on *net* returns). ``n_schemes`` multiplies the trial count
+    — trying K weighting schemes is another overfitting axis, so it deflates harder.
+    """
     fwd = forward_returns(panel)
     factor = evaluate(best_tree, panel)
     if not isinstance(factor, pd.DataFrame):
         raise TypeError("best_tree must evaluate to a panel (SERIES/SIGNAL)")
+    returns_of = returns_fn or (lambda tree: tree_returns(tree, panel, fwd))
 
     def ic_on(dates: pd.DatetimeIndex) -> float:
         return mean_ic(
@@ -86,13 +94,16 @@ def judge(
             min_names=min_names,
         )
 
+    def research(series: pd.Series) -> pd.Series:
+        return series.loc[series.index.isin(split.research)]
+
     # Deflated Sharpe of the best, with the trial-Sharpe spread as the deflation variance.
-    best_research = long_short_returns(factor, fwd)
-    best_research = best_research.loc[best_research.index.isin(split.research)]
-    trial_returns = returns_matrix(trials, panel, fwd, dates=split.research)
+    best_research = research(returns_of(best_tree))
+    trial_returns = pd.DataFrame({i: research(returns_of(t)) for i, t in enumerate(trials)})
     trial_sharpes = trial_returns.apply(sharpe_ratio, axis=0).dropna()
     var_sr = float(trial_sharpes.var(ddof=1)) if len(trial_sharpes) > 1 else 0.0
-    dsr = deflated_sharpe_ratio(best_research, n_trials, var_sr)
+    effective_trials = n_trials * max(1, n_schemes)
+    dsr = deflated_sharpe_ratio(best_research, effective_trials, var_sr)
     pbo_value = float(compute_pbo(trial_returns, n_blocks=n_blocks)["pbo"])
 
     train_ic = ic_on(split.train)
@@ -104,6 +115,6 @@ def judge(
         deflated_sharpe=dsr,
         pbo=pbo_value,
         train_ic=train_ic,
-        n_trials=n_trials,
+        n_trials=effective_trials,
         significant=bool(dsr > 0.95 and pbo_value < 0.5),
     )

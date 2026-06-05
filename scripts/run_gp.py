@@ -22,6 +22,15 @@ if _SRC.exists() and str(_SRC) not in sys.path:
 
 import yaml  # noqa: E402
 
+from alphaforge.backtest.costs import TransactionCostModel  # noqa: E402
+from alphaforge.backtest.engine import (  # noqa: E402
+    compare_schemes,
+    comparison_frame,
+    net_return_fn,
+)
+from alphaforge.backtest.portfolio import QuantileLongShort, RankProportional  # noqa: E402
+from alphaforge.core.evaluate import evaluate  # noqa: E402
+from alphaforge.core.fitness import forward_returns  # noqa: E402
 from alphaforge.core.gp import GP, GPConfig  # noqa: E402
 from alphaforge.core.panel import Panel  # noqa: E402
 from alphaforge.data.universe import sample_universe  # noqa: E402
@@ -82,6 +91,21 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     trials = [ind.tree for ind in gp.population]
+    bt = cfg.get("backtest", {})
+    costs = TransactionCostModel(
+        commission_bps=float(bt.get("commission_bps", 1.0)),
+        slippage_bps=float(bt.get("slippage_bps", 5.0)),
+    )
+    schemes = [QuantileLongShort(float(bt.get("quantile", 0.2))), RankProportional()]
+    fwd = forward_returns(panel)
+    best_factor = evaluate(best.tree, panel)
+
+    print("\nbest factor:", best.tree)
+    print("\nweighting schemes on the locked test split (net of costs):")
+    results = compare_schemes(best_factor, panel, fwd, schemes, costs, dates=split.test)
+    print(comparison_frame(results).round(4).to_string(index=False))
+
+    # The default scheme drives the deflated verdict; the scheme count deflates it harder.
     report = judge(
         best.tree,
         trials,
@@ -89,15 +113,18 @@ def main(argv: list[str] | None = None) -> int:
         panel,
         LockedTestSet(split.test),
         n_trials=gp.trial_count,
+        n_schemes=len(schemes),
+        returns_fn=net_return_fn(panel, fwd, schemes[0], costs),
         min_names=gp_config.min_names,
     )
-
-    print("\nbest factor:", best.tree)
-    print(f"trials searched      = {report.n_trials}")
+    print(
+        f"\ntrials searched      = {report.n_trials}  "
+        f"({gp.trial_count} factors x {len(schemes)} schemes)"
+    )
     print(f"train    |rank IC|   = {report.train_ic:.4f}")
     print(f"OOS test |rank IC|   = {report.oos_ic:.4f}   <- default, honest metric")
-    print(f"deflated Sharpe      = {report.deflated_sharpe:.4f}   (>0.95 significant)")
-    print(f"PBO                  = {report.pbo:.4f}   (>=0.5 overfit red flag)")
+    print(f"net deflated Sharpe  = {report.deflated_sharpe:.4f}   (>0.95 significant)")
+    print(f"PBO (net)            = {report.pbo:.4f}   (>=0.5 overfit red flag)")
     verdict = "PLAUSIBLE" if report.significant else "NOT SIGNIFICANT (likely overfit / luck)"
     print(f"verdict              = {verdict}")
     print("\n" + _DISCLAIMER)

@@ -23,3 +23,9 @@ gp:
   min_depth: 2
   seed: 0
   time_budget_s: null
+
+# Backtest / portfolio (Phase 4). The verdict deflates on NET (after-cost) returns.
+backtest:
+  quantile: 0.2          # top/bottom fraction for the quantile long/short scheme
+  commission_bps: 1.0
+  slippage_bps: 5.0
