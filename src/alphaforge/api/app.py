@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from alphaforge.api.jobs import JobStore
@@ -21,6 +22,13 @@ from alphaforge.core.panel import Panel
 from alphaforge.data.universe import sample_universe
 
 app = FastAPI(title="AlphaForge", version="0.1.0")
+# Allow the browser `app` build (Vite dev server) to call the local backend.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 _jobs = JobStore()
 
 _DEFAULT_UNIVERSE = "sp500-lite"

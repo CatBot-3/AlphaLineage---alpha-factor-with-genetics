@@ -51,5 +51,6 @@ def run_search(
         "best_factor": to_json(best.tree),
         "report": report_dict,
         "generations": gp.generation,
+        "history": gp.history,
         "lineage": store.to_dict(),
     }

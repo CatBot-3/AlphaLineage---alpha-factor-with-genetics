@@ -1,0 +1,2 @@
+VITE_DATA_SOURCE=app
+VITE_API_BASE=http://localhost:8000
