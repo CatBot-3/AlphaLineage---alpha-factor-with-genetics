@@ -18,6 +18,8 @@ dependencies = [
     "yfinance>=0.2.40",
     "python-dotenv>=0.21",
     "pyyaml>=6.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,7 @@ dev = [
     "hypothesis>=6.100",
     "requests-mock>=1.12",
     "types-requests>=2.31",
+    "httpx>=0.27",
 ]
 
 [tool.hatch.build.targets.wheel]

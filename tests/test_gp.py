@@ -75,8 +75,10 @@ def test_tournament_selects_best(signal_panel):
     panel, _ = signal_panel
     gp = GP(GPConfig(population_size=20, tournament_size=20, seed=0), panel)
     gp.initialize()
-    # a full-population tournament must return the single best individual
-    assert gp._tournament().fitness == max(i.fitness for i in gp.population)
+    # a full-population tournament must return the single best individual (and its index)
+    best, idx = gp._tournament()
+    assert best.fitness == max(i.fitness for i in gp.population)
+    assert gp.population[idx] is best
 
 
 def test_point_mutation_tweaks_constant_and_stays_valid(signal_panel):

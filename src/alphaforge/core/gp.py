@@ -101,11 +101,14 @@ class GP:
         fwd: pd.DataFrame | None = None,
         *,
         root_type: DType = DType.SIGNAL,
+        recorder: Any | None = None,
     ) -> None:
         self.config = config
         self.panel = panel
         self.fwd = fwd if fwd is not None else forward_returns(panel, config.horizon)
         self.root_type = root_type
+        # Optional lineage recorder (duck-typed: on_init(trees), on_generation(gen, entries)).
+        self.recorder = recorder
         self.rng = random.Random(config.seed)
         self.generator = RandomTreeGenerator(
             self.rng, max_depth=config.max_depth, max_nodes=config.max_nodes, root_type=root_type
@@ -142,9 +145,12 @@ class GP:
         return Individual(tree, fitness, metrics)
 
     # --- selection & variation ---------------------------------------------------
-    def _tournament(self) -> Individual:
-        contenders = [self.rng.choice(self.population) for _ in range(self.config.tournament_size)]
-        return max(contenders, key=lambda ind: ind.fitness)
+    def _tournament(self) -> tuple[Individual, int]:
+        # Index-based selection (same RNG draws as choice(population)) so we can record parents.
+        n = len(self.population)
+        idxs = [self.rng.choice(range(n)) for _ in range(self.config.tournament_size)]
+        best = max(idxs, key=lambda i: self.population[i].fitness)
+        return self.population[best], best
 
     def _crossover(self, a: Node, b: Node) -> Node:
         path, required, _ = self.rng.choice(iter_positions(a, self.root_type))
@@ -191,16 +197,24 @@ class GP:
             return tree
         return replace_at(tree, path, Node(self.rng.choice(same).name, node.children, node.value))
 
-    def _offspring(self) -> Node:
+    def _offspring(self) -> tuple[Node, list[int], str]:
+        ops: list[str] = []
         if self.rng.random() < self.config.crossover_rate:
-            tree = self._crossover(self._tournament().tree, self._tournament().tree)
+            (parent_a, idx_a), (parent_b, idx_b) = self._tournament(), self._tournament()
+            tree = self._crossover(parent_a.tree, parent_b.tree)
+            parents = [idx_a, idx_b]
+            ops.append("crossover")
         else:
-            tree = self._tournament().tree
+            parent, idx = self._tournament()
+            tree, parents = parent.tree, [idx]
+            ops.append("reproduction")
         if self.rng.random() < self.config.subtree_mutation_rate:
             tree = self._subtree_mutation(tree)
+            ops.append("subtree_mut")
         if self.rng.random() < self.config.point_mutation_rate:
             tree = self._point_mutation(tree)
-        return tree
+            ops.append("point_mut")
+        return tree, parents, "+".join(ops)
 
     # --- the loop ----------------------------------------------------------------
     def _record(self) -> None:
@@ -223,15 +237,26 @@ class GP:
         )
         self.population = [self._individual(t) for t in trees]
         self.generation = 0
+        if self.recorder is not None:
+            self.recorder.on_init([ind.tree for ind in self.population])
         self._record()
 
     def _step(self) -> None:
-        ranked = sorted(self.population, key=lambda ind: ind.fitness, reverse=True)
-        next_pop = list(ranked[: self.config.elitism])
+        n = len(self.population)
+        order = sorted(range(n), key=lambda i: self.population[i].fitness, reverse=True)
+        entries: list[tuple[Node, list[int], str]] = []
+        next_pop: list[Individual] = []
+        for i in order[: self.config.elitism]:
+            next_pop.append(self.population[i])
+            entries.append((self.population[i].tree, [i], "elite"))
         while len(next_pop) < self.config.population_size:
-            next_pop.append(self._individual(self._offspring()))
+            tree, parents, op = self._offspring()
+            next_pop.append(self._individual(tree))
+            entries.append((tree, parents, op))
         self.population = next_pop
         self.generation += 1
+        if self.recorder is not None:
+            self.recorder.on_generation(self.generation, entries)
         self._record()
 
     def run(
