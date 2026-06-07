@@ -40,6 +40,7 @@ class Primitive:
     fn: Callable[..., pd.DataFrame] | None = None  # operators
     panel_field: str | None = None  # operands
     sampler: Callable[[random.Random], Any] | None = None  # ephemerals
+    macro_body: Any = None  # user operators: a typed body tree (Node) expanded at evaluation
 
     @property
     def arity(self) -> int:

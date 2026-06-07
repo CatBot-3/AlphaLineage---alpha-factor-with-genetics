@@ -8,6 +8,7 @@ evaluates to a wide ``date x symbol`` DataFrame; SCALAR/WINDOW nodes to a float/
 
 from __future__ import annotations
 
+from alphaforge.core.extensions import expand
 from alphaforge.core.panel import Panel
 from alphaforge.core.primitives import Kind
 from alphaforge.core.tree import EvalResult, Node
@@ -16,6 +17,8 @@ from alphaforge.core.tree import EvalResult, Node
 def evaluate(node: Node, panel: Panel) -> EvalResult:
     """Evaluate ``node`` against ``panel``."""
     prim = node.primitive
+    if prim.macro_body is not None:  # user operator: expand the macro, then evaluate
+        return evaluate(expand(node, prim.macro_body), panel)
     if prim.kind is Kind.OPERAND:
         assert prim.panel_field is not None
         return panel[prim.panel_field]

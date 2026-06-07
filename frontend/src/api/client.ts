@@ -1,6 +1,6 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
-import type { RunResult } from "./types";
+import type { OperatorSpec, PrimitiveInfo, RunResult, UniverseSpec } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
@@ -50,4 +50,36 @@ export async function fetchRun(
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   throw new Error("run timed out");
+}
+
+// --- extensibility (Phase 7) ---------------------------------------------------
+export async function getPrimitives(): Promise<PrimitiveInfo[]> {
+  const res = await fetch(`${BASE}/primitives`);
+  if (!res.ok) throw new Error(`primitives failed: ${res.status}`);
+  return (await res.json()) as PrimitiveInfo[];
+}
+
+export async function registerOperator(spec: OperatorSpec): Promise<PrimitiveInfo> {
+  const res = await fetch(`${BASE}/operators`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec),
+  });
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(detail.detail ?? `register failed: ${res.status}`);
+  }
+  return (await res.json()) as PrimitiveInfo;
+}
+
+export async function defineUniverse(
+  spec: UniverseSpec,
+): Promise<{ name: string; symbols: string[] }> {
+  const res = await fetch(`${BASE}/universes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec),
+  });
+  if (!res.ok) throw new Error(`define universe failed: ${res.status}`);
+  return (await res.json()) as { name: string; symbols: string[] };
 }

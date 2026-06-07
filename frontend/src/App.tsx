@@ -2,13 +2,18 @@ import { useEffect, useState } from "react";
 import { loadRun } from "./api/dataSource";
 import { parseFactor, type RunResult } from "./api/types";
 import { Dashboard } from "./dashboard/Dashboard";
+import { OperatorComposer } from "./extend/OperatorComposer";
+import { UniverseBuilder } from "./extend/UniverseBuilder";
 import { FactorDetail } from "./factor/FactorDetail";
 import { FactorTree } from "./factor/FactorTree";
 import type { TreeNodeData } from "./factor/treeToFlow";
 import { Genealogy } from "./genealogy/Genealogy";
 import { LineageDetail } from "./genealogy/LineageDetail";
 
-type Tab = "dashboard" | "factor" | "genealogy";
+type Tab = "dashboard" | "factor" | "genealogy" | "extend";
+
+// The Extend tab needs the live backend; only show it in the `app` build.
+const CAN_EXTEND = import.meta.env.VITE_DATA_SOURCE === "app";
 
 export function App() {
   const [run, setRun] = useState<RunResult | null>(null);
@@ -57,6 +62,11 @@ export function App() {
         <button onClick={() => setTab("genealogy")} aria-current={tab === "genealogy"}>
           Genealogy
         </button>
+        {CAN_EXTEND && (
+          <button onClick={() => setTab("extend")} aria-current={tab === "extend"}>
+            Extend
+          </button>
+        )}
       </nav>
       <main>
         {tab === "dashboard" && <Dashboard report={run.report} history={run.history} />}
@@ -74,6 +84,12 @@ export function App() {
               selectedId={selectedLineage}
               onSelect={setSelectedLineage}
             />
+          </div>
+        )}
+        {tab === "extend" && CAN_EXTEND && (
+          <div className="extend">
+            <UniverseBuilder />
+            <OperatorComposer />
           </div>
         )}
       </main>

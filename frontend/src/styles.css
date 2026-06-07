@@ -142,3 +142,74 @@ footer {
 .error {
   color: #f87171;
 }
+.ok {
+  color: #34d399;
+}
+
+.extend {
+  display: grid;
+  gap: 16px;
+}
+.panel {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 16px;
+}
+.panel h3 {
+  margin-top: 0;
+}
+.field {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  margin-right: 12px;
+}
+input,
+select {
+  background: #0b1220;
+  color: var(--ink);
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.rows {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+.rows th {
+  text-align: left;
+  color: var(--muted);
+  font-size: 12px;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+}
+.actions button,
+.composer-signature button,
+.composer-palette button {
+  background: #1d4ed8;
+  color: var(--ink);
+  border: none;
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.composer-signature {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.composer-palette {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.composer-palette button {
+  background: #334155;
+  font-size: 12px;
+}

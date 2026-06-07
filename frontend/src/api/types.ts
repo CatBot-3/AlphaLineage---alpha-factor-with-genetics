@@ -47,3 +47,30 @@ export interface RunResult {
 export function parseFactor(factor: string | FactorNode): FactorNode {
   return typeof factor === "string" ? (JSON.parse(factor) as FactorNode) : factor;
 }
+
+// --- extensibility (Phase 7) ---------------------------------------------------
+export interface PrimitiveInfo {
+  name: string;
+  kind: string; // operator | operand | ephemeral
+  arg_types: string[];
+  out_type: string;
+  user: boolean;
+}
+
+export interface OperatorSpec {
+  name: string;
+  arg_types: string[];
+  out_type: string;
+  body: FactorNode; // a typed body tree with $arg leaves
+}
+
+export interface UniverseMembership {
+  symbol: string;
+  entry: string;
+  exit?: string | null;
+}
+
+export interface UniverseSpec {
+  name: string;
+  memberships: UniverseMembership[];
+}

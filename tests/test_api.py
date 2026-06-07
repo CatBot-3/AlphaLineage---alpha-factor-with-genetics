@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from alphaforge.api.app import app, get_panel
 from alphaforge.api.jobs import JobStore
+from alphaforge.core import extensions
 
 
 @pytest.fixture
@@ -17,6 +18,12 @@ def client(synthetic_panel):
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clean_operators():
+    yield
+    extensions.clear_user_operators()
 
 
 def _poll(client: TestClient, job_id: str, *, timeout: float = 60.0) -> dict:
@@ -54,6 +61,49 @@ def test_job_lifecycle(client):
 
 def test_unknown_job_is_404(client):
     assert client.get("/runs/does-not-exist").status_code == 404
+
+
+def test_list_primitives(client):
+    primitives = client.get("/primitives").json()
+    names = {p["name"] for p in primitives}
+    assert {"ts_mean", "rank", "close"} <= names
+    assert all("arg_types" in p and "out_type" in p for p in primitives)
+
+
+def test_register_operator_and_reject_unknown(client):
+    spec = {
+        "name": "spread_api",
+        "arg_types": ["series", "series"],
+        "out_type": "series",
+        "body": {
+            "name": "sub",
+            "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+        },
+    }
+    assert client.post("/operators", json=spec).json()["name"] == "spread_api"
+    assert any(o["name"] == "spread_api" for o in client.get("/operators").json())
+
+    # a body naming a non-primitive is rejected (400), never executed
+    bad = {
+        "name": "evil",
+        "arg_types": ["series"],
+        "out_type": "series",
+        "body": {"name": "__import__"},
+    }
+    assert client.post("/operators", json=bad).status_code == 400
+
+
+def test_define_point_in_time_universe(client):
+    spec = {
+        "name": "my-universe",
+        "memberships": [
+            {"symbol": "AAA", "entry": "2020-01-01"},
+            {"symbol": "BBB", "entry": "2021-01-01", "exit": "2022-01-01"},
+        ],
+    }
+    response = client.post("/universes", json=spec)
+    assert response.status_code == 200
+    assert set(response.json()["symbols"]) == {"AAA", "BBB"}
 
 
 def test_jobstore_runs_and_captures_failure():

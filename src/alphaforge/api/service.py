@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from alphaforge.core.extensions import operator_counts
 from alphaforge.core.gp import GP, GPConfig
 from alphaforge.core.panel import Panel
 from alphaforge.core.tree import to_dict, to_json
 from alphaforge.library.store import LineageStore
 from alphaforge.validation.pipeline import LockedTestSet, judge
 from alphaforge.validation.splits import time_split
+from alphaforge.validation.trials import effective_trials
 
 
 def run_search(
@@ -28,13 +30,17 @@ def run_search(
     best = gp.run()
 
     trials = [ind.tree for ind in gp.population]
+    # The deflation's trial count grows with the search space — including any user-added
+    # operators (Phase 7) — so adding primitives makes a lucky factor harder to certify.
+    builtin, user = operator_counts()
+    n_trials = effective_trials(gp.trial_count, n_operators=builtin + user, baseline=builtin)
     report = judge(
         best.tree,
         trials,
         split,
         panel,
         LockedTestSet(split.test),
-        n_trials=gp.trial_count,
+        n_trials=n_trials,
         min_names=config.min_names,
     )
     report_dict = {
