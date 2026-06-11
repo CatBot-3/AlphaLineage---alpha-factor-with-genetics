@@ -114,3 +114,13 @@ def expand(node: Node, body: Node) -> Node:
         return b
 
     return substitute(body)
+
+
+def expand_all(node: Node) -> Node:
+    """Recursively expand every user macro in ``node`` into a built-in-only tree."""
+    prim = REGISTRY.get(node.name)
+    if prim is not None and prim.macro_body is not None:
+        return expand_all(expand(node, prim.macro_body))
+    if node.children:
+        return Node(node.name, tuple(expand_all(c) for c in node.children), node.value)
+    return node

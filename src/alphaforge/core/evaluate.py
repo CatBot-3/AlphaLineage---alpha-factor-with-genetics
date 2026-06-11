@@ -1,24 +1,27 @@
-"""P1-T5 — the vectorized evaluator.
+"""P1-T5 — the vectorized evaluator (with an optional C++ backend).
 
-Walks a tree bottom-up over a :class:`~alphaforge.core.panel.Panel`. Operand leaves
-return their panel field, ephemeral leaves return their stored constant, and operators
-apply their vectorized implementation to the evaluated children. A SERIES/SIGNAL node
-evaluates to a wide ``date x symbol`` DataFrame; SCALAR/WINDOW nodes to a float/int.
+``evaluate_python`` is the pure-Python recursive baseline (the correctness reference): operand
+leaves return their panel field, ephemeral leaves their constant, operators apply their vectorized
+implementation, and user macros expand. ``evaluate`` is the public dispatcher — it uses the C++
+backend when it is built and the tree is supported (``ALPHAFORGE_EVALUATOR=auto`` default), and
+otherwise falls back transparently to ``evaluate_python``. The two are pinned identical by the
+parity test, so the backend choice never changes a result.
 """
 
 from __future__ import annotations
 
+from alphaforge.core import cpp
 from alphaforge.core.extensions import expand
 from alphaforge.core.panel import Panel
 from alphaforge.core.primitives import Kind
 from alphaforge.core.tree import EvalResult, Node
 
 
-def evaluate(node: Node, panel: Panel) -> EvalResult:
-    """Evaluate ``node`` against ``panel``."""
+def evaluate_python(node: Node, panel: Panel) -> EvalResult:
+    """Pure-Python recursive evaluation (the correctness baseline)."""
     prim = node.primitive
     if prim.macro_body is not None:  # user operator: expand the macro, then evaluate
-        return evaluate(expand(node, prim.macro_body), panel)
+        return evaluate_python(expand(node, prim.macro_body), panel)
     if prim.kind is Kind.OPERAND:
         assert prim.panel_field is not None
         return panel[prim.panel_field]
@@ -26,5 +29,17 @@ def evaluate(node: Node, panel: Panel) -> EvalResult:
         assert node.value is not None
         return node.value
     assert prim.fn is not None
-    args = [evaluate(child, panel) for child in node.children]
+    args = [evaluate_python(child, panel) for child in node.children]
     return prim.fn(*args)
+
+
+def evaluate(node: Node, panel: Panel) -> EvalResult:
+    """Evaluate ``node`` against ``panel``, using the C++ backend when available + supported."""
+    if cpp.backend_enabled():
+        try:
+            result = cpp.evaluate_cpp(node, panel)
+            if result is not None:
+                return result
+        except Exception:  # noqa: BLE001 - any backend failure falls back to Python
+            pass
+    return evaluate_python(node, panel)

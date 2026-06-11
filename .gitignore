@@ -23,3 +23,11 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+
+# Compiled C++ evaluator extension (build it with scripts/build_cpp.py; platform-specific)
+cpp/build/
+src/alphaforge/_evaluator*.pyd
+src/alphaforge/_evaluator*.so
+
+CLAUDE.md
+DEVELOPMENT_PLAN.md
