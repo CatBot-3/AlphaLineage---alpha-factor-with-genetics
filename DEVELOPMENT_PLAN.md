@@ -169,6 +169,36 @@ Acceptance (`tests/test_tree_*.py`, use `hypothesis` for fuzzing):
 3. `test_depth_size_constraints` — no generated tree exceeds configured depth/node limits.
 4. `test_serialization_roundtrip` — tree → JSON → tree is structurally identical and evaluates identically.
 
+### Phase 1b — C++ evaluator accelerator (optional, polyglot)
+
+Goal: a second, high-performance backend for the **evaluator hot path**, in C++ via pybind11, built
+with CMake. Added after Phase 1 deliberately: the pure-Python evaluator (P1-T5) and its correctness
+tests are the **baseline**, so this is a measured optimization of the one genuinely hot path — the
+evaluator is called across *generations × population × the date×symbol panel*, millions of array ops —
+not premature optimization elsewhere.
+
+Rationale / guardrails:
+- **Pure Python stays the default and the correctness baseline.** The project always runs without a
+  compiler. The C++ backend is opt-in (build it) with **graceful fallback** on any error.
+- **Auto backend selection:** use C++ when the compiled extension imports *and* the tree uses only
+  C++-supported ops, else Python. Override via `ALPHAFORGE_EVALUATOR=auto|python|cpp`.
+- **Coverage = core hot ops** (arithmetic, scalar, unary math, `ts_mean/std/sum/min/max`, `delta`,
+  `delay`, `rank`, `zscore`); any tree with another op falls back to Python whole-tree. The C++ never
+  changes a result — it is pinned identical to Python by the parity test.
+
+Tasks:
+1. `P1b-T1` C++ evaluator (`cpp/evaluator.cpp`) + pybind11 module + CMake build (`scripts/build_cpp.py`).
+2. `P1b-T2` Backend dispatcher with auto-select + graceful fallback (`core/cpp.py`, `core/evaluate.py`).
+3. `P1b-T3` Parity test + benchmark (supporting tasks for the writeup).
+
+Acceptance (`tests/test_cpp_evaluator.py`):
+1. `test_cpp_python_parity` — C++ and Python produce element-wise equal outputs over many random
+   supported trees (within a tight float tolerance; bit-exact is impossible across float ordering).
+2. `test_dispatch_python_matches_baseline` / `test_unsupported_op_falls_back` — fallback is correct.
+3. `scripts/bench_evaluator.py` — speed comparison; on the GP hot path (small point-in-time universe)
+   the C++ backend is ~5–8× faster (per-op Python/pandas overhead dominates there). On very large
+   panels pandas' vectorization wins — but that is not the workload the GP runs.
+
 ### Phase 2 — GP loop + fitness
 
 Goal: full GP search with IC fitness.
@@ -267,6 +297,43 @@ Acceptance (`tests/test_extensibility.py`):
 2. `test_no_arbitrary_code_path` — security review check: no code path executes user-supplied server-side code.
 3. `test_trial_count_updates` — adding primitives increases the trial count and shows up in the deflation.
 
+### Phase P — Packaging & Delivery (the V1 ship step)
+
+Goal: a one-command local run and a zero-backend public demo, so non-developers can try the project.
+
+**Distribution decision — two frontend build targets** (decided in Phase 5; they are distinct builds
+because browser cross-origin rules keep them separate, and are not connected by default):
+1. `demo` build — **static, JSON-driven**. Renders a pre-exported snapshot of ONE finished GP run
+   (the factor's expression tree, its genealogy, and its honest OOS/deflated metrics) from a static
+   JSON file. **No backend dependency**; deploys to a static host (e.g. Cloudflare Pages). A shop
+   window so people can see the project before installing anything.
+2. `app` build — the **full local app**; talks to the lightweight local FastAPI + in-process job +
+   SQLite backend (Phase 5). The user runs real searches on their own universe with their own Tiingo
+   key.
+
+**Sequencing.** Docker is the **final pre-ship step** — do NOT start it until the Phase 5 (backend),
+Phase 6 (frontend), and Phase 7 (extensibility) acceptance gates are green. Docker is a packaging /
+distribution convenience only: it does **not** change the runtime architecture or any invariant, and
+the dev stack stays the lightweight, no-external-servers one (FastAPI + in-process jobs + SQLite).
+
+Tasks:
+1. `PP-T1` `Dockerfile` + `docker-compose.yml` that bring up backend + frontend together via a single
+   `docker compose up`, so users never touch Python, virtualenvs, or dependency resolution and get
+   identical behavior across Windows, macOS, and Linux.
+2. `PP-T2` Demo-export script: serialize a finished GP run (lineage + factor + OOS/deflated metrics)
+   into the `demo` JSON the static build consumes.
+3. `PP-T3` Recipe-style README whose primary path is "install Docker, get a free Tiingo API key and
+   put it in `.env`, run one command," with a bare pull-and-run (uv or pip) path documented as a
+   fallback.
+
+Acceptance:
+1. From a clean machine with only Docker installed, `docker compose up` yields a working app reachable
+   in the browser.
+2. The `demo` static build deploys to a static host and renders the exported JSON with no backend
+   running.
+3. Following the README from scratch reproduces an end-to-end run.
+4. The demo-export script round-trips a stored run into valid demo JSON.
+
 ### Phase 8 — Live signals + push (optional / stretch)
 
 Goal: real-time fetch, signal generation, notifications.
@@ -308,7 +375,7 @@ Data quality checklist (gate before any production use): sufficient history (10+
 ## 8. Milestones / definition of done
 
 1. MVP (Phases 0 to 4): honestly-validated single-factor engine (CLI/notebook). Done when synthetic-signal recovery and noise-rejection tests pass and backtests include costs.
-2. V1 (MVP + Phases 5 to 7): web app + factor library + user-extensible + interactive UI. Done when lineage replays, combination beats the best single factor, and user operators never produce invalid trees with no arbitrary-code path.
+2. V1 (MVP + Phases 5 to 7, shipped via Phase P): web app + factor library + user-extensible + interactive UI, packaged for a one-command local run (Docker) with a static public `demo` build. Done when lineage replays, combination beats the best single factor, user operators never produce invalid trees with no arbitrary-code path, and `docker compose up` yields a working app from a clean machine.
 3. V2 (V1 + Phase 8): live signals and push, behind compliance and commercial-data-license gates. Done when point-in-time consistency passes and the compliance checklist is confirmed.
 
 ---

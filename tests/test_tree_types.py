@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from alphaforge.core.types import DType, is_subtype
+from alphalineage.core.types import DType, is_subtype
 
 
 def test_subtype_is_reflexive():

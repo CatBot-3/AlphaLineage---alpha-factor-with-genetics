@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.fitness import mean_ic
-from alphaforge.core.gp import GP, GPConfig, iter_positions, replace_at
-from alphaforge.core.tree import Node, is_valid, to_json
-from alphaforge.core.types import DType
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.fitness import mean_ic
+from alphalineage.core.gp import GP, GPConfig, iter_positions, replace_at
+from alphalineage.core.tree import Node, is_valid, to_json
+from alphalineage.core.types import DType
 
 
 def test_synthetic_signal_recovery(signal_panel):

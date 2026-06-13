@@ -6,10 +6,10 @@ import random
 
 import pandas as pd
 
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.generate import RandomTreeGenerator
-from alphaforge.core.panel import Panel
-from alphaforge.core.tree import is_valid
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.generate import RandomTreeGenerator
+from alphalineage.core.panel import Panel
+from alphalineage.core.tree import is_valid
 
 
 def test_random_trees_all_valid(synthetic_panel):

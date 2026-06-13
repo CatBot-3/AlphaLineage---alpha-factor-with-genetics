@@ -1,21 +1,35 @@
 // P7-T1: define a point-in-time universe (symbols with entry/exit dates).
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { defineUniverse } from "../api/client";
+import type { UniverseDraft } from "../api/types";
 import { toUniversePayload, type UniverseRow } from "./toUniversePayload";
 
 const EMPTY: UniverseRow = { symbol: "", entry: "", exit: "" };
 
-export function UniverseBuilder() {
-  const [name, setName] = useState("my-universe");
-  const [rows, setRows] = useState<UniverseRow[]>([{ ...EMPTY }]);
+export function UniverseBuilder({
+  draft,
+  onDraftChange,
+  canSubmit = true,
+}: {
+  draft?: UniverseDraft;
+  onDraftChange?: (draft: UniverseDraft) => void;
+  canSubmit?: boolean;
+}) {
+  const [name, setName] = useState(draft?.name ?? "my-universe");
+  const [rows, setRows] = useState<UniverseRow[]>(draft?.rows ?? [{ ...EMPTY }]);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    onDraftChange?.({ name, rows });
+  }, [name, rows, onDraftChange]);
 
   const update = (i: number, field: keyof UniverseRow, value: string) =>
     setRows((rs) => rs.map((r, j) => (j === i ? { ...r, [field]: value } : r)));
 
   async function submit() {
+    if (!canSubmit) return;
     setError(null);
     setResult(null);
     try {
@@ -29,6 +43,11 @@ export function UniverseBuilder() {
   return (
     <section className="panel" data-testid="universe-builder">
       <h3>Define a universe (point-in-time)</h3>
+      {!canSubmit && (
+        <p className="panel-note">
+          Static demo mode saves this draft locally; connect the backend to define it.
+        </p>
+      )}
       <label className="field">
         Name <input value={name} onChange={(e) => setName(e.target.value)} />
       </label>
@@ -68,7 +87,9 @@ export function UniverseBuilder() {
                 />
               </td>
               <td>
-                <button onClick={() => setRows((rs) => rs.filter((_, j) => j !== i))}>✕</button>
+                <button onClick={() => setRows((rs) => rs.filter((_, j) => j !== i))}>
+                  Remove
+                </button>
               </td>
             </tr>
           ))}
@@ -76,7 +97,7 @@ export function UniverseBuilder() {
       </table>
       <div className="actions">
         <button onClick={() => setRows((rs) => [...rs, { ...EMPTY }])}>+ Add symbol</button>
-        <button onClick={submit} data-testid="define-universe">
+        <button onClick={submit} data-testid="define-universe" disabled={!canSubmit}>
           Define universe
         </button>
       </div>

@@ -7,11 +7,11 @@ from unittest.mock import Mock
 import numpy as np
 import pandas as pd
 
-from alphaforge.data.adjust import adjust
-from alphaforge.data.cache import ParquetCache
-from alphaforge.data.schema import normalize
-from alphaforge.data.survivorship import survivorship_report
-from alphaforge.data.universe import Membership, Universe, sample_universe
+from alphalineage.data.adjust import adjust
+from alphalineage.data.cache import ParquetCache
+from alphalineage.data.schema import normalize
+from alphalineage.data.survivorship import survivorship_report
+from alphalineage.data.universe import Membership, Universe, sample_universe
 
 
 def test_cache_roundtrip(synthetic_prices):

@@ -3,13 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "alphaforge"
+name = "alphalineage"
 version = "0.1.0"
 description = "Evolutionary (genetic-programming) alpha-factor mining platform"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
-authors = [{ name = "AlphaForge" }]
+authors = [{ name = "AlphaLineage" }]
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.1",
@@ -37,7 +37,7 @@ dev = [
 cpp = ["pybind11>=2.12"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/alphaforge"]
+packages = ["src/alphalineage"]
 
 [tool.ruff]
 line-length = 100
@@ -66,5 +66,5 @@ addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
-source = ["alphaforge"]
+source = ["alphalineage"]
 branch = true

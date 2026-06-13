@@ -1,0 +1,41 @@
+:root {
+  --color-bg: #e8e4dc;
+  --color-primary: #0f1c4a;
+  --color-accent: #e6b817;
+  --color-ink: #0a0a0a;
+  --color-muted: color-mix(in srgb, var(--color-ink) 58%, transparent);
+  --color-soft: color-mix(in srgb, var(--color-bg) 78%, white);
+  --color-danger: #9f1d20;
+  --color-ok: #0f5b3d;
+
+  --font-display: "Outfit", "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Outfit", "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", Consolas, monospace;
+
+  --type-h1: clamp(36px, 5vw, 64px);
+  --type-h2: clamp(22px, 2.6vw, 32px);
+  --type-body: 15px;
+  --type-small: 11px;
+  --type-micro: 9px;
+
+  --lh-body: 1.6;
+  --tracking-tiny: 0.16em;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  --edge-padding: clamp(18px, 4vw, 48px);
+  --header-height: 58px;
+  --footer-height: 42px;
+  --max-content: 1160px;
+
+  --z-header: 50;
+  --z-popover: 100;
+  --transition-fast: 90ms linear;
+}

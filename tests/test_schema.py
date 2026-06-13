@@ -7,7 +7,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from alphaforge.data.schema import PRICE_COLUMNS, normalize, validate
+from alphalineage.data.schema import PRICE_COLUMNS, normalize, validate
 
 
 def test_normalize_tz_columns_and_defaults():

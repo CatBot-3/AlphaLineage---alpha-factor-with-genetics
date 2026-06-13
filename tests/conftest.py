@@ -11,7 +11,7 @@ import pytest
 def temp_data_dir(tmp_path, monkeypatch):
     """Redirect the local data store to a per-test temp directory."""
     data_dir = tmp_path / "data_cache"
-    monkeypatch.setenv("ALPHAFORGE_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ALPHALINEAGE_DATA_DIR", str(data_dir))
     return data_dir
 
 
@@ -37,7 +37,7 @@ def synthetic_prices() -> pd.DataFrame:
 @pytest.fixture
 def synthetic_panel():
     """A deterministic 60-day x 6-symbol panel with all operand fields populated."""
-    from alphaforge.core.panel import Panel
+    from alphalineage.core.panel import Panel
 
     rng = np.random.default_rng(42)
     n_days, n_syms = 60, 6
@@ -67,10 +67,10 @@ def signal_panel():
 
     Returns ``(panel, injected)`` where ``injected`` is the cross-sectional z-score of the
     latent. ``volume = exp(0.3*latent)`` is a strictly monotone (per-date) carrier, so any
-    volume-based factor has |rank IC| ~ 1.0 against ``injected`` — the GP should recover it.
+    volume-based factor has |rank IC| ~ 1.0 against ``injected`` - the GP should recover it.
     Forward returns are ``beta*injected[t] + noise``, so volume also predicts returns.
     """
-    from alphaforge.core.panel import Panel
+    from alphalineage.core.panel import Panel
 
     rng = np.random.default_rng(11)
     n_days, n_syms = 180, 12
@@ -104,7 +104,7 @@ def signal_panel():
 @pytest.fixture
 def noise_panel():
     """A pure-noise panel: random returns and independent random volume, no signal at all."""
-    from alphaforge.core.panel import Panel
+    from alphalineage.core.panel import Panel
 
     rng = np.random.default_rng(123)
     n_days, n_syms = 160, 12

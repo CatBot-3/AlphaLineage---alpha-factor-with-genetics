@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from alphaforge.core.fitness import daily_ic, forward_returns, ic_ir, mean_ic, score_tree
-from alphaforge.core.tree import Node
+from alphalineage.core.fitness import daily_ic, forward_returns, ic_ir, mean_ic, score_tree
+from alphalineage.core.tree import Node
 
 
 def _frame(values: list[list[float]]) -> pd.DataFrame:

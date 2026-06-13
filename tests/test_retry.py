@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from alphaforge.data.retry import RateLimiter, with_retry
-from alphaforge.data.tiingo_client import RateLimitError
+from alphalineage.data.retry import RateLimiter, with_retry
+from alphalineage.data.tiingo_client import RateLimitError
 
 
 def test_retry_succeeds_after_failures_and_honors_retry_after():

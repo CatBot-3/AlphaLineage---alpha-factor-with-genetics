@@ -1,6 +1,14 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
-import type { OperatorSpec, PrimitiveInfo, RunResult, UniverseSpec } from "./types";
+import type {
+  OperatorSpec,
+  PrimitiveInfo,
+  RunResult,
+  UniverseInfo,
+  UniverseSpec,
+  WorkspaceSnapshot,
+  WorkspaceSummary,
+} from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
@@ -82,4 +90,40 @@ export async function defineUniverse(
   });
   if (!res.ok) throw new Error(`define universe failed: ${res.status}`);
   return (await res.json()) as { name: string; symbols: string[] };
+}
+
+export async function listUniverses(): Promise<UniverseInfo[]> {
+  const res = await fetch(`${BASE}/universes`);
+  if (!res.ok) throw new Error(`universes failed: ${res.status}`);
+  return (await res.json()) as UniverseInfo[];
+}
+
+export async function listWorkspaces(): Promise<WorkspaceSummary[]> {
+  const res = await fetch(`${BASE}/workspaces`);
+  if (!res.ok) throw new Error(`workspaces failed: ${res.status}`);
+  return (await res.json()) as WorkspaceSummary[];
+}
+
+export async function saveWorkspace(snapshot: WorkspaceSnapshot): Promise<WorkspaceSnapshot> {
+  const res = await fetch(`${BASE}/workspaces`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(snapshot),
+  });
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(detail.detail ?? `save workspace failed: ${res.status}`);
+  }
+  return (await res.json()) as WorkspaceSnapshot;
+}
+
+export async function getWorkspace(id: string): Promise<WorkspaceSnapshot> {
+  const res = await fetch(`${BASE}/workspaces/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(`workspace load failed: ${res.status}`);
+  return (await res.json()) as WorkspaceSnapshot;
+}
+
+export async function deleteWorkspace(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/workspaces/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`workspace delete failed: ${res.status}`);
 }

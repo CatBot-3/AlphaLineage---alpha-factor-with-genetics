@@ -1,7 +1,7 @@
 """Build the optional C++ evaluator extension (cmake + ninja + g++) into the package.
 
 Run: ``python scripts/build_cpp.py``. Needs a C++ compiler, CMake, and Ninja on PATH plus
-``pybind11`` (installed automatically). The build is entirely optional — the project runs on the
+``pybind11`` (installed automatically). The build is entirely optional - the project runs on the
 pure-Python evaluator without it. The produced ``_evaluator*`` extension is gitignored.
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CPP_DIR = ROOT / "cpp"
 BUILD_DIR = CPP_DIR / "build"
-DEST = ROOT / "src" / "alphaforge"
+DEST = ROOT / "src" / "alphalineage"
 
 
 def _run(cmd: list[str]) -> None:

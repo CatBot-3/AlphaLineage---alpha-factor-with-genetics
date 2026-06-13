@@ -20,14 +20,17 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.runtime/
+.tmp/
+.claude/
 .coverage
 coverage.xml
 htmlcov/
 
 # Compiled C++ evaluator extension (build it with scripts/build_cpp.py; platform-specific)
 cpp/build/
-src/alphaforge/_evaluator*.pyd
-src/alphaforge/_evaluator*.so
+src/alphalineage/_evaluator*.pyd
+src/alphalineage/_evaluator*.so
 
 CLAUDE.md
 DEVELOPMENT_PLAN.md

@@ -9,21 +9,21 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from alphaforge.core import extensions
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.extensions import (
+from alphalineage.core import extensions
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.extensions import (
     ARG,
     InvalidOperator,
     operator_counts,
     register_operator,
 )
-from alphaforge.core.generate import RandomTreeGenerator
-from alphaforge.core.gp import GP, GPConfig
-from alphaforge.core.primitives import OPERATORS, REGISTRY, operators_for
-from alphaforge.core.tree import Node, is_valid, validate
-from alphaforge.core.types import DType
-from alphaforge.validation.deflated_sharpe import deflated_sharpe_ratio
-from alphaforge.validation.trials import effective_trials
+from alphalineage.core.generate import RandomTreeGenerator
+from alphalineage.core.gp import GP, GPConfig
+from alphalineage.core.primitives import OPERATORS, REGISTRY, operators_for
+from alphalineage.core.tree import Node, is_valid, validate
+from alphalineage.core.types import DType
+from alphalineage.validation.deflated_sharpe import deflated_sharpe_ratio
+from alphalineage.validation.trials import effective_trials
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +76,7 @@ def test_user_operator_valid_immediately(synthetic_panel):
 
 
 def test_no_arbitrary_code_path():
-    # a body naming anything that is not an existing primitive is rejected — never executed
+    # a body naming anything that is not an existing primitive is rejected - never executed
     with pytest.raises(InvalidOperator):
         register_operator("evil", [DType.SERIES], DType.SERIES, {"name": "__import__"})
     with pytest.raises(InvalidOperator):

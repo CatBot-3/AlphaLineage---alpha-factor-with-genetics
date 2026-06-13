@@ -26,9 +26,26 @@ built-in anti-overfitting suite.
 ## Conventions
 - Python 3.11+. One task = one PR-sized change. Write the acceptance test first.
 - Hot paths (tree evaluation) must be vectorized (numpy/pandas/numba).
+- The evaluator has an **optional C++ backend** (`cpp/`, pybind11+CMake; build via
+  `python scripts/build_cpp.py`). Pure Python is the default + correctness baseline and always runs
+  without a compiler; the C++ backend auto-engages when built (`ALPHAFORGE_EVALUATOR=auto|python|cpp`)
+  and is pinned identical to Python by the parity test. The compiled `.pyd`/`.so` is gitignored.
 - Do not call the data API inside the GP loop; read from the Parquet cache.
 - The two load-bearing tests are synthetic-signal recovery and noise rejection.
   If either regresses, stop and fix before anything else.
 
+## Backend & distribution (decided Phase 5)
+- Backend stack is **lightweight, no external servers**: FastAPI + an in-process threaded job
+  runner + JSON/SQLite. RQ/Redis + Postgres are only a future production swap behind the
+  job/store interfaces — do not introduce them into the dev stack.
+- Two frontend build targets: **`demo`** (static, JSON-driven snapshot of one finished run —
+  tree + genealogy + OOS/deflated metrics — no backend, deploys to a static host) and **`app`**
+  (talks to the local FastAPI+jobs+SQLite backend; real searches with the user's Tiingo key).
+  They are distinct builds (CORS) and not connected by default.
+- Local run is **Docker-first** (`docker compose up`; uv/pip is the fallback). Docker is a
+  packaging convenience only — it changes neither the architecture nor any invariant, and is the
+  final pre-ship step (Phase P), not started until the Phase 5/6/7 gates are green.
+
 ## Phase order
-Phases 0 → 8 in DEVELOPMENT_PLAN.md. Do not start a phase until the prior gate is green.
+Phases 0 → 8 (plus Phase P, Packaging & Delivery, near the end of V1) in DEVELOPMENT_PLAN.md.
+Do not start a phase until the prior gate is green.

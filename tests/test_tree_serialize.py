@@ -8,10 +8,10 @@ import pandas as pd
 from hypothesis import given
 from hypothesis import strategies as st
 
-from alphaforge.core import tree as T
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.generate import RandomTreeGenerator
-from alphaforge.core.tree import Node
+from alphalineage.core import tree as T
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.generate import RandomTreeGenerator
+from alphalineage.core.tree import Node
 
 
 def test_roundtrip_handbuilt():

@@ -5,10 +5,10 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from alphaforge.data.provider import FallbackProvider, ProviderError
-from alphaforge.data.schema import PRICE_COLUMNS
-from alphaforge.data.tiingo_client import TiingoError, TiingoProvider
-from alphaforge.data.yfinance_provider import YFinanceProvider
+from alphalineage.data.provider import FallbackProvider, ProviderError
+from alphalineage.data.schema import PRICE_COLUMNS
+from alphalineage.data.tiingo_client import TiingoError, TiingoProvider
+from alphalineage.data.yfinance_provider import YFinanceProvider
 
 
 def test_tiingo_provider_parses_payload(requests_mock):

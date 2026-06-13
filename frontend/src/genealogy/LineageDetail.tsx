@@ -1,5 +1,4 @@
-// Navigable lineage detail: trace a node's parents -> operation -> children. Clicking a
-// parent or child selects it, so the user can walk the genealogy.
+// Navigable lineage detail: trace a node's parents -> operation -> children.
 
 import type { Lineage } from "../api/types";
 
@@ -24,7 +23,7 @@ export function LineageDetail({
   return (
     <div className="detail" data-testid="lineage-detail">
       <h4>
-        node #{node.id} · gen {node.generation}
+        node #{node.id} / gen {node.generation}
       </h4>
       <p>
         operation: <b data-testid="lineage-op">{node.op}</b>

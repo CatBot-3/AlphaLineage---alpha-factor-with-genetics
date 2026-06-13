@@ -5,14 +5,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.gp import GP, GPConfig
-from alphaforge.core.tree import Node, to_json
-from alphaforge.library.combine import combine
-from alphaforge.library.diversity import prune, signal_correlation
-from alphaforge.library.store import LineageStore
-from alphaforge.validation.deflated_sharpe import deflated_sharpe_ratio, sharpe_ratio
-from alphaforge.validation.performance import long_short_returns
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.gp import GP, GPConfig
+from alphalineage.core.tree import Node, to_json
+from alphalineage.library.combine import combine
+from alphalineage.library.diversity import prune, signal_correlation
+from alphalineage.library.store import LineageStore
+from alphalineage.validation.deflated_sharpe import deflated_sharpe_ratio, sharpe_ratio
+from alphalineage.validation.performance import long_short_returns
 
 
 def test_lineage_replay(signal_panel, tmp_path):

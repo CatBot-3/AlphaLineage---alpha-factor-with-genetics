@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.primitives import EPHEMERALS, OPERAND_FIELDS, OPERANDS, OPERATORS
-from alphaforge.core.tree import Node, validate
-from alphaforge.core.types import DType
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.primitives import EPHEMERALS, OPERAND_FIELDS, OPERANDS, OPERATORS
+from alphalineage.core.tree import Node, validate
+from alphalineage.core.types import DType
 
 
 def _arg_node(dtype: DType) -> Node:

@@ -7,17 +7,17 @@ import random
 import numpy as np
 import pandas as pd
 
-from alphaforge.backtest.costs import TransactionCostModel
-from alphaforge.backtest.engine import backtest, compare_schemes, comparison_frame
-from alphaforge.backtest.metrics import max_drawdown, turnover
-from alphaforge.backtest.portfolio import QuantileLongShort, RankProportional, neutralize
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.fitness import forward_returns
-from alphaforge.core.generate import RandomTreeGenerator
-from alphaforge.core.tree import Node
-from alphaforge.validation.deflated_sharpe import sharpe_ratio
-from alphaforge.validation.pipeline import LockedTestSet, judge
-from alphaforge.validation.splits import time_split
+from alphalineage.backtest.costs import TransactionCostModel
+from alphalineage.backtest.engine import backtest, compare_schemes, comparison_frame
+from alphalineage.backtest.metrics import max_drawdown, turnover
+from alphalineage.backtest.portfolio import QuantileLongShort, RankProportional, neutralize
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.fitness import forward_returns
+from alphalineage.core.generate import RandomTreeGenerator
+from alphalineage.core.tree import Node
+from alphalineage.validation.deflated_sharpe import sharpe_ratio
+from alphalineage.validation.pipeline import LockedTestSet, judge
+from alphalineage.validation.splits import time_split
 
 
 # --- acceptance -----------------------------------------------------------------

@@ -24,12 +24,12 @@ if _SRC.exists() and str(_SRC) not in sys.path:
 
 from dotenv import load_dotenv  # noqa: E402
 
-from alphaforge.data import paths  # noqa: E402
-from alphaforge.data.cache import ParquetCache  # noqa: E402
-from alphaforge.data.provider import FallbackProvider, PriceProvider  # noqa: E402
-from alphaforge.data.tiingo_client import TiingoProvider  # noqa: E402
-from alphaforge.data.universe import sample_universe  # noqa: E402
-from alphaforge.data.yfinance_provider import YFinanceProvider  # noqa: E402
+from alphalineage.data import paths  # noqa: E402
+from alphalineage.data.cache import ParquetCache  # noqa: E402
+from alphalineage.data.provider import FallbackProvider, PriceProvider  # noqa: E402
+from alphalineage.data.tiingo_client import TiingoProvider  # noqa: E402
+from alphalineage.data.universe import sample_universe  # noqa: E402
+from alphalineage.data.yfinance_provider import YFinanceProvider  # noqa: E402
 
 
 def _build_provider(choice: str, *, have_key: bool) -> PriceProvider:
@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
 
     have_key = bool(os.environ.get("TIINGO_API_KEY"))
     if args.provider in {"auto", "tiingo"} and not have_key:
-        print("TODO(human): TIINGO_API_KEY not set — set it in .env to use Tiingo.")
+        print("TODO(human): TIINGO_API_KEY not set - set it in .env to use Tiingo.")
         if args.provider == "tiingo":
             return 1
         print("Falling back to yfinance (survivorship-biased, prototype-grade).")

@@ -1,5 +1,7 @@
 // TypeScript mirrors of the backend JSON shapes (core/tree.py, library/store.py, pipeline.py).
 
+export type AppMode = "demo" | "app";
+
 export interface FactorNode {
   name: string;
   value?: number;
@@ -73,4 +75,63 @@ export interface UniverseMembership {
 export interface UniverseSpec {
   name: string;
   memberships: UniverseMembership[];
+}
+
+export interface UniverseInfo extends UniverseSpec {
+  symbols: string[];
+  source: "sample" | "custom";
+}
+
+export interface UniverseDraft {
+  name: string;
+  rows: Array<{ symbol: string; entry: string; exit: string }>;
+}
+
+export interface OperatorDraftNode {
+  id: string;
+  kind: string;
+  label?: string;
+  argIndex?: number;
+  value?: number;
+  x: number;
+  y: number;
+}
+
+export interface OperatorDraftEdge {
+  source: string;
+  target: string;
+}
+
+export interface OperatorComposerDraft {
+  name: string;
+  argTypes: string[];
+  outType: string;
+  nodes: OperatorDraftNode[];
+  edges: OperatorDraftEdge[];
+}
+
+export interface WorkspaceUiState {
+  selectedTab?: "dashboard" | "factor" | "genealogy" | "extend";
+  selectedFactorNode?: { name: string; value?: number } | null;
+  selectedLineage?: number | null;
+}
+
+export interface WorkspaceSnapshot {
+  id?: string;
+  name: string;
+  version: 1;
+  savedAt: string;
+  run: RunResult | null;
+  universes: UniverseSpec[];
+  operators: OperatorSpec[];
+  universeDraft?: UniverseDraft;
+  operatorDraft?: OperatorComposerDraft;
+  ui: WorkspaceUiState;
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  savedAt: string;
+  hasRun: boolean;
 }

@@ -22,20 +22,20 @@ if _SRC.exists() and str(_SRC) not in sys.path:
 
 import yaml  # noqa: E402
 
-from alphaforge.backtest.costs import TransactionCostModel  # noqa: E402
-from alphaforge.backtest.engine import (  # noqa: E402
+from alphalineage.backtest.costs import TransactionCostModel  # noqa: E402
+from alphalineage.backtest.engine import (  # noqa: E402
     compare_schemes,
     comparison_frame,
     net_return_fn,
 )
-from alphaforge.backtest.portfolio import QuantileLongShort, RankProportional  # noqa: E402
-from alphaforge.core.evaluate import evaluate  # noqa: E402
-from alphaforge.core.fitness import forward_returns  # noqa: E402
-from alphaforge.core.gp import GP, GPConfig  # noqa: E402
-from alphaforge.core.panel import Panel  # noqa: E402
-from alphaforge.data.universe import sample_universe  # noqa: E402
-from alphaforge.validation.pipeline import LockedTestSet, judge  # noqa: E402
-from alphaforge.validation.splits import Split, time_split  # noqa: E402
+from alphalineage.backtest.portfolio import QuantileLongShort, RankProportional  # noqa: E402
+from alphalineage.core.evaluate import evaluate  # noqa: E402
+from alphalineage.core.fitness import forward_returns  # noqa: E402
+from alphalineage.core.gp import GP, GPConfig  # noqa: E402
+from alphalineage.core.panel import Panel  # noqa: E402
+from alphalineage.data.universe import sample_universe  # noqa: E402
+from alphalineage.validation.pipeline import LockedTestSet, judge  # noqa: E402
+from alphalineage.validation.splits import Split, time_split  # noqa: E402
 
 _DISCLAIMER = "Not investment advice. Research output only; signals must survive costs (Phase 4)."
 

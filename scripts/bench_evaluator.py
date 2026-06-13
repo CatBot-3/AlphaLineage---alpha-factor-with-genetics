@@ -17,10 +17,10 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from alphaforge.core import cpp  # noqa: E402
-from alphaforge.core.evaluate import evaluate_python  # noqa: E402
-from alphaforge.core.generate import RandomTreeGenerator  # noqa: E402
-from alphaforge.core.panel import Panel  # noqa: E402
+from alphalineage.core import cpp  # noqa: E402
+from alphalineage.core.evaluate import evaluate_python  # noqa: E402
+from alphalineage.core.generate import RandomTreeGenerator  # noqa: E402
+from alphalineage.core.panel import Panel  # noqa: E402
 
 
 def _panel(t: int, n: int) -> Panel:
@@ -65,13 +65,13 @@ def _bench(t: int, n: int, n_trees: int, note: str) -> None:
 
 def main() -> int:
     if not cpp.available():
-        print("C++ extension not built — run `python scripts/build_cpp.py` to compare.\n")
+        print("C++ extension not built - run `python scripts/build_cpp.py` to compare.\n")
     # The GP hot path: a small point-in-time universe, evaluated millions of times. Here the
     # per-op Python/pandas overhead dominates and C++ wins. On very large panels, pandas'
-    # vectorized C rolling/rank wins — but that is not the workload the GP actually runs.
-    _bench(252, 10, 2000, "GP hot path — small universe")
+    # vectorized C rolling/rank wins - but that is not the workload the GP actually runs.
+    _bench(252, 10, 2000, "GP hot path - small universe")
     _bench(500, 12, 1500, "small universe, longer history")
-    _bench(2000, 200, 300, "large panel — pandas' vectorization wins")
+    _bench(2000, 200, 300, "large panel - pandas' vectorization wins")
     return 0
 
 

@@ -17,11 +17,12 @@ vi.mock("../api/client", () => ({
 import { OperatorComposer } from "./OperatorComposer";
 
 describe("OperatorComposer (P7-T2)", () => {
-  it("renders the palette and signature controls", () => {
+  it("renders the palette and signature controls", async () => {
     render(<OperatorComposer />);
     expect(screen.getByTestId("operator-composer")).toBeInTheDocument();
     expect(screen.getByTestId("palette")).toBeInTheDocument();
     expect(screen.getByTestId("register-operator")).toBeInTheDocument();
     expect(screen.getByLabelText("arg-types")).toBeInTheDocument();
+    expect(await screen.findByText("sub")).toBeInTheDocument();
   });
 });

@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from alphaforge.data.adjust import adjust, adjusted_close
-from alphaforge.data.schema import normalize
+from alphalineage.data.adjust import adjust, adjusted_close
+from alphalineage.data.schema import normalize
 
 
 def _frame(close, *, div_cash=None, split_factor=None):

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.simplify import simplify
-from alphaforge.core.tree import Node
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.simplify import simplify
+from alphalineage.core.tree import Node
 
 
 def test_scalar_identities():

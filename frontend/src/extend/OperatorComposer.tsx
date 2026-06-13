@@ -1,6 +1,4 @@
-// P7-T2: compose a custom operator as a typed macro using a React Flow drag-to-edit editor.
-// The graph is converted to a body tree (graphToBody) and submitted to POST /operators — the
-// server validates it as data (no code). Connections are made by dragging between node handles.
+// P7-T2: compose a custom operator as a typed macro using a React Flow editor.
 
 import {
   addEdge,
@@ -14,34 +12,87 @@ import {
   useNodesState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getPrimitives, registerOperator } from "../api/client";
-import type { PrimitiveInfo } from "../api/types";
+import type { OperatorComposerDraft, PrimitiveInfo } from "../api/types";
 import { type ComposerEdge, type ComposerNode, findRoot, graphToBody } from "./graphToBody";
 
 const OUTPUT_TYPES = ["series", "signal", "window", "scalar"];
-let nodeCounter = 0;
 
-export function OperatorComposer() {
+function nodesFromDraft(draft?: OperatorComposerDraft): Node[] {
+  return (draft?.nodes ?? []).map((node) => ({
+    id: node.id,
+    position: { x: node.x, y: node.y },
+    data: {
+      label: node.label ?? node.kind,
+      kind: node.kind,
+      argIndex: node.argIndex,
+      value: node.value,
+    },
+  }));
+}
+
+function edgesFromDraft(draft?: OperatorComposerDraft): Edge[] {
+  return (draft?.edges ?? []).map((edge, i) => ({
+    id: `${edge.source}-${edge.target}-${i}`,
+    source: edge.source,
+    target: edge.target,
+  }));
+}
+
+export function OperatorComposer({
+  draft,
+  onDraftChange,
+  canSubmit = true,
+}: {
+  draft?: OperatorComposerDraft;
+  onDraftChange?: (draft: OperatorComposerDraft) => void;
+  canSubmit?: boolean;
+}) {
+  const initialNodes = useMemo(() => nodesFromDraft(draft), [draft]);
+  const initialEdges = useMemo(() => edgesFromDraft(draft), [draft]);
   const [palette, setPalette] = useState<PrimitiveInfo[]>([]);
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  const [name, setName] = useState("my_op");
-  const [argTypes, setArgTypes] = useState<string[]>(["series", "window"]);
-  const [outType, setOutType] = useState("series");
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>(initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges);
+  const [name, setName] = useState(draft?.name ?? "my_op");
+  const [argTypes, setArgTypes] = useState<string[]>(draft?.argTypes ?? ["series", "window"]);
+  const [outType, setOutType] = useState(draft?.outType ?? "series");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const nextId = useRef(initialNodes.length);
 
   useEffect(() => {
+    if (!canSubmit) {
+      setPalette([]);
+      return;
+    }
     getPrimitives()
       .then(setPalette)
       .catch(() => setPalette([]));
-  }, []);
+  }, [canSubmit]);
+
+  useEffect(() => {
+    onDraftChange?.({
+      name,
+      argTypes,
+      outType,
+      nodes: nodes.map((node) => ({
+        id: node.id,
+        kind: String(node.data.kind),
+        label: String(node.data.label ?? node.data.kind),
+        argIndex: node.data.argIndex as number | undefined,
+        value: node.data.value as number | undefined,
+        x: node.position.x,
+        y: node.position.y,
+      })),
+      edges: edges.map((edge) => ({ source: edge.source, target: edge.target })),
+    });
+  }, [argTypes, edges, name, nodes, onDraftChange, outType]);
 
   const onConnect = useCallback((c: Connection) => setEdges((es) => addEdge(c, es)), [setEdges]);
 
   function addNode(kind: string, extra: Record<string, unknown> = {}, label?: string) {
-    const id = `c${nodeCounter++}`;
+    const id = `c${nextId.current++}`;
     setNodes((ns) => [
       ...ns,
       {
@@ -53,6 +104,7 @@ export function OperatorComposer() {
   }
 
   function register() {
+    if (!canSubmit) return;
     setError(null);
     setMessage(null);
     const composerNodes: ComposerNode[] = nodes.map((n) => ({
@@ -80,7 +132,12 @@ export function OperatorComposer() {
 
   return (
     <section className="panel" data-testid="operator-composer">
-      <h3>Compose an operator (no code — only existing primitives)</h3>
+      <h3>Compose an operator</h3>
+      {!canSubmit && (
+        <p className="panel-note">
+          Static demo mode keeps this graph as a local draft; connect the backend to register it.
+        </p>
+      )}
       <div className="composer-signature">
         <label className="field">
           Name <input value={name} onChange={(e) => setName(e.target.value)} />
@@ -108,7 +165,7 @@ export function OperatorComposer() {
             ))}
           </select>
         </label>
-        <button onClick={register} data-testid="register-operator">
+        <button onClick={register} data-testid="register-operator" disabled={!canSubmit}>
           Register
         </button>
       </div>

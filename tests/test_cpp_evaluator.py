@@ -12,10 +12,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from alphaforge.core import cpp
-from alphaforge.core.evaluate import evaluate, evaluate_python
-from alphaforge.core.generate import RandomTreeGenerator
-from alphaforge.core.tree import Node
+from alphalineage.core import cpp
+from alphalineage.core.evaluate import evaluate, evaluate_python
+from alphalineage.core.generate import RandomTreeGenerator
+from alphalineage.core.tree import Node
 
 # Parity bar: bit-exact equality is impossible across C++/pandas float ordering, so the two
 # backends are pinned to agree within a tight tolerance (~8 significant figures).
@@ -46,7 +46,7 @@ def test_flatten_ir():
 
 
 def test_dispatch_python_matches_baseline(synthetic_panel, monkeypatch):
-    monkeypatch.setenv("ALPHAFORGE_EVALUATOR", "python")
+    monkeypatch.setenv("ALPHALINEAGE_EVALUATOR", "python")
     gen = RandomTreeGenerator(random.Random(3), max_depth=4, max_nodes=20)
     for tree in gen.ramped_half_and_half(200, min_depth=2, max_depth=4):
         pd.testing.assert_frame_equal(
@@ -55,9 +55,9 @@ def test_dispatch_python_matches_baseline(synthetic_panel, monkeypatch):
 
 
 def test_backend_selection(monkeypatch):
-    monkeypatch.setenv("ALPHAFORGE_EVALUATOR", "python")
+    monkeypatch.setenv("ALPHALINEAGE_EVALUATOR", "python")
     assert cpp.backend_enabled() is False
-    monkeypatch.setenv("ALPHAFORGE_EVALUATOR", "auto")
+    monkeypatch.setenv("ALPHALINEAGE_EVALUATOR", "auto")
     assert cpp.backend_enabled() == cpp.available()
 
 
@@ -80,7 +80,7 @@ def test_cpp_python_parity(synthetic_panel):
 
 @pytest.mark.skipif(not cpp.available(), reason="C++ evaluator extension not built")
 def test_unsupported_op_falls_back(synthetic_panel, monkeypatch):
-    monkeypatch.setenv("ALPHAFORGE_EVALUATOR", "cpp")
+    monkeypatch.setenv("ALPHALINEAGE_EVALUATOR", "cpp")
     tree = Node("ts_rank", (Node("close"), Node("window", value=5)))  # not C++-supported
     assert cpp.evaluate_cpp(tree, synthetic_panel) is None
     pd.testing.assert_frame_equal(

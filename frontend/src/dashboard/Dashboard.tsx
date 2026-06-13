@@ -1,5 +1,4 @@
-// P6-T3: metrics dashboard. The DEFAULT/primary metrics are out-of-sample / deflated
-// (invariant 1: user-facing metrics default to OOS/deflated); train metrics are secondary.
+// P6-T3: metrics dashboard. User-facing metrics default to OOS/deflated values.
 
 import type { HistoryPoint, Report } from "../api/types";
 import { Sparkline } from "./Sparkline";
@@ -17,7 +16,7 @@ export function Dashboard({ report, history }: { report: Report; history: Histor
   return (
     <div className="dashboard">
       <section className="primary" data-testid="primary-metric">
-        <div className="primary-label">Out-of-sample / deflated — the honest default</div>
+        <div className="primary-label">Out-of-sample / deflated - the honest default</div>
         <div className="primary-grid">
           <Metric label="OOS rank IC" value={report.oos_ic.toFixed(3)} />
           <Metric label="Deflated Sharpe" value={report.deflated_sharpe.toFixed(3)} />
@@ -30,7 +29,7 @@ export function Dashboard({ report, history }: { report: Report; history: Histor
       </section>
 
       <details className="secondary" data-testid="secondary-metric">
-        <summary>In-sample (train) metrics — for reference only</summary>
+        <summary>In-sample (train) metrics - for reference only</summary>
         <Metric label="Train rank IC" value={report.train_ic.toFixed(3)} />
         <Metric label="Trials searched" value={String(report.n_trials)} />
       </details>

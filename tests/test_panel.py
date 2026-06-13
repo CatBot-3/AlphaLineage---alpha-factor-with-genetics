@@ -5,9 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from alphaforge.core.panel import Panel
-from alphaforge.data.cache import ParquetCache
-from alphaforge.data.schema import normalize
+from alphalineage.core.panel import Panel
+from alphalineage.data.cache import ParquetCache
+from alphalineage.data.schema import normalize
 
 
 def _price_frame(dates: pd.DatetimeIndex, base: float) -> pd.DataFrame:

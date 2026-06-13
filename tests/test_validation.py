@@ -9,22 +9,22 @@ import pandas as pd
 import pytest
 from scipy.stats import norm
 
-from alphaforge.core.evaluate import evaluate
-from alphaforge.core.fitness import forward_returns, mean_ic
-from alphaforge.core.generate import RandomTreeGenerator
-from alphaforge.core.tree import Node
-from alphaforge.validation.deflated_sharpe import (
+from alphalineage.core.evaluate import evaluate
+from alphalineage.core.fitness import forward_returns, mean_ic
+from alphalineage.core.generate import RandomTreeGenerator
+from alphalineage.core.tree import Node
+from alphalineage.validation.deflated_sharpe import (
     deflated_sharpe_ratio,
     expected_max_sharpe,
     probabilistic_sharpe_ratio,
     sharpe_ratio,
 )
-from alphaforge.validation.pbo import pbo
-from alphaforge.validation.performance import long_short_returns
-from alphaforge.validation.pipeline import LockedTestSet, judge
-from alphaforge.validation.purged_cv import purged_kfold
-from alphaforge.validation.splits import time_split, walk_forward
-from alphaforge.validation.trials import TrialCounter
+from alphalineage.validation.pbo import pbo
+from alphalineage.validation.performance import long_short_returns
+from alphalineage.validation.pipeline import LockedTestSet, judge
+from alphalineage.validation.purged_cv import purged_kfold
+from alphalineage.validation.splits import time_split, walk_forward
+from alphalineage.validation.trials import TrialCounter
 
 
 # --- acceptance -----------------------------------------------------------------
