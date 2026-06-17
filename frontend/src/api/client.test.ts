@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  clearData,
   continueSession,
   createSession,
   getSession,
   putSettings,
   saveFactor,
+  shutdown,
 } from "./client";
 
 function mockFetch(payload: unknown, ok = true) {
@@ -83,12 +85,29 @@ describe("factor + settings client", () => {
     expect(body.provenance).toEqual({ session_id: "s1" });
   });
 
-  it("PUTs the factors_dir and returns the resolved path", async () => {
-    const fetchSpy = mockFetch({ factors_dir: "/tmp/factors" });
-    const settings = await putSettings("/tmp/factors");
-    expect(settings.factors_dir).toBe("/tmp/factors");
+  it("PUTs a partial settings update (evaluator only) without wiping other keys", async () => {
+    const fetchSpy = mockFetch({ factors_dir: "/d", evaluator: "python", tiingo_api_key_set: false });
+    const settings = await putSettings({ evaluator: "python" });
+    expect(settings.evaluator).toBe("python");
     const [, init] = fetchSpy.mock.calls[0];
     expect(init.method).toBe("PUT");
-    expect(JSON.parse(init.body as string)).toEqual({ factors_dir: "/tmp/factors" });
+    expect(JSON.parse(init.body as string)).toEqual({ evaluator: "python" });
+  });
+});
+
+describe("data + shutdown client", () => {
+  it("POSTs a category to /data/clear", async () => {
+    const fetchSpy = mockFetch({ key: "sessions", label: "Training sessions", bytes: 0, count: 0 });
+    await clearData("sessions");
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/data\/clear$/);
+    expect(JSON.parse(init.body as string)).toEqual({ category: "sessions" });
+  });
+
+  it("POSTs /shutdown", async () => {
+    const fetchSpy = mockFetch({ shutting_down: true });
+    const res = await shutdown();
+    expect(res.shutting_down).toBe(true);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/shutdown$/);
   });
 });

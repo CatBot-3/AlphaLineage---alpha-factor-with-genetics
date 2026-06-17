@@ -19,6 +19,12 @@ UI for training, iterating, the factor library, and an honest metrics/genealogy 
 
 ## Run it (recipe)
 
+### 0. Windows one-command launcher
+
+Double-click **`start.cmd`** (or run `powershell -ExecutionPolicy Bypass -File start.ps1`). It builds
+the UI, runs one server that hosts both the API and the UI on **http://localhost:8000**, and opens a
+browser tab. Stop it from the in-app gear menu (⚙ → **Quit**) or with `Ctrl+C`.
+
 ### 1. Docker — the one-command path (recommended)
 
 You need only [Docker](https://docs.docker.com/get-docker/) installed.

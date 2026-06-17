@@ -29,6 +29,7 @@ from alphalineage.api import sessions
 from alphalineage.api.jobs import JobStore
 from alphalineage.api.progress import RunProgress
 from alphalineage.api.service import run_search
+from alphalineage.core import cpp
 from alphalineage.core.extensions import (
     USER_OPERATORS,
     InvalidOperator,
@@ -42,7 +43,7 @@ from alphalineage.core.primitives import REGISTRY, Primitive
 from alphalineage.core.tree import from_dict as tree_from_dict
 from alphalineage.core.tree import validate as validate_tree
 from alphalineage.core.types import DType
-from alphalineage.data import paths
+from alphalineage.data import paths, usage
 from alphalineage.data.universe import Membership, Universe, sample_universe
 from alphalineage.library.factors import FactorStore
 
@@ -126,7 +127,16 @@ class FactorPatch(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    factors_dir: str
+    factors_dir: str | None = None
+    tiingo_api_key: str | None = None
+    evaluator: str | None = None
+
+
+class DataClearRequest(BaseModel):
+    category: str
+
+
+_EVALUATORS = {"auto", "python", "cpp"}
 
 
 class SessionCreateRequest(BaseModel):
@@ -515,20 +525,55 @@ def delete_factor(factor_id: str) -> dict[str, str]:
 # --- settings --------------------------------------------------------------------
 @app.get("/settings")
 def get_settings() -> dict[str, Any]:
-    return {"factors_dir": str(paths.factors_dir())}
+    stored = paths.read_settings()
+    return {
+        "factors_dir": str(paths.factors_dir()),
+        "tiingo_api_key_set": bool(paths.tiingo_api_key()),  # never echo the secret itself
+        "evaluator": stored.get("evaluator", "auto"),
+        "cpp_available": cpp.available(),
+    }
 
 
 @app.put("/settings")
 def update_settings(update: SettingsUpdate) -> dict[str, Any]:
-    target = Path(update.factors_dir).expanduser()
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise HTTPException(status_code=400, detail=f"cannot use factors_dir: {exc}") from exc
     settings = paths.read_settings()
-    settings["factors_dir"] = str(target)
+    if update.factors_dir is not None:
+        target = Path(update.factors_dir).expanduser()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"cannot use factors_dir: {exc}") from exc
+        settings["factors_dir"] = str(target)
+    if update.tiingo_api_key is not None:
+        key = update.tiingo_api_key.strip()
+        if key:
+            settings["tiingo_api_key"] = key
+        else:
+            settings.pop("tiingo_api_key", None)  # empty string clears the stored key
+    if update.evaluator is not None:
+        evaluator = update.evaluator.lower()
+        if evaluator not in _EVALUATORS:
+            raise HTTPException(
+                status_code=400, detail=f"evaluator must be one of {sorted(_EVALUATORS)}"
+            )
+        settings["evaluator"] = evaluator
+        cpp.set_backend(evaluator)
     paths.write_settings(settings)
-    return {"factors_dir": str(paths.factors_dir())}
+    return get_settings()
+
+
+# --- local data usage + cleanup --------------------------------------------------
+@app.get("/data/usage")
+def data_usage() -> list[dict[str, Any]]:
+    return usage.usage()
+
+
+@app.post("/data/clear")
+def data_clear(req: DataClearRequest) -> dict[str, Any]:
+    try:
+        return usage.clear(req.category)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --- iterative training sessions -------------------------------------------------
@@ -738,6 +783,24 @@ def stop_session(session_id: str) -> dict[str, bool]:
 
 
 # --- static frontend (single-image Docker serving) -------------------------------
+def _schedule_shutdown() -> None:
+    """Exit the process shortly, after the HTTP response has flushed. Patched out in tests."""
+    threading.Timer(0.4, lambda: os._exit(0)).start()
+
+
+@app.post("/shutdown")
+def shutdown() -> dict[str, bool]:
+    """Stop the app (single-process launcher Quit). Gated so it is inert unless enabled.
+
+    Session state is already persisted to disk after every segment, so an immediate exit is safe;
+    the frontend warns about a running search before calling this.
+    """
+    if os.environ.get("ALPHALINEAGE_ALLOW_SHUTDOWN") != "1":
+        raise HTTPException(status_code=403, detail="shutdown is disabled")
+    _schedule_shutdown()
+    return {"shutting_down": True}
+
+
 def mount_static(directory: str) -> None:
     """Serve the built frontend from ``directory`` at ``/``.
 
@@ -751,3 +814,16 @@ def mount_static(directory: str) -> None:
 _STATIC_DIR = os.environ.get("ALPHALINEAGE_STATIC_DIR")
 if _STATIC_DIR and Path(_STATIC_DIR).is_dir():
     mount_static(_STATIC_DIR)
+
+
+def _apply_persisted_settings() -> None:
+    """Apply runtime-relevant settings (the evaluator choice) once at startup."""
+    try:
+        evaluator = paths.read_settings().get("evaluator")
+        if evaluator:
+            cpp.set_backend(evaluator)
+    except Exception:  # noqa: BLE001 - settings are best-effort at startup
+        pass
+
+
+_apply_persisted_settings()

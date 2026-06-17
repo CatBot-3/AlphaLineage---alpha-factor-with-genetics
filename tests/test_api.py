@@ -255,6 +255,27 @@ def test_static_dir_served_when_configured(tmp_path):
         del app.router.routes[before:]  # remove the mount so other tests see a clean app
 
 
+def test_shutdown_is_gated_and_indirected(client, monkeypatch):
+    import alphalineage.api.app as api_app
+
+    # disabled by default - a stray POST cannot kill the server
+    monkeypatch.delenv("ALPHALINEAGE_ALLOW_SHUTDOWN", raising=False)
+    assert client.post("/shutdown").status_code == 403
+
+    # enabled by the launcher: returns shutting_down and schedules exit (patched, never real)
+    calls = {"n": 0}
+
+    def _fake() -> None:
+        calls["n"] += 1
+
+    monkeypatch.setattr(api_app, "_schedule_shutdown", _fake)
+    monkeypatch.setenv("ALPHALINEAGE_ALLOW_SHUTDOWN", "1")
+    response = client.post("/shutdown")
+    assert response.status_code == 200
+    assert response.json() == {"shutting_down": True}
+    assert calls["n"] == 1
+
+
 def test_jobstore_runs_and_captures_failure():
     store = JobStore()
 

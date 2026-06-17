@@ -55,11 +55,32 @@ def available() -> bool:
     return _EXT is not None
 
 
+# Process-level backend override, set from the persisted UI setting. Resolved without a
+# per-evaluation file read. The ``ALPHALINEAGE_EVALUATOR`` env var stays the explicit force-override
+# (power users / CI); the UI setting governs whenever that env var is unset, which is every normal
+# launch. ``None`` => no override.
+_BACKEND_OVERRIDE: str | None = None
+
+
+def set_backend(choice: str | None) -> None:
+    """Set (clear with ``None``) the runtime evaluator choice: ``auto`` | ``python`` | ``cpp``."""
+    global _BACKEND_OVERRIDE
+    _BACKEND_OVERRIDE = choice.lower() if choice else None
+
+
+def selected_backend() -> str:
+    """The active evaluator selection: env var (force) > UI override > ``auto`` default."""
+    env = os.environ.get("ALPHALINEAGE_EVALUATOR")
+    if env:
+        return env.lower()
+    if _BACKEND_OVERRIDE is not None:
+        return _BACKEND_OVERRIDE
+    return "auto"
+
+
 def backend_enabled() -> bool:
     """True if the selected backend permits C++ and the extension is available."""
-    return (
-        os.environ.get("ALPHALINEAGE_EVALUATOR", "auto").lower() in ("auto", "cpp") and available()
-    )
+    return selected_backend() in ("auto", "cpp") and available()
 
 
 def flatten(node: Node) -> tuple[list[Instruction], int] | None:

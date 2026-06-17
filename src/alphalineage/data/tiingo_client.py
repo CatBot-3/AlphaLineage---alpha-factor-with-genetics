@@ -7,12 +7,10 @@ inputs the adjuster needs. The HTTP session is injectable so tests mock it.
 
 from __future__ import annotations
 
-import os
-
 import pandas as pd
 import requests
 
-from alphalineage.data import schema
+from alphalineage.data import paths, schema
 from alphalineage.data.retry import RateLimiter, with_retry
 
 _BASE_URL = "https://api.tiingo.com"
@@ -70,7 +68,7 @@ class TiingoProvider:
         sleep: object = None,
         max_attempts: int = 5,
     ) -> None:
-        self.api_key = api_key if api_key is not None else os.environ.get("TIINGO_API_KEY")
+        self.api_key = api_key if api_key is not None else paths.tiingo_api_key()
         self.session = session or requests.Session()
         self.base_url = base_url.rstrip("/")
         self.rate_limiter = rate_limiter

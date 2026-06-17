@@ -24,6 +24,10 @@ built-in anti-overfitting suite.
 - Run (CLI): `python scripts/run_gp.py --config configs/dev.yaml`
 - Run (app): `docker compose up` → http://localhost:8000 (single image; the API serves the built UI).
   Fallback: `uvicorn alphalineage.api.app:app --port 8000` + `cd frontend && npm run dev:app`.
+- Run (Windows launcher): `start.cmd` / `start.ps1` — builds the UI, serves API+UI on :8000 in one
+  process, opens a browser; in-app gear menu (⚙) → Quit hits gated `POST /shutdown`
+  (`ALPHALINEAGE_ALLOW_SHUTDOWN=1`) to stop everything. `scripts/Start-AlphaLineage.ps1` is the dev
+  two-process path (Vite :5173 + uvicorn :8000).
 - Demo export: `python scripts/export_demo.py --workspace run-<id> --out frontend/public/demo-run.json`
 
 ## Iterative sessions (V1 finish)

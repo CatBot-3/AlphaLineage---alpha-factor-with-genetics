@@ -578,6 +578,152 @@ select:focus {
   justify-items: start;
 }
 
+/* --- Settings gear menu + Quit (launcher) ------------------------------------ */
+.settings-menu {
+  position: relative;
+}
+
+.gear {
+  border: 1px solid var(--color-ink);
+  background: transparent;
+  color: var(--color-ink);
+  padding: 4px 9px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.gear:hover {
+  background: var(--color-primary);
+  color: var(--color-bg);
+  border-color: var(--color-primary);
+}
+
+.settings-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: var(--z-popover);
+  width: 280px;
+  max-height: 70vh;
+  overflow-y: auto;
+  border: 1px solid var(--color-ink);
+  background: var(--color-bg);
+  box-shadow: 4px 4px 0 var(--color-ink);
+  padding: var(--space-3);
+  display: grid;
+  gap: var(--space-3);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.settings-section {
+  display: grid;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-ink) 20%, transparent);
+}
+
+.settings-section:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.settings-section h5 {
+  margin: 0;
+  color: var(--color-primary);
+  font-size: var(--type-small);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-tiny);
+}
+
+.settings-section > button {
+  border: 1px solid var(--color-ink);
+  background: transparent;
+  color: var(--color-ink);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.settings-section > button:hover:not(:disabled) {
+  background: var(--color-primary);
+  color: var(--color-bg);
+  border-color: var(--color-primary);
+}
+
+.settings-section > button:disabled {
+  opacity: 0.35;
+}
+
+.data-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.data-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: var(--type-small);
+}
+
+.quit-action {
+  border-color: var(--color-danger) !important;
+  color: var(--color-danger) !important;
+  text-align: center !important;
+  font-weight: 600;
+}
+
+.quit-action:hover {
+  background: var(--color-danger) !important;
+  color: var(--color-bg) !important;
+}
+
+.quit-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-popover) + 10);
+  background: color-mix(in srgb, var(--color-ink) 45%, transparent);
+  display: grid;
+  place-items: center;
+}
+
+.quit-dialog {
+  width: min(440px, 92vw);
+  border: 1px solid var(--color-ink);
+  background: var(--color-bg);
+  box-shadow: 6px 6px 0 var(--color-ink);
+  padding: var(--space-5);
+  display: grid;
+  gap: var(--space-3);
+}
+
+.quit-warnings {
+  margin: 0;
+  padding-left: var(--space-4);
+  color: var(--color-danger);
+}
+
+.quit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.goodbye {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  gap: var(--space-3);
+  padding: var(--space-6);
+  color: var(--color-ink);
+}
+
 /* --- Honesty surfacing (B5) --------------------------------------------------- */
 .oos-warning {
   border: 1px solid var(--color-danger);

@@ -88,6 +88,15 @@ def factors_dir() -> Path:
     return data_dir() / "factors"
 
 
+def tiingo_api_key() -> str | None:
+    """The Tiingo data key, resolved env var > settings (set from the UI) > none."""
+    env = os.environ.get("TIINGO_API_KEY")
+    if env:
+        return env
+    key = read_settings().get("tiingo_api_key")
+    return key or None
+
+
 def ensure_dirs() -> None:
     """Create every subdirectory of the data store if missing."""
     for directory in (

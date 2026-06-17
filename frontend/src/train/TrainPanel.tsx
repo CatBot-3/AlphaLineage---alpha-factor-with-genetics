@@ -12,11 +12,13 @@ export function TrainPanel({
   seedIds = [],
   restoreSessionId = null,
   onComplete,
+  onRunningChange,
   onOpenDashboard,
 }: {
   seedIds?: string[];
   restoreSessionId?: string | null;
   onComplete?: (result: RunResult) => void;
+  onRunningChange?: (running: boolean, sessionId: string | null) => void;
   onOpenDashboard?: () => void;
 }) {
   const { sessionId, state, error, phase, start, cont, stop, attach } = useSession(onComplete);
@@ -30,6 +32,11 @@ export function TrainPanel({
       attach(restoreSessionId);
     }
   }, [restoreSessionId, attach]);
+
+  // Surface whether a search is in progress (and which session) so Quit can warn / stop it.
+  useEffect(() => {
+    onRunningChange?.(phase === "running", sessionId);
+  }, [phase, sessionId, onRunningChange]);
 
   const running = phase === "running";
   const done = phase === "done";

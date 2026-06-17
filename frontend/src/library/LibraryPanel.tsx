@@ -2,13 +2,7 @@
 // folder, and seed a new training session from one or more saved factors.
 
 import { useEffect, useState } from "react";
-import {
-  deleteFactor,
-  getSettings,
-  listFactors,
-  putSettings,
-  renameFactor,
-} from "../api/client";
+import { deleteFactor, listFactors, renameFactor } from "../api/client";
 import type { SavedFactor } from "../api/types";
 
 function researchIc(factor: SavedFactor): string {
@@ -19,7 +13,6 @@ function researchIc(factor: SavedFactor): string {
 export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
   const [factors, setFactors] = useState<SavedFactor[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
-  const [factorsDir, setFactorsDir] = useState("");
   const [status, setStatus] = useState<string | null>(null);
 
   function refresh() {
@@ -28,9 +21,6 @@ export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
 
   useEffect(() => {
     refresh();
-    getSettings()
-      .then((s) => setFactorsDir(s.factors_dir))
-      .catch(() => undefined);
   }, []);
 
   function toggle(id: string) {
@@ -48,16 +38,6 @@ export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
     await deleteFactor(id);
     setSelected((prev) => prev.filter((s) => s !== id));
     refresh();
-  }
-
-  async function saveDir() {
-    try {
-      const s = await putSettings(factorsDir);
-      setFactorsDir(s.factors_dir);
-      setStatus(`Library folder set to ${s.factors_dir}`);
-    } catch (e) {
-      setStatus(String(e));
-    }
   }
 
   return (
@@ -105,20 +85,7 @@ export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
         </ul>
       </section>
 
-      <section className="library-settings">
-        <h4>Storage folder</h4>
-        <label className="field">
-          <span className="field-label">Factors directory</span>
-          <input
-            value={factorsDir}
-            aria-label="Factors directory"
-            onChange={(e) => setFactorsDir(e.target.value)}
-          />
-        </label>
-        <button type="button" className="ghost" onClick={saveDir}>
-          Save folder
-        </button>
-      </section>
+      <p className="hint">Change where factors are stored in the ⚙ settings menu.</p>
 
       {status && <p className="surface-message">{status}</p>}
       <p className="disclaimer">Not investment advice. Research output only.</p>

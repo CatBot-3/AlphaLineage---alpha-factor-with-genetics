@@ -1,6 +1,7 @@
 import type { AppMode } from "../api/types";
 import type { ReactNode } from "react";
 import { modeLabel } from "./mode";
+import { SettingsMenu } from "./SettingsMenu";
 
 export type Tab = "train" | "dashboard" | "factor" | "genealogy" | "library" | "extend";
 
@@ -23,6 +24,7 @@ export function AppShell({
   onLoadLocal,
   onSaveBackend,
   onLoadBackend,
+  onQuit,
   children,
 }: {
   mode: AppMode;
@@ -34,6 +36,7 @@ export function AppShell({
   onLoadLocal: () => void;
   onSaveBackend: () => void;
   onLoadBackend: () => void;
+  onQuit: () => void;
   children: ReactNode;
 }) {
   const backend = mode === "app";
@@ -68,21 +71,15 @@ export function AppShell({
         </nav>
         <div className="workspace-tools" aria-label="Workspace">
           <span className="mode-badge">{modeLabel(mode)}</span>
-          <button type="button" onClick={onRefreshRun}>
-            {backend ? "Run search" : "Load demo"}
-          </button>
-          <button type="button" onClick={onSaveLocal}>
-            Save local
-          </button>
-          <button type="button" onClick={onLoadLocal}>
-            Load local
-          </button>
-          <button type="button" onClick={onSaveBackend} disabled={!backend}>
-            Save backend
-          </button>
-          <button type="button" onClick={onLoadBackend} disabled={!backend}>
-            Load backend
-          </button>
+          <SettingsMenu
+            mode={mode}
+            onRefreshRun={onRefreshRun}
+            onSaveLocal={onSaveLocal}
+            onLoadLocal={onLoadLocal}
+            onSaveBackend={onSaveBackend}
+            onLoadBackend={onLoadBackend}
+            onQuit={onQuit}
+          />
         </div>
       </header>
 

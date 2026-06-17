@@ -14,6 +14,7 @@ function renderShell(mode: "demo" | "app" = "demo") {
       onLoadLocal={vi.fn()}
       onSaveBackend={vi.fn()}
       onLoadBackend={vi.fn()}
+      onQuit={vi.fn()}
     >
       <div>content</div>
     </AppShell>,

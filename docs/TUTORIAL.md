@@ -174,7 +174,8 @@ Source: [`cpp/`](../cpp/), [`core/cpp.py`](../src/alphalineage/core/cpp.py)
 
 The evaluator's hot path has an optional pybind11/CMake backend. Pure Python is the default and the
 correctness baseline; when the compiled extension is present it engages automatically and is pinned
-identical to Python by a parity test. Set `ALPHALINEAGE_EVALUATOR=python` to force the baseline.
+identical to Python by a parity test. The backend is selectable at runtime from the gear menu
+(§3.14) — `auto` / `python` / `cpp` — or via `ALPHALINEAGE_EVALUATOR=python` to force the baseline.
 
 ---
 
@@ -206,11 +207,17 @@ The sequence triggered by **Start training**, traced through the components:
 ## 3. How to do everything from the browser
 
 Open the app:
+- **Windows launcher:** double-click **`start.cmd`** (or `powershell -ExecutionPolicy Bypass -File
+  start.ps1`). It builds the UI, runs one process that serves the API and the UI on
+  **http://localhost:8000**, and opens a browser tab. Stop it from the gear menu (⚙ → **Quit**) or
+  `Ctrl+C`.
 - **Docker:** `docker compose up`, then **http://localhost:8000**.
 - **Dev:** backend `uvicorn alphalineage.api.app:app --port 8000`, frontend `cd frontend && npm run
   dev:app`, then **http://localhost:5173**.
 
-The **Train / Library / Extend** tabs require the backend and are disabled in the static demo.
+The **Train / Library / Extend** tabs require the backend and are disabled in the static demo. The
+**gear menu (⚙)** in the top-right holds workspace save/load, settings, the local-data cleaner, and
+Quit (§3.14).
 
 ### 3.1 Define and store a universe
 **Extend** tab → **Define a universe (point-in-time)** panel.
@@ -325,9 +332,32 @@ active tab/selection. An in-flight session is also persisted: reloading the page
 Train tab to it and resumes progress streaming.
 
 ### 3.13 Change where factors are stored
-**Library** tab → **Storage folder** → set **Factors directory** and click **Save folder**.
-Subsequent saves are written there. Resolution order: the `ALPHALINEAGE_FACTORS_DIR` environment
-variable, then this setting, then the default `data_cache/factors/`.
+Gear menu (⚙) → **Settings** → **Factors directory** → enter a path and **Save folder**. Subsequent
+saves are written there. Resolution order: the `ALPHALINEAGE_FACTORS_DIR` environment variable, then
+this setting, then the default `data_cache/factors/`.
+
+### 3.14 The gear menu: settings, data cleanup, and Quit
+The **⚙** button in the top-right opens the control menu (backend/app mode only).
+
+- **Workspace** — the same Run search / Save local / Load local / Save backend / Load backend actions
+  as §3.12.
+- **Settings**
+  - **Tiingo API key** — paste your free [Tiingo](https://www.tiingo.com) key and **Save key** to
+    enable data downloads without editing `.env`. The key is stored server-side and never shown back
+    (the menu only reports whether one is set); an environment variable, if present, takes precedence.
+  - **Evaluator backend** — `auto` (use the compiled C++ evaluator when available, else Python),
+    `python` (force the baseline), or `cpp` (force C++; disabled when the extension is not built). The
+    choice applies immediately and persists.
+  - **Factors directory** — see §3.13.
+- **Local data** — per-category disk usage (market data, custom universes, training sessions, saved
+  factors, saved workspaces) with a **Clear** button each. Clearing deletes that category's files on
+  disk (confirmed first) to reclaim space; it cannot be undone. Cleared market data must be
+  re-downloaded; cleared sessions/factors/workspaces are gone.
+- **Quit AlphaLineage** — shuts the app down. If a search is still running or the best factor isn't
+  saved to the library, the confirmation lists the warning and offers to **Save best factor** and/or
+  **Stop search** first. Confirming **Quit now** stops the single server process (the API and the
+  served UI together); the tab then shows a shutdown notice you can close. (Training sessions are
+  always persisted to disk after every segment, so quitting never loses a completed segment.)
 
 ---
 

@@ -178,6 +178,22 @@ export interface SavedFactor {
 
 export interface Settings {
   factors_dir: string;
+  tiingo_api_key_set: boolean;
+  evaluator: "auto" | "python" | "cpp";
+  cpp_available: boolean;
+}
+
+export interface SettingsUpdate {
+  factors_dir?: string;
+  tiingo_api_key?: string;
+  evaluator?: "auto" | "python" | "cpp";
+}
+
+export interface DataUsageRow {
+  key: string;
+  label: string;
+  bytes: number;
+  count: number;
 }
 
 export function parseFactor(factor: string | FactorNode): FactorNode {

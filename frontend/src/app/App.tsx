@@ -4,6 +4,8 @@ import {
   listWorkspaces,
   saveFactor,
   saveWorkspace,
+  shutdown,
+  stopSession,
 } from "../api/client";
 import { loadRun } from "../api/dataSource";
 import {
@@ -62,6 +64,11 @@ export function App() {
     initialWorkspace?.operatorDraft,
   );
   const [seedIds, setSeedIds] = useState<string[]>([]);
+  const [searchRunning, setSearchRunning] = useState(false);
+  const [runningSessionId, setRunningSessionId] = useState<string | null>(null);
+  const [bestFactorSaved, setBestFactorSaved] = useState(false);
+  const [quitOpen, setQuitOpen] = useState(false);
+  const [shutDown, setShutDown] = useState(false);
   const [status, setStatus] = useState<string | null>(
     initialWorkspace?.run ? "Loaded local workspace" : null,
   );
@@ -122,8 +129,34 @@ export function App() {
 
   function onRunComplete(result: RunResult) {
     setRun(result);
+    setBestFactorSaved(false); // a fresh best factor is not yet in the library
     setTab("dashboard");
     setStatus("Run completed - showing out-of-sample metrics");
+  }
+
+  function onRunningChange(running: boolean, sessionId: string | null) {
+    setSearchRunning(running);
+    setRunningSessionId(sessionId);
+  }
+
+  async function performShutdown() {
+    try {
+      await shutdown();
+    } catch {
+      // the server may drop the connection as it exits; that's expected
+    }
+    setQuitOpen(false);
+    setShutDown(true);
+  }
+
+  async function stopRunningSearch() {
+    if (runningSessionId) {
+      try {
+        await stopSession(runningSessionId);
+      } catch (e) {
+        setStatus(String(e));
+      }
+    }
   }
 
   function onRefreshRun() {
@@ -172,6 +205,7 @@ export function App() {
           test_reads: run.test_reads,
         },
       });
+      setBestFactorSaved(true);
       setStatus("Saved best factor to library");
     } catch (e) {
       setStatus(String(e));
@@ -222,6 +256,19 @@ export function App() {
 
   const factor = run ? parseFactor(run.best_factor) : null;
 
+  if (shutDown) {
+    return (
+      <div className="goodbye" data-testid="goodbye">
+        <h1>AlphaLineage has shut down.</h1>
+        <p>The backend and UI server have stopped. You can close this tab.</p>
+      </div>
+    );
+  }
+
+  const quitWarnings: string[] = [];
+  if (searchRunning) quitWarnings.push("A search is still running.");
+  if (run && !bestFactorSaved) quitWarnings.push("The best factor isn't saved to your library.");
+
   return (
     <AppShell
       mode={mode}
@@ -233,6 +280,7 @@ export function App() {
       onLoadLocal={loadLocal}
       onSaveBackend={saveBackend}
       onLoadBackend={loadBackend}
+      onQuit={() => setQuitOpen(true)}
     >
       <section className="app-page">
         <header className="view-head">
@@ -259,6 +307,7 @@ export function App() {
                 seedIds={seedIds}
                 restoreSessionId={initialWorkspace?.ui.sessionId ?? null}
                 onComplete={onRunComplete}
+                onRunningChange={onRunningChange}
                 onOpenDashboard={() => setTab("dashboard")}
               />
             </div>
@@ -351,6 +400,56 @@ export function App() {
               />
             </div>
           </section>
+        )}
+
+        {quitOpen && (
+          <div className="quit-backdrop" role="dialog" aria-modal="true" data-testid="quit-dialog">
+            <div className="quit-dialog">
+              <h3>Quit AlphaLineage?</h3>
+              {quitWarnings.length > 0 ? (
+                <ul className="quit-warnings">
+                  {quitWarnings.map((w) => (
+                    <li key={w}>{w}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p>This will shut down the backend and the UI server.</p>
+              )}
+              <div className="quit-actions">
+                {run && !bestFactorSaved && (
+                  <button
+                    type="button"
+                    className="ghost"
+                    data-testid="quit-save-factor"
+                    onClick={saveBestFactor}
+                  >
+                    Save best factor
+                  </button>
+                )}
+                {searchRunning && (
+                  <button
+                    type="button"
+                    className="ghost"
+                    data-testid="quit-stop-search"
+                    onClick={stopRunningSearch}
+                  >
+                    Stop search
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="primary-action"
+                  data-testid="quit-confirm"
+                  onClick={performShutdown}
+                >
+                  Quit now
+                </button>
+                <button type="button" className="ghost" onClick={() => setQuitOpen(false)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </section>
     </AppShell>

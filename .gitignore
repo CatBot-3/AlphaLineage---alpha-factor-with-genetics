@@ -1,10 +1,8 @@
-# Secrets
+
 .env
 
-# Local data store (pulled stock data)
 data_cache/
 
-# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -12,11 +10,9 @@ __pycache__/
 build/
 dist/
 
-# Virtual envs
 .venv/
 venv/
 
-# Tooling caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -26,10 +22,7 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
-CLAUDE.md
-DEVELOPMENT_PLAN.md
 
-# Compiled C++ evaluator extension (build it with scripts/build_cpp.py; platform-specific)
 cpp/build/
 src/alphalineage/_evaluator*.pyd
 src/alphalineage/_evaluator*.so

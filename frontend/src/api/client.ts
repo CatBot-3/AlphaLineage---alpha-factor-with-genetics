@@ -1,6 +1,7 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
 import type {
+  DataUsageRow,
   Lineage,
   OperatorSpec,
   RunResult,
@@ -11,6 +12,7 @@ import type {
   SessionState,
   SessionSummary,
   Settings,
+  SettingsUpdate,
   UniverseInfo,
   UniverseSpec,
   WorkspaceSnapshot,
@@ -219,11 +221,25 @@ export async function getSettings(): Promise<Settings> {
   return jsonOrThrow(await fetch(`${BASE}/settings`), "load settings");
 }
 
-export async function putSettings(factorsDir: string): Promise<Settings> {
+export async function putSettings(update: SettingsUpdate): Promise<Settings> {
   const res = await fetch(`${BASE}/settings`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ factors_dir: factorsDir }),
+    body: JSON.stringify(update),
   });
   return jsonOrThrow(res, "update settings");
+}
+
+// --- local data usage + cleanup ------------------------------------------------
+export async function getDataUsage(): Promise<DataUsageRow[]> {
+  return jsonOrThrow(await fetch(`${BASE}/data/usage`), "load data usage");
+}
+
+export async function clearData(category: string): Promise<DataUsageRow> {
+  return jsonOrThrow(await POST("/data/clear", { category }), "clear data");
+}
+
+// --- shutdown (single-process launcher Quit) -----------------------------------
+export async function shutdown(): Promise<{ shutting_down: boolean }> {
+  return jsonOrThrow(await POST("/shutdown", {}), "shutdown");
 }
