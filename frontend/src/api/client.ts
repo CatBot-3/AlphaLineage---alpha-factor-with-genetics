@@ -23,10 +23,20 @@ import type {
 // sets an explicit base for the Vite dev server, which runs on a different port.
 const BASE = import.meta.env.VITE_API_BASE ?? "";
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function jsonOrThrow<T>(res: Response, action: string): Promise<T> {
   if (!res.ok) {
     const detail = (await res.json().catch(() => ({}))) as { detail?: string };
-    throw new Error(detail.detail ?? `${action} failed: ${res.status}`);
+    throw new ApiError(detail.detail ?? `${action} failed: ${res.status}`, res.status);
   }
   return (await res.json()) as T;
 }

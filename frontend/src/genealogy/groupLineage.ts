@@ -45,9 +45,10 @@ function bestOf(values: Array<number | null>): number | null {
   return present.length ? Math.max(...present) : null;
 }
 
-export function groupLineage(lineage: Lineage): GenerationGroup[] {
+export function groupLineage(lineage: Lineage | null | undefined): GenerationGroup[] {
+  const nodes = lineage?.nodes ?? [];
   const byGen = new Map<number, LineageNode[]>();
-  for (const node of lineage.nodes) {
+  for (const node of nodes) {
     const bucket = byGen.get(node.generation) ?? [];
     bucket.push(node);
     byGen.set(node.generation, bucket);

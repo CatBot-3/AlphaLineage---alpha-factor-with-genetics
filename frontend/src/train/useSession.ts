@@ -4,6 +4,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ApiError,
   continueSession,
   createSession,
   getSession,
@@ -25,9 +26,18 @@ export function useSession(onComplete?: (result: RunResult) => void) {
   const [pollToken, setPollToken] = useState(0);
   const [state, setState] = useState<SessionState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
   const firedRef = useRef(false);
+
+  const reset = useCallback(() => {
+    firedRef.current = false;
+    setSessionId(null);
+    setState(null);
+    setError(null);
+    setPollToken((t) => t + 1);
+  }, []);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -52,7 +62,18 @@ export function useSession(onComplete?: (result: RunResult) => void) {
           return;
         }
       } catch (e) {
-        if (active) setError(String(e));
+        if (!active) return;
+        // A 404 means the session no longer exists (e.g. its data was cleared) - drop back to
+        // the idle form rather than trapping the user on a dead error page.
+        if (e instanceof ApiError && e.status === 404) {
+          firedRef.current = false;
+          setSessionId(null);
+          setState(null);
+          setError(null);
+          setNotice("That session no longer exists - start a new one.");
+        } else {
+          setError(String(e));
+        }
         return;
       }
       timer = setTimeout(tick, POLL_MS);
@@ -67,6 +88,7 @@ export function useSession(onComplete?: (result: RunResult) => void) {
 
   const start = useCallback(async (req: SessionCreateRequest) => {
     setError(null);
+    setNotice(null);
     setState(null);
     firedRef.current = false;
     try {
@@ -105,6 +127,7 @@ export function useSession(onComplete?: (result: RunResult) => void) {
   const attach = useCallback((id: string) => {
     firedRef.current = false;
     setError(null);
+    setNotice(null);
     setSessionId(id);
     setPollToken((t) => t + 1);
   }, []);
@@ -113,5 +136,5 @@ export function useSession(onComplete?: (result: RunResult) => void) {
     ? "failed"
     : (state?.job?.status as SessionPhase | undefined) ?? (sessionId ? "running" : "idle");
 
-  return { sessionId, state, error, phase, start, cont, stop, attach };
+  return { sessionId, state, error, notice, phase, start, cont, stop, attach, reset };
 }

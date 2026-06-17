@@ -1,6 +1,5 @@
 import type { AppMode } from "../api/types";
 import type { ReactNode } from "react";
-import { modeLabel } from "./mode";
 import { SettingsMenu } from "./SettingsMenu";
 
 export type Tab = "train" | "dashboard" | "factor" | "genealogy" | "library" | "extend";
@@ -70,7 +69,6 @@ export function AppShell({
           </div>
         </nav>
         <div className="workspace-tools" aria-label="Workspace">
-          <span className="mode-badge">{modeLabel(mode)}</span>
           <SettingsMenu
             mode={mode}
             onRefreshRun={onRefreshRun}

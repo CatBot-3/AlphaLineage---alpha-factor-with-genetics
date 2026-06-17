@@ -21,7 +21,8 @@ export function TrainPanel({
   onRunningChange?: (running: boolean, sessionId: string | null) => void;
   onOpenDashboard?: () => void;
 }) {
-  const { sessionId, state, error, phase, start, cont, stop, attach } = useSession(onComplete);
+  const { sessionId, state, error, notice, phase, start, cont, stop, attach, reset } =
+    useSession(onComplete);
   const [moreGenerations, setMoreGenerations] = useState(5);
 
   // On reload, re-attach to a persisted session so an in-flight run keeps streaming progress.
@@ -52,6 +53,8 @@ export function TrainPanel({
 
   return (
     <div className="train-panel" data-testid="train-panel">
+      {notice && <p className="surface-message" data-testid="train-notice">{notice}</p>}
+
       {!sessionId && (
         <RunConfigForm initialSeedIds={seedIds} onStart={handleStart} disabled={running} />
       )}
@@ -60,7 +63,17 @@ export function TrainPanel({
 
       {sessionId && (
         <section className="train-status">
-          <ProgressView progress={state?.job?.progress ?? null} phase={phase} onStop={stop} />
+          <div className="train-status-head">
+            <ProgressView progress={state?.job?.progress ?? null} phase={phase} onStop={stop} />
+            <button
+              type="button"
+              className="ghost"
+              data-testid="new-session"
+              onClick={reset}
+            >
+              New session
+            </button>
+          </div>
 
           {state && (
             <dl className="train-counts" data-testid="train-counts">

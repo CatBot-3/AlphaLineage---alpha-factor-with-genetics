@@ -31,4 +31,10 @@ describe("ancestry (B4)", () => {
   it("returns null for an empty lineage", () => {
     expect(bestFinalNode({ run_id: "r", metadata: {}, nodes: [] })).toBeNull();
   });
+
+  it("does not throw on a missing/malformed lineage", () => {
+    expect(bestFinalNode(undefined)).toBeNull();
+    expect(bestFinalNode({} as unknown as Lineage)).toBeNull();
+    expect(ancestorClosure({ run_id: "r", metadata: {}, nodes: [] }, 5).nodes).toEqual([]);
+  });
 });

@@ -24,6 +24,14 @@ export function Genealogy({
   const [focusId, setFocusId] = useState<number | null>(null);
   const generations = useMemo(() => groupLineage(lineage), [lineage]);
 
+  if (!lineage?.nodes?.length) {
+    return (
+      <div className="genealogy" data-testid="genealogy">
+        <p className="hint">No lineage to display for this run.</p>
+      </div>
+    );
+  }
+
   function trace(id: number) {
     setFocusId(id);
     setMode("ancestry");

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  getSessionLineage,
   getWorkspace,
   listWorkspaces,
   saveFactor,
@@ -27,6 +28,7 @@ import { LineageDetail } from "../genealogy/LineageDetail";
 import { LibraryPanel } from "../library/LibraryPanel";
 import { TrainPanel } from "../train/TrainPanel";
 import { AppShell, type Tab } from "./AppShell";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { getAppMode } from "./mode";
 import {
   makeWorkspaceSnapshot,
@@ -127,8 +129,18 @@ export function App() {
     writeLocalWorkspace(currentSnapshot());
   }, [currentSnapshot]);
 
-  function onRunComplete(result: RunResult) {
-    setRun(result);
+  async function onRunComplete(result: RunResult) {
+    // GET /sessions/{id} strips the (large) lineage from the result; fetch it so the Genealogy
+    // view has data. Demo runs already carry lineage and have no session_id, so they skip this.
+    let full = result;
+    if (result.session_id && !result.lineage?.nodes?.length) {
+      try {
+        full = { ...result, lineage: await getSessionLineage(result.session_id) };
+      } catch {
+        // keep the stripped result; the genealogy view will show an empty state, not crash
+      }
+    }
+    setRun(full);
     setBestFactorSaved(false); // a fresh best factor is not yet in the library
     setTab("dashboard");
     setStatus("Run completed - showing out-of-sample metrics");
@@ -296,6 +308,7 @@ export function App() {
         {error && <p className="error surface-message">{error}</p>}
         {loading && !run && <p className="surface-message">Loading...</p>}
 
+        <ErrorBoundary key={tab}>
         {tab === "train" && (
           <section className="view-card" data-view="train">
             <div className="view-rail">
@@ -401,6 +414,7 @@ export function App() {
             </div>
           </section>
         )}
+        </ErrorBoundary>
 
         {quitOpen && (
           <div className="quit-backdrop" role="dialog" aria-modal="true" data-testid="quit-dialog">

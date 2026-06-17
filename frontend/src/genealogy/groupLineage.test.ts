@@ -46,6 +46,13 @@ describe("groupLineage (B4)", () => {
     expect(generations[0].bestFitness).toBe(0.5);
   });
 
+  it("returns empty (never throws) for missing or empty nodes", () => {
+    expect(groupLineage(undefined)).toEqual([]);
+    expect(groupLineage({ run_id: "r", metadata: {}, nodes: [] })).toEqual([]);
+    // a malformed lineage with no nodes array must not crash the render
+    expect(groupLineage({} as unknown as Lineage)).toEqual([]);
+  });
+
   it("tolerates missing fitness (old demo runs)", () => {
     const noFit: Lineage = {
       run_id: "r",

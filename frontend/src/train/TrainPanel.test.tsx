@@ -7,7 +7,20 @@ const continueSession = vi.fn();
 const getSession = vi.fn();
 const stopSession = vi.fn();
 
+// Defined via vi.hoisted so it's available inside the hoisted vi.mock factory below.
+const { ApiError } = vi.hoisted(() => ({
+  ApiError: class ApiError extends Error {
+    constructor(
+      message: string,
+      public status: number,
+    ) {
+      super(message);
+    }
+  },
+}));
+
 vi.mock("../api/client", () => ({
+  ApiError,
   createSession: (req: SessionCreateRequest) => createSession(req),
   continueSession: (id: string, req: SessionContinueRequest) => continueSession(id, req),
   getSession: (id: string) => getSession(id),
@@ -73,5 +86,27 @@ describe("TrainPanel (B2)", () => {
     fireEvent.click(screen.getByTestId("continue-run"));
 
     await waitFor(() => expect(continueSession).toHaveBeenCalledWith("s1", { generations: 3 }));
+  });
+
+  it("returns to the run-config form when a restored session 404s (deleted)", async () => {
+    getSession.mockRejectedValue(new ApiError("unknown session", 404));
+    render(<TrainPanel restoreSessionId="gone" />);
+
+    // instead of a dead error page, the notice + the form come back
+    expect(await screen.findByTestId("train-notice")).toHaveTextContent(/no longer exists/i);
+    expect(await screen.findByTestId("run-config-form")).toBeInTheDocument();
+  });
+
+  it("lets the user start a new session from a finished one", async () => {
+    createSession.mockResolvedValue({ session_id: "s1", job_id: "j1" });
+    getSession.mockResolvedValue(DONE_SESSION);
+
+    render(<TrainPanel />);
+    fireEvent.submit(await screen.findByTestId("run-config-form"));
+    await screen.findByTestId("train-continue");
+
+    fireEvent.click(screen.getByTestId("new-session"));
+    // back to the form, ready to launch a fresh session
+    expect(await screen.findByTestId("run-config-form")).toBeInTheDocument();
   });
 });
