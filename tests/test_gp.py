@@ -70,6 +70,86 @@ def test_checkpoint_resume(signal_panel, tmp_path):
     assert straight.history == resumed.history
 
 
+def test_seeded_init_contains_seeds_and_marks_lineage(signal_panel):
+    from alphalineage.library.store import LineageStore
+
+    panel, _ = signal_panel
+    seeds = [
+        Node("rank", (Node("ts_mean", (Node("close"), Node("window", value=5))),)),
+        Node("rank", (Node("volume"),)),
+    ]
+    store = LineageStore()
+    gp = GP(
+        GPConfig(population_size=20, generations=1, max_depth=5, max_nodes=25, seed=7),
+        panel,
+        recorder=store,
+    )
+    gp.initialize(seeds)
+
+    assert [to_json(i.tree) for i in gp.population[:2]] == [to_json(s) for s in seeds]
+    gen0 = [n for n in store.nodes if n.generation == 0]
+    assert [n.op for n in gen0[:2]] == ["seed", "seed"]
+    assert all(n.op == "init" for n in gen0[2:])
+
+
+def test_seed_rejected_with_named_offender(signal_panel):
+    panel, _ = signal_panel
+    gp = GP(GPConfig(population_size=10, max_depth=2, max_nodes=5, seed=0), panel)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="bogus"):
+        gp.initialize([Node("bogus")])
+    # a WINDOW-typed root cannot seed a SIGNAL population
+    with pytest.raises(ValueError, match="window"):
+        gp.initialize([Node("window", value=5)])
+    # depth/size limits hold for seeds too
+    deep = Node("rank", (Node("ts_mean", (Node("close"), Node("window", value=5))),))
+    with pytest.raises(ValueError, match="depth"):
+        gp.initialize([deep])
+
+
+def test_checkpoint_carries_trial_count(signal_panel, tmp_path):
+    panel, _ = signal_panel
+    config = GPConfig(population_size=20, generations=3, max_depth=4, max_nodes=20, seed=5)
+    ckpt = tmp_path / "ckpt.json"
+
+    partial = GP(config, panel)
+    partial.run(generations=2, checkpoint_path=ckpt)
+    counted = partial.trial_count
+    assert counted > 0
+
+    resumed = GP.from_checkpoint(ckpt, panel)
+    assert resumed.trial_count == counted  # never silently resets to 0
+    resumed.run()
+    assert resumed.trial_count >= counted
+
+
+def test_stop_callback_halts_early(signal_panel):
+    panel, _ = signal_panel
+    config = GPConfig(population_size=20, generations=50, max_depth=4, max_nodes=20, seed=6)
+    gp = GP(config, panel)
+    gp.run(stop=lambda: gp.generation >= 2)
+    assert gp.generation == 2
+
+
+def test_rescore_on_new_panel_changes_fitness_not_trees(signal_panel, noise_panel):
+    panel, _ = signal_panel
+    config = GPConfig(population_size=20, generations=2, max_depth=4, max_nodes=20, seed=8)
+    gp = GP(config, panel)
+    gp.run()
+    trees_before = [to_json(i.tree) for i in gp.population]
+    fits_before = [i.fitness for i in gp.population]
+    trials_before = gp.trial_count
+
+    gp.panel = noise_panel
+    gp.rescore_population()
+
+    assert [to_json(i.tree) for i in gp.population] == trees_before
+    assert [i.fitness for i in gp.population] != fits_before
+    assert gp.trial_count >= trials_before  # counted trials never shrink
+
+
 # --- supporting -----------------------------------------------------------------
 def test_tournament_selects_best(signal_panel):
     panel, _ = signal_panel

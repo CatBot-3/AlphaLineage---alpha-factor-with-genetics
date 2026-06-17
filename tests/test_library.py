@@ -45,6 +45,34 @@ def test_lineage_replay(signal_panel, tmp_path):
             assert all(p in ids and p < node.id for p in node.parents)
 
 
+def test_lineage_records_fitness(signal_panel, tmp_path):
+    panel, _ = signal_panel
+    store = LineageStore()
+    gp = GP(
+        GPConfig(population_size=15, generations=2, max_depth=4, max_nodes=20, seed=2),
+        panel,
+        recorder=store,
+    )
+    gp.run()
+
+    assert all(isinstance(n.fitness, float) for n in store.nodes)
+    # the final generation's recorded fitnesses match the population's
+    final = [n for n in store.nodes if n.generation == gp.generation]
+    assert [n.fitness for n in final] == [i.fitness for i in gp.population]
+
+    # round-trips through JSON; files without fitness load as None
+    loaded = LineageStore.load(store.save(tmp_path / "lineage.json"))
+    assert [n.fitness for n in loaded.nodes] == [n.fitness for n in store.nodes]
+    legacy = store.to_dict()
+    for node in legacy["nodes"]:
+        node.pop("fitness", None)
+    import json
+
+    legacy_path = tmp_path / "legacy.json"
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert all(n.fitness is None for n in LineageStore.load(legacy_path).nodes)
+
+
 def test_diversity_threshold(synthetic_panel):
     panel = synthetic_panel
     trees = [

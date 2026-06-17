@@ -299,6 +299,21 @@ Acceptance (`tests/test_extensibility.py`):
 
 ### Phase P — Packaging & Delivery (the V1 ship step)
 
+> **Status: shipped.** `Dockerfile` + `docker-compose.yml` build one image (Node builds the UI;
+> Python serves both the API and the built UI on the same origin via `ALPHALINEAGE_STATIC_DIR`).
+> Demo export is `scripts/export_demo.py` + `src/alphalineage/library/export.py` (round-trip covered
+> by `tests/test_demo_export.py`); `frontend/public/demo-run.json` is regenerated from a real run.
+> `README.md` is the Docker-first recipe with a pip/uv fallback, and `docs/TUTORIAL.md` is the full
+> plain-language guide. Acceptance items 2–4 verified locally; item 1 (`docker compose up` on a clean
+> machine) is run on a Docker host.
+>
+> **V1 finish (post-Phase-7, this push):** iterative training **sessions** (`api/sessions.py`) — a
+> search grown over segments with warm-start continue, seed-from-saved-factors, a frozen test
+> boundary, cumulative trial counts and counted OOS reads; a saved-factor **library**
+> (`library/factors.py`) with a user-configurable storage dir; live run progress + stop
+> (`api/progress.py`); and a redesigned **genealogy** view (grouped-by-method generation list +
+> focused ancestry trace) so it stays legible at thousands of nodes.
+
 Goal: a one-command local run and a zero-backend public demo, so non-developers can try the project.
 
 **Distribution decision — two frontend build targets** (decided in Phase 5; they are distinct builds

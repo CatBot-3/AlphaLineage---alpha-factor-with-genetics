@@ -35,7 +35,14 @@ describe("AppShell", () => {
       .map((button) => button.textContent);
 
     expect(appLabels).toEqual(demoLabels);
-    expect(demoLabels).toEqual(["Metrics", "Best factor", "Genealogy", "Extend"]);
+    expect(demoLabels).toEqual([
+      "Train",
+      "Metrics",
+      "Best factor",
+      "Genealogy",
+      "Library",
+      "Extend",
+    ]);
   });
 
   it("marks backend tools as read-only in static demo mode", () => {

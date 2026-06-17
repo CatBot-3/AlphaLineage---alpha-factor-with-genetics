@@ -1,16 +1,40 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
 import type {
+  Lineage,
   OperatorSpec,
-  PrimitiveInfo,
   RunResult,
+  PrimitiveInfo,
+  SavedFactor,
+  SessionContinueRequest,
+  SessionCreateRequest,
+  SessionState,
+  SessionSummary,
+  Settings,
   UniverseInfo,
   UniverseSpec,
   WorkspaceSnapshot,
   WorkspaceSummary,
 } from "./types";
 
-const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+// Same-origin by default (the Docker image serves the UI from the API host); `.env.app`
+// sets an explicit base for the Vite dev server, which runs on a different port.
+const BASE = import.meta.env.VITE_API_BASE ?? "";
+
+async function jsonOrThrow<T>(res: Response, action: string): Promise<T> {
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(detail.detail ?? `${action} failed: ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
+const POST = (path: string, body: unknown): Promise<Response> =>
+  fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
 export interface RunConfig {
   population_size?: number;
@@ -126,4 +150,80 @@ export async function getWorkspace(id: string): Promise<WorkspaceSnapshot> {
 export async function deleteWorkspace(id: string): Promise<void> {
   const res = await fetch(`${BASE}/workspaces/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`workspace delete failed: ${res.status}`);
+}
+
+// --- iterative training sessions (A4/A5) ---------------------------------------
+export interface SessionHandle {
+  session_id: string;
+  job_id: string;
+}
+
+export async function createSession(req: SessionCreateRequest): Promise<SessionHandle> {
+  return jsonOrThrow(await POST("/sessions", req), "create session");
+}
+
+export async function continueSession(
+  sessionId: string,
+  req: SessionContinueRequest,
+): Promise<SessionHandle> {
+  return jsonOrThrow(await POST(`/sessions/${encodeURIComponent(sessionId)}/continue`, req), "continue session");
+}
+
+export async function getSession(sessionId: string): Promise<SessionState> {
+  return jsonOrThrow(await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`), "load session");
+}
+
+export async function listSessions(): Promise<SessionSummary[]> {
+  return jsonOrThrow(await fetch(`${BASE}/sessions`), "list sessions");
+}
+
+export async function getSessionLineage(sessionId: string): Promise<Lineage> {
+  return jsonOrThrow(await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/lineage`), "load lineage");
+}
+
+export async function stopSession(sessionId: string): Promise<{ stopping: boolean }> {
+  return jsonOrThrow(await POST(`/sessions/${encodeURIComponent(sessionId)}/stop`, {}), "stop session");
+}
+
+// --- saved factors (A3) --------------------------------------------------------
+export async function listFactors(): Promise<SavedFactor[]> {
+  return jsonOrThrow(await fetch(`${BASE}/factors`), "list factors");
+}
+
+export async function saveFactor(payload: {
+  name: string;
+  tree: unknown;
+  metrics?: Record<string, number>;
+  provenance?: Record<string, unknown>;
+  notes?: string;
+}): Promise<SavedFactor> {
+  return jsonOrThrow(await POST("/factors", payload), "save factor");
+}
+
+export async function deleteFactor(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/factors/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`delete factor failed: ${res.status}`);
+}
+
+export async function renameFactor(id: string, name: string): Promise<SavedFactor> {
+  const res = await fetch(`${BASE}/factors/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  return jsonOrThrow(res, "rename factor");
+}
+
+// --- settings ------------------------------------------------------------------
+export async function getSettings(): Promise<Settings> {
+  return jsonOrThrow(await fetch(`${BASE}/settings`), "load settings");
+}
+
+export async function putSettings(factorsDir: string): Promise<Settings> {
+  const res = await fetch(`${BASE}/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ factors_dir: factorsDir }),
+  });
+  return jsonOrThrow(res, "update settings");
 }

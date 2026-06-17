@@ -83,6 +83,35 @@ def register_operator(
     return prim
 
 
+def ensure_operator(
+    name: str,
+    arg_types: Sequence[DType],
+    out_type: DType,
+    body: Node | dict[str, Any],
+) -> Primitive:
+    """Idempotently register a user operator.
+
+    No-op (returns the existing primitive) when an identical operator is already
+    registered; raises ``InvalidOperator`` when the name is taken by a different
+    definition or a built-in. Used to re-materialize a saved factor's operators
+    before seeding a session (invariant 5: still data, never code).
+    """
+    types = tuple(arg_types)
+    body_node = body if isinstance(body, Node) else from_dict(body)
+    existing = USER_OPERATORS.get(name)
+    if existing is not None:
+        if (
+            existing.arg_types == types
+            and existing.out_type == out_type
+            and existing.macro_body == body_node
+        ):
+            return existing
+        raise InvalidOperator(f"{name!r} already registered with a different definition")
+    if name in REGISTRY:  # a built-in (or other non-macro primitive) holds this name
+        raise InvalidOperator(f"{name!r} already exists; choose another name")
+    return register_operator(name, types, out_type, body_node)
+
+
 def unregister_operator(name: str) -> None:
     """Remove a user operator (never a built-in)."""
     USER_OPERATORS.pop(name, None)

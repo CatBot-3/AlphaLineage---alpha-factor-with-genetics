@@ -26,6 +26,8 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+CLAUDE.md
+DEVELOPMENT_PLAN.md
 
 # Compiled C++ evaluator extension (build it with scripts/build_cpp.py; platform-specific)
 cpp/build/

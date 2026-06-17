@@ -1,3 +1,5 @@
 {
-    "cmake.sourceDirectory": "F:/Alpha-Factor Mining/cpp"
+    "cmake.sourceDirectory": "F:/Alpha-Factor Mining/cpp",
+    "cmake.configureOnOpen": false,
+    "cmake.automaticReconfigure": false
 }

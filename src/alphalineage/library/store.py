@@ -27,6 +27,7 @@ class LineageNode:
     op: str
     parents: list[int]
     tree: Node
+    fitness: float | None = None
 
 
 @dataclass
@@ -39,25 +40,52 @@ class LineageStore:
     _next_id: int = 0
     _current_gen_ids: list[int] = field(default_factory=list)
 
-    def _add(self, generation: int, op: str, parents: list[int], tree: Node) -> int:
+    def _add(
+        self,
+        generation: int,
+        op: str,
+        parents: list[int],
+        tree: Node,
+        fitness: float | None = None,
+    ) -> int:
         node_id = self._next_id
         self._next_id += 1
-        self.nodes.append(LineageNode(node_id, generation, op, list(parents), tree))
+        self.nodes.append(LineageNode(node_id, generation, op, list(parents), tree, fitness))
         return node_id
 
     # --- recorder protocol (called by GP) ----------------------------------------
-    def on_init(self, trees: Sequence[Node]) -> None:
-        self._current_gen_ids = [self._add(0, "init", [], t) for t in trees]
+    def on_init(
+        self,
+        trees: Sequence[Node],
+        *,
+        fitnesses: Sequence[float] | None = None,
+        ops: Sequence[str] | None = None,
+    ) -> None:
+        fits: list[float | None] = list(fitnesses) if fitnesses is not None else [None] * len(trees)
+        labels = ops if ops is not None else ["init"] * len(trees)
+        self._current_gen_ids = [
+            self._add(0, op, [], t, fit) for t, op, fit in zip(trees, labels, fits, strict=True)
+        ]
 
     def on_generation(
-        self, generation: int, entries: Sequence[tuple[Node, list[int], str]]
+        self, generation: int, entries: Sequence[tuple[Node, list[int], str, float]]
     ) -> None:
         previous = self._current_gen_ids
         new_ids = []
-        for tree, parent_indices, op in entries:
+        for tree, parent_indices, op, *rest in entries:
             parent_ids = [previous[i] for i in parent_indices]
-            new_ids.append(self._add(generation, op, parent_ids, tree))
+            fitness = float(rest[0]) if rest else None
+            new_ids.append(self._add(generation, op, parent_ids, tree, fitness))
         self._current_gen_ids = new_ids
+
+    def continue_from(self, generation: int) -> None:
+        """Re-point the recorder at ``generation`` so a resumed run's parents resolve.
+
+        After loading a persisted lineage to keep recording into (a warm-started session
+        segment), the next ``on_generation`` must map parent indices onto the node ids of
+        the last recorded generation - in population order, which is append order here.
+        """
+        self._current_gen_ids = [n.id for n in self.nodes if n.generation == generation]
 
     # --- queries ------------------------------------------------------------------
     def generations(self) -> list[list[Node]]:
@@ -82,6 +110,7 @@ class LineageStore:
                     "op": n.op,
                     "parents": n.parents,
                     "tree": tree_to_dict(n.tree),
+                    "fitness": n.fitness,
                 }
                 for n in self.nodes
             ],
@@ -99,7 +128,14 @@ class LineageStore:
         store = cls(run_id=data.get("run_id", "run"))
         store.metadata = data.get("metadata", {})
         store.nodes = [
-            LineageNode(n["id"], n["generation"], n["op"], n["parents"], tree_from_dict(n["tree"]))
+            LineageNode(
+                n["id"],
+                n["generation"],
+                n["op"],
+                n["parents"],
+                tree_from_dict(n["tree"]),
+                n.get("fitness"),
+            )
             for n in data["nodes"]
         ]
         store._next_id = max((n.id for n in store.nodes), default=-1) + 1

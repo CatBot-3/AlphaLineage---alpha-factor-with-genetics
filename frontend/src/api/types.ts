@@ -23,6 +23,7 @@ export interface LineageNode {
   op: string;
   parents: number[];
   tree: FactorNode;
+  fitness?: number | null; // present for runs >= the session/genealogy redesign; null for old demos
 }
 
 export interface Lineage {
@@ -44,6 +45,139 @@ export interface RunResult {
   generations: number;
   history: HistoryPoint[];
   lineage: Lineage;
+  // session-aware fields (present for runs launched as a session segment)
+  session_id?: string;
+  segment?: number;
+  test_reads?: number;
+  cumulative_trials?: number;
+  repeated_oos_warning?: boolean;
+}
+
+// --- iterative sessions (A4/A5) ------------------------------------------------
+export interface GpConfig {
+  population_size: number;
+  generations: number;
+  tournament_size: number;
+  crossover_rate: number;
+  subtree_mutation_rate: number;
+  point_mutation_rate: number;
+  max_depth: number;
+  max_nodes: number;
+  parsimony: number;
+  elitism: number;
+  ic_method: string;
+  min_names: number;
+  horizon: number;
+  min_depth: number;
+  seed: number;
+  time_budget_s: number | null;
+}
+
+export interface ProgressSnapshot {
+  phase: string;
+  generation: number;
+  target_generations: number;
+  history: Array<{ generation: number; best_fitness: number; mean_fitness: number }>;
+  best: { tree: string; fitness: number } | null;
+}
+
+export interface SessionBoundaries {
+  train_end: string;
+  valid_start: string;
+  valid_end: string;
+  test_start: string;
+  embargo: number;
+}
+
+export interface SessionSegment {
+  index: number;
+  universe: string;
+  config: Partial<GpConfig>;
+  gen_start: number;
+  gen_end: number;
+  new_trials: number;
+  status: string;
+}
+
+export interface SessionJob {
+  id: string;
+  status: string; // queued | running | done | failed
+  progress: ProgressSnapshot | null;
+}
+
+export interface SessionState {
+  id: string;
+  name: string;
+  created_at: string;
+  universe: string;
+  as_of: string;
+  boundaries: SessionBoundaries;
+  config: Partial<GpConfig>;
+  operators: OperatorSpec[];
+  seed_factor_ids: string[];
+  trial_baseline: number;
+  cumulative_trials: number;
+  test_reads: number;
+  segments: SessionSegment[];
+  last_job_id: string | null;
+  job: SessionJob | null;
+  result: RunResult | null;
+}
+
+export interface SessionSummary {
+  id: string;
+  name: string;
+  created_at: string;
+  universe: string;
+  segments: number;
+  cumulative_trials: number;
+  test_reads: number;
+}
+
+export interface SessionCreateRequest {
+  name?: string;
+  universe?: string;
+  as_of?: string;
+  config?: Partial<GpConfig>;
+  operators?: OperatorSpec[];
+  seed_factor_ids?: string[];
+  train?: number;
+  valid?: number;
+  embargo?: number;
+}
+
+export interface SessionContinueRequest {
+  generations: number;
+  config?: Partial<GpConfig>;
+  universe?: string | null;
+  operators?: OperatorSpec[];
+  seed_factor_ids?: string[];
+}
+
+// --- saved factors (A3) --------------------------------------------------------
+export interface FactorProvenance {
+  session_id?: string;
+  generation?: number;
+  universe?: string;
+  cumulative_trials?: number;
+  test_reads?: number;
+  test_start?: string;
+}
+
+export interface SavedFactor {
+  id: string;
+  name: string;
+  saved_at: string;
+  tree: FactorNode;
+  metrics: Record<string, number>;
+  provenance: FactorProvenance;
+  required_operators: OperatorSpec[];
+  notes: string;
+  disclaimer: string;
+}
+
+export interface Settings {
+  factors_dir: string;
 }
 
 export function parseFactor(factor: string | FactorNode): FactorNode {
@@ -111,9 +245,10 @@ export interface OperatorComposerDraft {
 }
 
 export interface WorkspaceUiState {
-  selectedTab?: "dashboard" | "factor" | "genealogy" | "extend";
+  selectedTab?: "train" | "dashboard" | "factor" | "genealogy" | "extend" | "library";
   selectedFactorNode?: { name: string; value?: number } | null;
   selectedLineage?: number | null;
+  sessionId?: string | null;
 }
 
 export interface WorkspaceSnapshot {

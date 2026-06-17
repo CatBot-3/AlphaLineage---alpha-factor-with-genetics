@@ -2,12 +2,14 @@ import type { AppMode } from "../api/types";
 import type { ReactNode } from "react";
 import { modeLabel } from "./mode";
 
-export type Tab = "dashboard" | "factor" | "genealogy" | "extend";
+export type Tab = "train" | "dashboard" | "factor" | "genealogy" | "library" | "extend";
 
 const TABS: Array<{ id: Tab; label: string; backendOnly?: boolean }> = [
+  { id: "train", label: "Train", backendOnly: true },
   { id: "dashboard", label: "Metrics" },
   { id: "factor", label: "Best factor" },
   { id: "genealogy", label: "Genealogy" },
+  { id: "library", label: "Library", backendOnly: true },
   { id: "extend", label: "Extend", backendOnly: true },
 ];
 

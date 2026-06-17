@@ -170,6 +170,91 @@ def test_invalid_workspace_payload_is_rejected(client):
     assert response.status_code == 422
 
 
+def test_run_progress_reaches_target(client):
+    config = {"population_size": 16, "generations": 3, "max_depth": 4, "max_nodes": 20, "seed": 0}
+    job_id = client.post("/runs", json={"config": config}).json()["job_id"]
+    final = _poll(client, job_id)
+    assert final["status"] == "done", final
+
+    progress = final["progress"]
+    assert progress is not None
+    assert progress["generation"] == 3
+    assert progress["target_generations"] == 3
+    assert len(progress["history"]) == 4  # generation 0 (init) plus 1..3
+    assert progress["best"] is not None and "fitness" in progress["best"]
+
+
+def test_run_search_stop_halts_early(signal_panel):
+    from alphalineage.api.service import run_search
+    from alphalineage.core.gp import GPConfig
+
+    panel, _ = signal_panel
+    config = GPConfig(population_size=16, generations=50, max_depth=4, max_nodes=20, seed=0)
+    calls = {"n": 0}
+
+    def stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1  # let generation 1 run, then halt
+
+    result = run_search(config, panel, stop=stop)
+    assert result["generations"] < 50
+
+
+def test_stop_endpoint_returns_stopping(client):
+    config = {"population_size": 16, "generations": 40, "max_depth": 4, "max_nodes": 20, "seed": 0}
+    job_id = client.post("/runs", json={"config": config}).json()["job_id"]
+
+    stopped = client.post(f"/runs/{job_id}/stop")
+    assert stopped.status_code == 200
+    assert stopped.json() == {"stopping": True}
+    assert client.post("/runs/does-not-exist/stop").status_code == 404
+
+    final = _poll(client, job_id)
+    assert final["status"] == "done", final
+
+
+def test_run_progress_threadsafe_snapshot():
+    import threading
+
+    from alphalineage.api.progress import RunProgress
+    from alphalineage.core.tree import Node
+
+    progress = RunProgress(target_generations=20)
+    tree = Node("rank", (Node("close"),))
+
+    def observe(gen: int) -> None:
+        progress.on_generation(gen, [(tree, [0], "elite", float(gen))])
+
+    threads = [threading.Thread(target=observe, args=(g,)) for g in range(1, 21)]
+    for t in threads:
+        t.start()
+    snaps = [progress.snapshot() for _ in range(50)]
+    for t in threads:
+        t.join()
+
+    assert all(0 <= s["generation"] <= 20 for s in snaps)
+    final = progress.snapshot()
+    assert final["generation"] >= 1
+    assert len(final["history"]) == 20
+
+
+def test_static_dir_served_when_configured(tmp_path):
+    from alphalineage.api.app import mount_static
+
+    (tmp_path / "index.html").write_text("<html>alphalineage ui</html>", encoding="utf-8")
+    before = len(app.router.routes)
+    mount_static(str(tmp_path))
+    try:
+        with TestClient(app) as test_client:
+            root = test_client.get("/")
+            assert root.status_code == 200
+            assert "alphalineage ui" in root.text
+            # API routes still resolve - the mount is last and least specific
+            assert test_client.get("/health").json()["status"] == "ok"
+    finally:
+        del app.router.routes[before:]  # remove the mount so other tests see a clean app
+
+
 def test_jobstore_runs_and_captures_failure():
     store = JobStore()
 

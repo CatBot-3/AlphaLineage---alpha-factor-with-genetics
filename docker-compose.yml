@@ -1,0 +1,14 @@
+# One service: the API serving the built UI on http://localhost:8000.
+# `data_cache/` is bind-mounted so downloaded prices, saved factors and sessions persist on the host.
+# Set TIINGO_API_KEY in a local `.env` (copy from .env.example) to download fresh data; the bundled
+# cache works without it.
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      ALPHALINEAGE_DATA_DIR: /data
+      TIINGO_API_KEY: ${TIINGO_API_KEY:-}
+    volumes:
+      - ./data_cache:/data

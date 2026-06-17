@@ -13,6 +13,7 @@ import dataclasses
 import json
 import random
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ from alphalineage.core.generate import RandomTreeGenerator
 from alphalineage.core.panel import Panel
 from alphalineage.core.primitives import OPERANDS, OPERATORS, Kind
 from alphalineage.core.simplify import simplify
-from alphalineage.core.tree import Node, from_dict, to_dict, to_json
+from alphalineage.core.tree import Node, from_dict, to_dict, to_json, validate
 from alphalineage.core.types import DType, is_subtype
 
 Path_ = str | Path
@@ -91,6 +92,26 @@ def replace_at(tree: Node, path: tuple[int, ...], new: Node) -> Node:
     return Node(tree.name, tuple(children), tree.value)
 
 
+def validate_seed(
+    tree: Node, *, max_depth: int, max_nodes: int, root_type: DType = DType.SIGNAL
+) -> Node:
+    """A seed for the GP population is data, never code: every node must be a registered
+    primitive, the root must satisfy ``root_type``, and depth/size must fit the config.
+
+    Raises ``ValueError`` naming the offending primitive or the violated bound.
+    """
+    validate(tree)  # raises InvalidTree naming the offending primitive
+    if not is_subtype(tree.out_type, root_type):
+        raise ValueError(
+            f"seed root must produce {root_type.name}, got {tree.out_type.name} ({tree.name!r})"
+        )
+    if tree.depth() > max_depth:
+        raise ValueError(f"seed depth {tree.depth()} exceeds max_depth {max_depth}")
+    if tree.size() > max_nodes:
+        raise ValueError(f"seed size {tree.size()} exceeds max_nodes {max_nodes}")
+    return tree
+
+
 class GP:
     """A genetic-programming run over a panel."""
 
@@ -117,11 +138,14 @@ class GP:
         self.generation = 0
         self.history: list[dict[str, float]] = []
         self._cache: dict[str, tuple[float, dict[str, float]]] = {}
+        # Trials counted before this object's cache existed (resumes, invalidated caches).
+        # Monotone by construction: it only ever grows, so deflation never softens.
+        self._prior_trials = 0
 
     @property
     def trial_count(self) -> int:
         """Distinct factors scored so far - the deflation's number of trials."""
-        return len(self._cache)
+        return self._prior_trials + len(self._cache)
 
     # --- scoring -----------------------------------------------------------------
     def _score(self, tree: Node) -> tuple[float, dict[str, float]]:
@@ -229,30 +253,50 @@ class GP:
             }
         )
 
-    def initialize(self) -> None:
-        trees = self.generator.ramped_half_and_half(
-            self.config.population_size,
+    def _validate_seed(self, tree: Node) -> Node:
+        return validate_seed(
+            tree,
+            max_depth=self.config.max_depth,
+            max_nodes=self.config.max_nodes,
+            root_type=self.root_type,
+        )
+
+    def initialize(self, seeds: Sequence[Node] = ()) -> None:
+        seed_trees = [self._validate_seed(s) for s in seeds]
+        if len(seed_trees) > self.config.population_size:
+            raise ValueError(
+                f"{len(seed_trees)} seeds exceed population_size {self.config.population_size}"
+            )
+        trees = seed_trees + self.generator.ramped_half_and_half(
+            self.config.population_size - len(seed_trees),
             min_depth=self.config.min_depth,
             max_depth=self.config.max_depth,
         )
         self.population = [self._individual(t) for t in trees]
         self.generation = 0
         if self.recorder is not None:
-            self.recorder.on_init([ind.tree for ind in self.population])
+            ops = ["seed"] * len(seed_trees) + ["init"] * (len(trees) - len(seed_trees))
+            self.recorder.on_init(
+                [ind.tree for ind in self.population],
+                fitnesses=[ind.fitness for ind in self.population],
+                ops=ops,
+            )
         self._record()
 
     def _step(self) -> None:
         n = len(self.population)
         order = sorted(range(n), key=lambda i: self.population[i].fitness, reverse=True)
-        entries: list[tuple[Node, list[int], str]] = []
+        entries: list[tuple[Node, list[int], str, float]] = []
         next_pop: list[Individual] = []
         for i in order[: self.config.elitism]:
-            next_pop.append(self.population[i])
-            entries.append((self.population[i].tree, [i], "elite"))
+            elite = self.population[i]
+            next_pop.append(elite)
+            entries.append((elite.tree, [i], "elite", elite.fitness))
         while len(next_pop) < self.config.population_size:
             tree, parents, op = self._offspring()
-            next_pop.append(self._individual(tree))
-            entries.append((tree, parents, op))
+            child = self._individual(tree)
+            next_pop.append(child)
+            entries.append((tree, parents, op, child.fitness))
         self.population = next_pop
         self.generation += 1
         if self.recorder is not None:
@@ -260,15 +304,22 @@ class GP:
         self._record()
 
     def run(
-        self, generations: int | None = None, checkpoint_path: Path_ | None = None
+        self,
+        generations: int | None = None,
+        checkpoint_path: Path_ | None = None,
+        *,
+        seeds: Sequence[Node] = (),
+        stop: Callable[[], bool] | None = None,
     ) -> Individual:
         target = generations if generations is not None else self.config.generations
         if not self.population:
-            self.initialize()
+            self.initialize(seeds)
             if checkpoint_path is not None:
                 self.save_checkpoint(checkpoint_path)
         start = time.monotonic()
         while self.generation < target:
+            if stop is not None and stop():
+                break
             self._step()
             if checkpoint_path is not None:
                 self.save_checkpoint(checkpoint_path)
@@ -278,6 +329,18 @@ class GP:
             ):
                 break
         return self.best()
+
+    def rescore_population(self, fwd: pd.DataFrame | None = None) -> None:
+        """Re-score the current population against the current panel/config.
+
+        Used when a continued session changes the universe or a scoring-relevant
+        setting: stale cached scores are invalidated, but the trials they counted
+        are folded into the prior baseline first - the count never shrinks.
+        """
+        self._prior_trials += len(self._cache)
+        self._cache.clear()
+        self.fwd = fwd if fwd is not None else forward_returns(self.panel, self.config.horizon)
+        self.population = [self._individual(ind.tree) for ind in self.population]
 
     def best(self, *, simplified: bool = True) -> Individual:
         top = max(self.population, key=lambda ind: ind.fitness)
@@ -292,6 +355,7 @@ class GP:
             "generation": self.generation,
             "rng_state": [version, list(internal), gauss],
             "config": self.config.to_dict(),
+            "trials": self.trial_count,
             "history": self.history,
             "population": [
                 {"tree": to_dict(ind.tree), "fitness": ind.fitness, "metrics": ind.metrics}
@@ -301,9 +365,17 @@ class GP:
         Path(path).write_text(json.dumps(state), encoding="utf-8")
 
     @classmethod
-    def from_checkpoint(cls, path: Path_, panel: Panel, fwd: pd.DataFrame | None = None) -> GP:
+    def from_checkpoint(
+        cls,
+        path: Path_,
+        panel: Panel,
+        fwd: pd.DataFrame | None = None,
+        *,
+        recorder: Any | None = None,
+    ) -> GP:
         state = json.loads(Path(path).read_text(encoding="utf-8"))
-        gp = cls(GPConfig.from_dict(state["config"]), panel, fwd)
+        gp = cls(GPConfig.from_dict(state["config"]), panel, fwd, recorder=recorder)
+        gp._prior_trials = int(state.get("trials", 0))
         version, internal, gauss = state["rng_state"]
         gp.rng.setstate((version, tuple(internal), gauss))
         gp.generation = int(state["generation"])

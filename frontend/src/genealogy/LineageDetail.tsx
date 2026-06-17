@@ -1,15 +1,17 @@
 // Navigable lineage detail: trace a node's parents -> operation -> children.
 
-import type { Lineage } from "../api/types";
+import type { Lineage, LineageNode } from "../api/types";
 
 export function LineageDetail({
   lineage,
   selectedId,
   onSelect,
+  onSave,
 }: {
   lineage: Lineage;
   selectedId: number | null;
   onSelect: (id: number) => void;
+  onSave?: (node: LineageNode) => void;
 }) {
   if (selectedId === null) {
     return <div className="detail">Select a node to trace its lineage.</div>;
@@ -28,6 +30,21 @@ export function LineageDetail({
       <p>
         operation: <b data-testid="lineage-op">{node.op}</b>
       </p>
+      {typeof node.fitness === "number" && (
+        <p>
+          fitness: <b>{node.fitness.toFixed(4)}</b>
+        </p>
+      )}
+      {onSave && (
+        <button
+          type="button"
+          className="ghost"
+          data-testid="save-lineage-node"
+          onClick={() => onSave(node)}
+        >
+          Save to library
+        </button>
+      )}
       <div className="lineage-links">
         <span>parents:</span>{" "}
         {node.parents.length === 0 ? (

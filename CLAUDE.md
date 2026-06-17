@@ -17,18 +17,32 @@ built-in anti-overfitting suite.
 
 ## Commands
 - Setup: `uv venv && uv pip install -e ".[dev]"`
-- Test:  `pytest -q --cov=alphaforge`
+- Test:  `pytest -q --cov=alphalineage`
 - Lint:  `ruff check . && ruff format --check .`
 - Types: `mypy src`
 - Data:  `python scripts/download_universe.py --universe sp500-lite --years 15`
-- Run:   `python scripts/run_gp.py --config configs/dev.yaml`
+- Run (CLI): `python scripts/run_gp.py --config configs/dev.yaml`
+- Run (app): `docker compose up` → http://localhost:8000 (single image; the API serves the built UI).
+  Fallback: `uvicorn alphalineage.api.app:app --port 8000` + `cd frontend && npm run dev:app`.
+- Demo export: `python scripts/export_demo.py --workspace run-<id> --out frontend/public/demo-run.json`
+
+## Iterative sessions (V1 finish)
+- A *session* (`src/alphalineage/api/sessions.py`) is a search grown over *segments*: create →
+  continue (warm-start the evolved population) with changed config/universe/operators → seed new
+  sessions from saved factors (`src/alphalineage/library/factors.py`). State lives under
+  `data_cache/sessions/{id}/` (session.json + checkpoint.json + lineage.json + result.json).
+- Honesty across segments: the train/test **time boundary** is frozen at creation (never relocated,
+  even when the universe changes); trial counts are cumulative + monotone (carried through the GP
+  checkpoint); every segment is one OOS read, counted and surfaced in the dashboard.
+- Factor storage dir is user-configurable: env `ALPHALINEAGE_FACTORS_DIR` > `meta/settings.json`
+  (`PUT /settings`) > default. Lineage nodes carry `fitness`, powering the grouped genealogy view.
 
 ## Conventions
 - Python 3.11+. One task = one PR-sized change. Write the acceptance test first.
 - Hot paths (tree evaluation) must be vectorized (numpy/pandas/numba).
 - The evaluator has an **optional C++ backend** (`cpp/`, pybind11+CMake; build via
   `python scripts/build_cpp.py`). Pure Python is the default + correctness baseline and always runs
-  without a compiler; the C++ backend auto-engages when built (`ALPHAFORGE_EVALUATOR=auto|python|cpp`)
+  without a compiler; the C++ backend auto-engages when built (`ALPHALINEAGE_EVALUATOR=auto|python|cpp`)
   and is pinned identical to Python by the parity test. The compiled `.pyd`/`.so` is gitignored.
 - Do not call the data API inside the GP loop; read from the Parquet cache.
 - The two load-bearing tests are synthetic-signal recovery and noise rejection.

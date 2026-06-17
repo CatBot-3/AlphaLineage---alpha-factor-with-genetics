@@ -8,6 +8,7 @@
     "dev:app": "vite --mode app",
     "build:demo": "vite build --mode demo",
     "build:app": "vite build --mode app",
+    "build:docker": "vite build --mode docker",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",

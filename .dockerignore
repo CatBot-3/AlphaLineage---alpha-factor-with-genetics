@@ -1,0 +1,18 @@
+# Keep the build context small and the image clean.
+.git
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyd
+*.so
+data_cache
+frontend/node_modules
+frontend/dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+cpp/build
+htmlcov
+.coverage

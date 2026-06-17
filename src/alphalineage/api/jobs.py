@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -20,6 +20,10 @@ class Job:
     status: str = "queued"  # queued | running | done | failed
     result: Any = None
     error: str | None = None
+    # Live snapshot object (e.g. RunProgress) read by GET /runs/{id} while the job runs.
+    progress: Any = None
+    # Cooperative-cancellation flag the work function polls; set by JobStore.cancel.
+    cancel: threading.Event = field(default_factory=threading.Event)
 
 
 class JobStore:
@@ -34,9 +38,16 @@ class JobStore:
         fn: Callable[..., Any],
         *args: Any,
         on_success: Callable[[str, Any], None] | None = None,
+        progress: Any = None,
+        cancel: threading.Event | None = None,
+        job_id: str | None = None,
         **kwargs: Any,
     ) -> str:
-        job = Job(id=uuid.uuid4().hex)
+        job = Job(
+            id=job_id if job_id is not None else uuid.uuid4().hex,
+            progress=progress,
+            cancel=cancel if cancel is not None else threading.Event(),
+        )
         with self._lock:
             self._jobs[job.id] = job
 
@@ -66,3 +77,12 @@ class JobStore:
     def get(self, job_id: str) -> Job | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def cancel(self, job_id: str) -> bool:
+        """Signal a job to stop; the work function decides when to honor it. Returns found."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            return False
+        job.cancel.set()
+        return True
