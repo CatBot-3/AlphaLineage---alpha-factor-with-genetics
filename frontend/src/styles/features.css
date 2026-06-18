@@ -150,7 +150,16 @@
   border-color: var(--color-primary);
 }
 
-.extend {
+.extend-panel {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.extend-page-picker {
+  max-width: 280px;
+}
+
+.formula-editor-page {
   display: grid;
   gap: var(--space-5);
 }
@@ -316,7 +325,7 @@ select:focus {
   font-size: 12px;
 }
 
-.universe-updater {
+.universe-editor-page {
   display: grid;
   gap: var(--space-3);
 }
@@ -326,8 +335,30 @@ select:focus {
   min-width: 110px;
 }
 
+.universe-rows-scroll {
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.universe-rows-scroll thead th {
+  position: sticky;
+  top: 0;
+  background: var(--color-bg);
+}
+
 .inline-tools {
   align-items: flex-end;
+}
+
+.danger-navy {
+  margin-left: auto;
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.danger-navy:hover:not(:disabled) {
+  background: var(--color-primary);
+  color: var(--color-bg);
 }
 
 .check-row {
@@ -369,6 +400,36 @@ select:focus {
 .candidate-list button:hover {
   border-color: var(--color-primary);
   box-shadow: 3px 3px 0 var(--color-accent);
+}
+
+.candidate-list button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--color-primary) 18%, var(--color-bg));
+  border-color: var(--color-primary);
+}
+
+.verified-badge {
+  display: inline-block;
+  margin-left: var(--space-2);
+  background: var(--color-accent);
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: var(--type-micro);
+  font-weight: 700;
+  padding: 1px 5px;
+}
+
+.show-more {
+  width: 100%;
+  text-align: center;
+  border: 1px dashed var(--color-ink);
+  background: transparent;
+  color: var(--color-muted);
+  padding: 6px;
+}
+
+.show-more:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
 }
 
 .candidate-list span,
@@ -496,6 +557,29 @@ select:focus {
   letter-spacing: normal;
   color: var(--color-ink);
   font-family: var(--font-mono);
+}
+
+.universe-field-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.universe-field-row select {
+  flex: 1;
+}
+
+.edit-universe-btn {
+  border: 1px solid var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-ink);
+  padding: 5px 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.edit-universe-btn:hover {
+  background: color-mix(in srgb, var(--color-accent) 80%, var(--color-ink));
 }
 
 .advanced summary {

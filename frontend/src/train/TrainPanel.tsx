@@ -14,12 +14,14 @@ export function TrainPanel({
   onComplete,
   onRunningChange,
   onOpenDashboard,
+  onOpenUniverseEditor,
 }: {
   seedIds?: string[];
   restoreSessionId?: string | null;
   onComplete?: (result: RunResult) => void;
   onRunningChange?: (running: boolean, sessionId: string | null) => void;
   onOpenDashboard?: () => void;
+  onOpenUniverseEditor?: (universeName: string) => void;
 }) {
   const { sessionId, state, error, notice, phase, start, cont, stop, attach, reset } =
     useSession(onComplete);
@@ -56,7 +58,12 @@ export function TrainPanel({
       {notice && <p className="surface-message" data-testid="train-notice">{notice}</p>}
 
       {!sessionId && (
-        <RunConfigForm initialSeedIds={seedIds} onStart={handleStart} disabled={running} />
+        <RunConfigForm
+          initialSeedIds={seedIds}
+          onStart={handleStart}
+          disabled={running}
+          onEditUniverse={onOpenUniverseEditor}
+        />
       )}
 
       {error && <p className="error surface-message">{error}</p>}

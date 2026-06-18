@@ -1,5 +1,6 @@
-import type { AppMode } from "../api/types";
+import type { AppMode, SyncProgressSnapshot } from "../api/types";
 import type { ReactNode } from "react";
+import { DataPullProgress } from "./DataPullProgress";
 import { SettingsMenu } from "./SettingsMenu";
 
 export type Tab = "train" | "dashboard" | "factor" | "genealogy" | "library" | "extend";
@@ -17,6 +18,7 @@ export function AppShell({
   mode,
   tab,
   status,
+  progress,
   onTabChange,
   onRefreshRun,
   onSaveLocal,
@@ -29,6 +31,7 @@ export function AppShell({
   mode: AppMode;
   tab: Tab;
   status?: string | null;
+  progress?: SyncProgressSnapshot | null;
   onTabChange: (tab: Tab) => void;
   onRefreshRun: () => void;
   onSaveLocal: () => void;
@@ -82,6 +85,8 @@ export function AppShell({
       </header>
 
       <main className="site-main">{children}</main>
+
+      <DataPullProgress progress={progress ?? null} />
 
       <footer className="site-footer">
         <span>{status ?? "Not investment advice. Research output only."}</span>

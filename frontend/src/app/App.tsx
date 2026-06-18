@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   getSessionLineage,
+  getUniverse,
   getWorkspace,
   listWorkspaces,
   saveFactor,
@@ -15,12 +16,13 @@ import {
   type LineageNode,
   type OperatorComposerDraft,
   type RunResult,
+  type SyncProgressSnapshot,
   type UniverseDraft,
   type WorkspaceSnapshot,
 } from "../api/types";
 import { Dashboard } from "../dashboard/Dashboard";
-import { OperatorComposer } from "../extend/OperatorComposer";
-import { UniverseUpdater } from "../extend/UniverseUpdater";
+import { ExtendPanel, type ExtendPage } from "../extend/ExtendPanel";
+import { rowsFromUniverse } from "../extend/toUniversePayload";
 import { FactorDetail } from "../factor/FactorDetail";
 import { FactorTree } from "../factor/FactorTree";
 import type { TreeNodeData } from "../factor/treeToFlow";
@@ -75,6 +77,8 @@ export function App() {
   const [bestFactorSaved, setBestFactorSaved] = useState(false);
   const [quitOpen, setQuitOpen] = useState(false);
   const [shutDown, setShutDown] = useState(false);
+  const [extendPage, setExtendPage] = useState<ExtendPage>("universe");
+  const [dataPullProgress, setDataPullProgress] = useState<SyncProgressSnapshot | null>(null);
   const [status, setStatus] = useState<string | null>(
     initialWorkspace?.run ? "Loaded local workspace" : null,
   );
@@ -191,6 +195,22 @@ export function App() {
     setStatus(`Seeding a new session from ${ids.length} factor(s)`);
   }
 
+  async function openUniverseEditor(universeName: string) {
+    try {
+      const universe = await getUniverse(universeName);
+      setUniverseDraft({
+        name: universe.name,
+        rows: rowsFromUniverse(universe),
+        selectedUniverse: universe.source === "custom" ? universe.name : "",
+        expectedStart: universeDraft?.expectedStart,
+      });
+    } catch (e) {
+      setStatus(String(e));
+    }
+    setExtendPage("universe");
+    setTab("extend");
+  }
+
   async function saveLineageNode(node: LineageNode) {
     try {
       await saveFactor({
@@ -292,6 +312,7 @@ export function App() {
       mode={mode}
       tab={tab}
       status={status}
+      progress={dataPullProgress}
       onTabChange={setTab}
       onRefreshRun={onRefreshRun}
       onSaveLocal={saveLocal}
@@ -328,6 +349,7 @@ export function App() {
                 onComplete={onRunComplete}
                 onRunningChange={onRunningChange}
                 onOpenDashboard={() => setTab("dashboard")}
+                onOpenUniverseEditor={openUniverseEditor}
               />
             </div>
           </section>
@@ -406,18 +428,17 @@ export function App() {
               <span>04</span>
               <span />
             </div>
-            <div className="view-body extend">
-              <UniverseUpdater
-                draft={universeDraft}
+            <div className="view-body">
+              <ExtendPanel
+                initialPage={extendPage}
+                universeDraft={universeDraft}
+                onUniverseDraftChange={setUniverseDraft}
                 formulaDraft={formulaDraft}
-                onDraftChange={setUniverseDraft}
                 onFormulaDraftChange={setFormulaDraft}
+                operatorDraft={operatorDraft}
+                onOperatorDraftChange={setOperatorDraft}
                 canSubmit={mode === "app"}
-              />
-              <OperatorComposer
-                draft={operatorDraft}
-                onDraftChange={setOperatorDraft}
-                canSubmit={mode === "app"}
+                onDataPullProgressChange={setDataPullProgress}
               />
             </div>
           </section>

@@ -32,10 +32,12 @@ export function RunConfigForm({
   initialSeedIds = [],
   onStart,
   disabled,
+  onEditUniverse,
 }: {
   initialSeedIds?: string[];
   onStart: (req: RunRequestForm) => void;
   disabled?: boolean;
+  onEditUniverse?: (universeName: string) => void;
 }) {
   const [name, setName] = useState("Session");
   const [universe, setUniverse] = useState("sp500-lite");
@@ -74,14 +76,26 @@ export function RunConfigForm({
         </label>
         <label className="field">
           <span className="field-label">Universe</span>
-          <select value={universe} aria-label="Universe" onChange={(e) => setUniverse(e.target.value)}>
-            {universes.length === 0 && <option value="sp500-lite">sp500-lite</option>}
-            {universes.map((u) => (
-              <option key={u.name} value={u.name}>
-                {u.name} ({u.symbols.length})
-              </option>
-            ))}
-          </select>
+          <span className="universe-field-row">
+            <select value={universe} aria-label="Universe" onChange={(e) => setUniverse(e.target.value)}>
+              {universes.length === 0 && <option value="sp500-lite">sp500-lite</option>}
+              {universes.map((u) => (
+                <option key={u.name} value={u.name}>
+                  {u.name} ({u.symbols.length})
+                </option>
+              ))}
+            </select>
+            {onEditUniverse && (
+              <button
+                type="button"
+                className="edit-universe-btn"
+                data-testid="edit-universe"
+                onClick={() => onEditUniverse(universe)}
+              >
+                Edit
+              </button>
+            )}
+          </span>
         </label>
         {CORE_FIELDS.map((f) =>
           numberField(f.key, config[f.key] as number, set(f.key), f.label),

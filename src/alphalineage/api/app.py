@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from alphalineage.api import sessions
 from alphalineage.api.jobs import JobStore
-from alphalineage.api.progress import RunProgress
+from alphalineage.api.progress import RunProgress, SyncProgress
 from alphalineage.api.service import run_search
 from alphalineage.core import cpp
 from alphalineage.core.extensions import (
@@ -166,6 +166,7 @@ class SymbolValidationRequest(BaseModel):
     symbol: str
     start: str | None = None
     end: str | None = None
+    force: bool = False
 
 
 class SymbolValidation(BaseModel):
@@ -176,6 +177,7 @@ class SymbolValidation(BaseModel):
     last_date: str | None = None
     provider: str | None = None
     error: str | None = None
+    cached: bool = False
 
 
 class DataCoverage(BaseModel):
@@ -204,6 +206,22 @@ class DataSyncResult(BaseModel):
     first_date: str | None = None
     last_date: str | None = None
     provider: str | None = None
+    error: str | None = None
+
+
+class MembershipSyncRequest(BaseModel):
+    symbols: list[str]
+    expected_start: str
+
+
+class MembershipSyncResult(BaseModel):
+    symbol: str
+    status: str  # resolved | failed
+    entry: str | None = None
+    exit: str | None = None
+    delisted: bool = False
+    list_date: str | None = None
+    last_date: str | None = None
     error: str | None = None
 
 
@@ -383,12 +401,20 @@ def _search_symbol_candidates(query: str, limit: int = 8) -> list[SymbolCandidat
     return candidates
 
 
+_verified_symbols: dict[str, SymbolValidation] = {}
+
+
 def _validate_symbol(
     symbol: str,
     start: str | None = None,
     end: str | None = None,
+    *,
+    force: bool = False,
 ) -> SymbolValidation:
     clean = symbol.strip().upper()
+    cache_key = f"{clean}|{start}|{end}"
+    if not force and cache_key in _verified_symbols:
+        return SymbolValidation(**{**_model_dump(_verified_symbols[cache_key]), "cached": True})
     provider = _price_provider()
     try:
         frame = provider.get_prices(clean, start, end)
@@ -402,7 +428,7 @@ def _validate_symbol(
             provider=_provider_source(provider, clean),
             error="provider returned no rows",
         )
-    return SymbolValidation(
+    result = SymbolValidation(
         symbol=clean,
         valid=True,
         rows=len(frame),
@@ -410,6 +436,8 @@ def _validate_symbol(
         last_date=_date_iso(frame.index.max()),
         provider=_provider_source(provider, clean),
     )
+    _verified_symbols[cache_key] = result
+    return result
 
 
 def _coverage_for_symbol(
@@ -525,25 +553,80 @@ def _sync_one_symbol(
         return DataSyncResult(symbol=clean, status="failed", provider=provider.name, error=str(exc))
 
 
-def _run_data_sync(req: DataSyncRequest) -> dict[str, Any]:
+def _run_data_sync(req: DataSyncRequest, progress: SyncProgress | None = None) -> dict[str, Any]:
     provider = _price_provider()
     cache = ParquetCache()
-    results = [
-        _sync_one_symbol(
-            symbol,
-            start=req.start,
-            end=req.end,
-            mode=req.mode,
-            provider=provider,
-            cache=cache,
+    results = []
+    for symbol in req.symbols:
+        if not symbol.strip():
+            continue
+        results.append(
+            _sync_one_symbol(
+                symbol,
+                start=req.start,
+                end=req.end,
+                mode=req.mode,
+                provider=provider,
+                cache=cache,
+            )
         )
-        for symbol in req.symbols
-        if symbol.strip()
-    ]
+        if progress is not None:
+            progress.advance(symbol)
     return {
         "mode": req.mode,
         "start": req.start,
         "end": req.end,
+        "results": [_model_dump(result) for result in results],
+    }
+
+
+# Weekends/holidays/provider lag before a stale price tail is treated as a delisting.
+_DELISTING_TOLERANCE_DAYS = 10
+_EARLIEST_HISTORY_START = "1900-01-01"
+
+
+def _resolve_membership_dates(
+    symbol: str, expected_start: str, provider: PriceProvider
+) -> MembershipSyncResult:
+    clean = symbol.strip().upper()
+    try:
+        frame = provider.get_prices(clean, _EARLIEST_HISTORY_START, _today_iso())
+    except Exception as exc:  # noqa: BLE001 - one symbol's failure must not abort the batch
+        return MembershipSyncResult(symbol=clean, status="failed", error=str(exc))
+    if frame.empty:
+        return MembershipSyncResult(
+            symbol=clean, status="failed", error="provider returned no rows"
+        )
+
+    list_date = frame.index.min()
+    last_date = frame.index.max()
+    today = pd.Timestamp(_today_iso())
+    delisted = bool((today - last_date).days > _DELISTING_TOLERANCE_DAYS)
+    entry = max(pd.Timestamp(expected_start), list_date)
+    return MembershipSyncResult(
+        symbol=clean,
+        status="resolved",
+        entry=_date_iso(entry),
+        exit=_date_iso(last_date) if delisted else None,
+        delisted=delisted,
+        list_date=_date_iso(list_date),
+        last_date=_date_iso(last_date),
+    )
+
+
+def _run_membership_sync(
+    req: MembershipSyncRequest, progress: SyncProgress | None = None
+) -> dict[str, Any]:
+    provider = _price_provider()
+    results = []
+    for symbol in req.symbols:
+        if not symbol.strip():
+            continue
+        results.append(_resolve_membership_dates(symbol, req.expected_start, provider))
+        if progress is not None:
+            progress.advance(symbol)
+    return {
+        "expected_start": req.expected_start,
         "results": [_model_dump(result) for result in results],
     }
 
@@ -1028,7 +1111,7 @@ def search_symbols(query: str, limit: int = 8) -> list[SymbolCandidate]:
 
 @app.post("/symbols/validate", response_model=SymbolValidation)
 def validate_symbol(req: SymbolValidationRequest) -> SymbolValidation:
-    return _validate_symbol(req.symbol, req.start, req.end)
+    return _validate_symbol(req.symbol, req.start, req.end, force=req.force)
 
 
 @app.get("/data/usage")
@@ -1055,7 +1138,8 @@ def data_sync(req: DataSyncRequest) -> dict[str, str]:
     if not symbols:
         raise HTTPException(status_code=400, detail="at least one symbol is required")
     request = DataSyncRequest(symbols=symbols, start=req.start, end=req.end, mode=mode)
-    job_id = _data_jobs.submit(lambda: _run_data_sync(request))
+    progress = SyncProgress(total=len(symbols))
+    job_id = _data_jobs.submit(lambda: _run_data_sync(request, progress), progress=progress)
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -1069,6 +1153,32 @@ def data_sync_status(job_id: str) -> dict[str, Any]:
         "status": job.status,
         "result": job.result,
         "error": job.error,
+        "progress": job.progress.snapshot() if job.progress else None,
+    }
+
+
+@app.post("/universes/sync-dates")
+def universes_sync_dates(req: MembershipSyncRequest) -> dict[str, str]:
+    symbols = sorted({symbol.strip().upper() for symbol in req.symbols if symbol.strip()})
+    if not symbols:
+        raise HTTPException(status_code=400, detail="at least one symbol is required")
+    request = MembershipSyncRequest(symbols=symbols, expected_start=req.expected_start)
+    progress = SyncProgress(total=len(symbols))
+    job_id = _data_jobs.submit(lambda: _run_membership_sync(request, progress), progress=progress)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/universes/sync-dates/{job_id}")
+def universes_sync_dates_status(job_id: str) -> dict[str, Any]:
+    job = _data_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown sync job")
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "result": job.result,
+        "error": job.error,
+        "progress": job.progress.snapshot() if job.progress else None,
     }
 
 

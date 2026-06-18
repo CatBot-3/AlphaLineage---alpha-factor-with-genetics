@@ -28,6 +28,12 @@ def _clean_operators():
     extensions.clear_user_operators()
 
 
+@pytest.fixture(autouse=True)
+def _clean_verified_symbols():
+    yield
+    api_app._verified_symbols.clear()
+
+
 def _poll(client: TestClient, job_id: str, *, timeout: float = 60.0) -> dict:
     deadline = time.monotonic() + timeout
     payload: dict = {}
@@ -44,6 +50,17 @@ def _poll_data_sync(client: TestClient, job_id: str, *, timeout: float = 5.0) ->
     payload: dict = {}
     while time.monotonic() < deadline:
         payload = client.get(f"/data/sync/{job_id}").json()
+        if payload["status"] in ("done", "failed"):
+            return payload
+        time.sleep(0.02)
+    return payload
+
+
+def _poll_membership_sync(client: TestClient, job_id: str, *, timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    payload: dict = {}
+    while time.monotonic() < deadline:
+        payload = client.get(f"/universes/sync-dates/{job_id}").json()
         if payload["status"] in ("done", "failed"):
             return payload
         time.sleep(0.02)
@@ -255,6 +272,44 @@ def test_symbol_search_and_validation(client, monkeypatch, synthetic_prices):
     assert "unknown symbol" in invalid.json()["error"]
 
 
+def test_symbol_validation_is_cached_per_range(client, monkeypatch, synthetic_prices):
+    prices = api_app.schema.normalize(synthetic_prices)
+
+    class CountingProvider:
+        name = "fake"
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_prices(self, symbol, start=None, end=None):
+            self.calls += 1
+            return prices
+
+    provider = CountingProvider()
+    monkeypatch.setattr(api_app, "_price_provider", lambda: provider)
+
+    first = client.post("/symbols/validate", json={"symbol": "AAPL", "start": "2020-01-01"})
+    assert first.json()["valid"] is True
+    assert first.json()["cached"] is False
+    assert provider.calls == 1
+
+    second = client.post("/symbols/validate", json={"symbol": "AAPL", "start": "2020-01-01"})
+    assert second.json()["cached"] is True
+    assert provider.calls == 1  # no extra provider hit - served from the verified cache
+
+    different_range = client.post(
+        "/symbols/validate", json={"symbol": "AAPL", "start": "2020-02-01"}
+    )
+    assert different_range.json()["cached"] is False
+    assert provider.calls == 2
+
+    forced = client.post(
+        "/symbols/validate", json={"symbol": "AAPL", "start": "2020-01-01", "force": True}
+    )
+    assert forced.json()["cached"] is False
+    assert provider.calls == 3
+
+
 def test_incremental_and_refresh_data_sync(client, monkeypatch, synthetic_prices):
     prices = api_app.schema.normalize(synthetic_prices)
 
@@ -295,6 +350,7 @@ def test_incremental_and_refresh_data_sync(client, monkeypatch, synthetic_prices
     )
     final = _poll_data_sync(client, started.json()["job_id"])
     assert final["status"] == "done", final
+    assert final["progress"] == {"done": 1, "total": 1, "current_symbol": "AAPL"}
     assert provider.calls == [
         ("AAPL", "2020-01-01", "2020-01-06"),
         ("AAPL", "2020-01-11", "2020-01-20"),
@@ -346,6 +402,94 @@ def test_data_sync_keeps_other_symbols_running_after_failure(client, monkeypatch
     assert final["status"] == "done", final
     results = {item["symbol"]: item for item in final["result"]["results"]}
     assert results["AAPL"]["status"] == "fetched"
+    assert results["BAD"]["status"] == "failed"
+
+
+def test_membership_date_sync_fills_entry_and_exit_for_active_stock(client, monkeypatch):
+    import numpy as np
+
+    idx = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=30)
+    close = 100.0 + np.arange(30) * 0.1
+    active_prices = api_app.schema.normalize(
+        pd.DataFrame(
+            {
+                "open": close,
+                "high": close * 1.01,
+                "low": close * 0.99,
+                "close": close,
+                "volume": np.full(30, 1_000_000.0),
+                "div_cash": np.zeros(30),
+                "split_factor": np.ones(30),
+            },
+            index=idx,
+        )
+    )
+
+    class FakeProvider:
+        name = "fake"
+
+        def get_prices(self, symbol, start=None, end=None):
+            return active_prices
+
+    monkeypatch.setattr(api_app, "_price_provider", lambda: FakeProvider())
+
+    started = client.post(
+        "/universes/sync-dates", json={"symbols": ["AAPL"], "expected_start": "2010-01-01"}
+    )
+    final = _poll_membership_sync(client, started.json()["job_id"])
+    assert final["status"] == "done", final
+    result = final["result"]["results"][0]
+    assert result["status"] == "resolved"
+    assert result["delisted"] is False
+    assert result["exit"] is None
+    assert result["entry"] == idx.min().date().isoformat()
+
+
+def test_membership_date_sync_detects_delisted_symbol(client, monkeypatch, synthetic_prices):
+    prices = api_app.schema.normalize(synthetic_prices)
+
+    class FakeProvider:
+        name = "fake"
+
+        def get_prices(self, symbol, start=None, end=None):
+            return prices
+
+    monkeypatch.setattr(api_app, "_price_provider", lambda: FakeProvider())
+
+    started = client.post(
+        "/universes/sync-dates", json={"symbols": ["LEH"], "expected_start": "2000-01-01"}
+    )
+    final = _poll_membership_sync(client, started.json()["job_id"])
+    assert final["status"] == "done", final
+    result = final["result"]["results"][0]
+    assert result["status"] == "resolved"
+    assert result["delisted"] is True
+    assert result["exit"] == prices.index.max().date().isoformat()
+    assert result["entry"] == prices.index.min().date().isoformat()
+
+
+def test_membership_date_sync_keeps_other_symbols_running_after_failure(
+    client, monkeypatch, synthetic_prices
+):
+    prices = api_app.schema.normalize(synthetic_prices)
+
+    class MixedProvider:
+        name = "mixed"
+
+        def get_prices(self, symbol, start=None, end=None):
+            if symbol == "BAD":
+                raise RuntimeError("provider rejected symbol")
+            return prices
+
+    monkeypatch.setattr(api_app, "_price_provider", lambda: MixedProvider())
+    started = client.post(
+        "/universes/sync-dates",
+        json={"symbols": ["AAPL", "BAD"], "expected_start": "2019-01-01"},
+    )
+    final = _poll_membership_sync(client, started.json()["job_id"])
+    assert final["status"] == "done", final
+    results = {item["symbol"]: item for item in final["result"]["results"]}
+    assert results["AAPL"]["status"] == "resolved"
     assert results["BAD"]["status"] == "failed"
 
 
@@ -456,6 +600,25 @@ def test_run_progress_threadsafe_snapshot():
     final = progress.snapshot()
     assert final["generation"] >= 1
     assert len(final["history"]) == 20
+
+
+def test_sync_progress_threadsafe_snapshot():
+    import threading
+
+    from alphalineage.api.progress import SyncProgress
+
+    progress = SyncProgress(total=20)
+    threads = [threading.Thread(target=progress.advance, args=(f"SYM{i}",)) for i in range(20)]
+    for t in threads:
+        t.start()
+    snaps = [progress.snapshot() for _ in range(50)]
+    for t in threads:
+        t.join()
+
+    assert all(0 <= s["done"] <= 20 and s["total"] == 20 for s in snaps)
+    final = progress.snapshot()
+    assert final["done"] == 20
+    assert final["current_symbol"] is not None
 
 
 def test_static_dir_served_when_configured(tmp_path):

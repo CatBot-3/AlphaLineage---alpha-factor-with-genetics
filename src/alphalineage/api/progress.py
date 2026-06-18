@@ -93,3 +93,31 @@ class RunProgress:
                 "history": list(self._history),
                 "best": best,
             }
+
+
+class SyncProgress:
+    """A thread-safe ``{done, total, current_symbol}`` counter for a data-pull job.
+
+    Handed to ``JobStore.submit(..., progress=...)`` the same way ``RunProgress`` is for GP
+    runs, so ``GET .../{job_id}`` can read a live snapshot while the job's background thread
+    is still working through its symbol list.
+    """
+
+    def __init__(self, *, total: int = 0) -> None:
+        self._lock = threading.Lock()
+        self._done = 0
+        self._total = total
+        self._current_symbol: str | None = None
+
+    def advance(self, symbol: str) -> None:
+        with self._lock:
+            self._done += 1
+            self._current_symbol = symbol
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "done": self._done,
+                "total": self._total,
+                "current_symbol": self._current_symbol,
+            }

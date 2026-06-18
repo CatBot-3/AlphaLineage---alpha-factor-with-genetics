@@ -7,6 +7,8 @@ import type {
   DataUsageRow,
   FormulaSpec,
   Lineage,
+  MembershipSyncJob,
+  MembershipSyncRequest,
   OperatorSpec,
   RunResult,
   PrimitiveInfo,
@@ -174,8 +176,8 @@ export async function deleteUniverse(name: string): Promise<void> {
   if (!res.ok) throw new Error(`delete universe failed: ${res.status}`);
 }
 
-export async function searchSymbols(query: string): Promise<SymbolCandidate[]> {
-  const params = new URLSearchParams({ query });
+export async function searchSymbols(query: string, limit = 15): Promise<SymbolCandidate[]> {
+  const params = new URLSearchParams({ query, limit: String(limit) });
   return jsonOrThrow(await fetch(`${BASE}/symbols/search?${params}`), "search symbols");
 }
 
@@ -183,6 +185,7 @@ export async function validateSymbol(payload: {
   symbol: string;
   start?: string;
   end?: string;
+  force?: boolean;
 }): Promise<SymbolValidation> {
   return jsonOrThrow(await POST("/symbols/validate", payload), "validate symbol");
 }
@@ -204,6 +207,19 @@ export async function startDataSync(req: DataSyncRequest): Promise<{ job_id: str
 
 export async function getDataSync(jobId: string): Promise<DataSyncJob> {
   return jsonOrThrow(await fetch(`${BASE}/data/sync/${encodeURIComponent(jobId)}`), "load sync job");
+}
+
+export async function startMembershipSync(
+  req: MembershipSyncRequest,
+): Promise<{ job_id: string; status: string }> {
+  return jsonOrThrow(await POST("/universes/sync-dates", req), "start membership sync");
+}
+
+export async function getMembershipSync(jobId: string): Promise<MembershipSyncJob> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/universes/sync-dates/${encodeURIComponent(jobId)}`),
+    "load membership sync job",
+  );
 }
 
 export async function listWorkspaces(): Promise<WorkspaceSummary[]> {

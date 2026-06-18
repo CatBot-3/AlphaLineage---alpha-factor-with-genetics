@@ -3,10 +3,13 @@ import {
   clearData,
   continueSession,
   createSession,
+  getMembershipSync,
   getSession,
   putSettings,
   saveFactor,
+  searchSymbols,
   shutdown,
+  startMembershipSync,
 } from "./client";
 
 function mockFetch(payload: unknown, ok = true) {
@@ -109,5 +112,31 @@ describe("data + shutdown client", () => {
     const res = await shutdown();
     expect(res.shutting_down).toBe(true);
     expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/shutdown$/);
+  });
+});
+
+describe("symbol search + membership sync client", () => {
+  it("requests more than 5 results so the UI can reveal them on demand", async () => {
+    const fetchSpy = mockFetch([]);
+    await searchSymbols("AAPL");
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/limit=15/);
+  });
+
+  it("POSTs symbols + expected_start to /universes/sync-dates", async () => {
+    const fetchSpy = mockFetch({ job_id: "m1", status: "queued" });
+    await startMembershipSync({ symbols: ["AAPL", "leh"], expected_start: "2010-01-01" });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/universes\/sync-dates$/);
+    expect(JSON.parse(init.body as string)).toEqual({
+      symbols: ["AAPL", "leh"],
+      expected_start: "2010-01-01",
+    });
+  });
+
+  it("GETs membership sync job status", async () => {
+    const fetchSpy = mockFetch({ job_id: "m1", status: "done", result: null, error: null });
+    const job = await getMembershipSync("m1");
+    expect(job.status).toBe("done");
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/universes\/sync-dates\/m1$/);
   });
 });

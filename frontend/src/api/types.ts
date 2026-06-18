@@ -247,9 +247,7 @@ export interface UniverseDraft {
   name: string;
   rows: Array<{ symbol: string; entry: string; exit: string }>;
   selectedUniverse?: string;
-  syncStart?: string;
-  syncEnd?: string;
-  syncMode?: "incremental" | "refresh";
+  expectedStart?: string;
 }
 
 export interface FormulaDraft {
@@ -279,6 +277,7 @@ export interface SymbolValidation {
   last_date?: string | null;
   provider?: string | null;
   error?: string | null;
+  cached?: boolean;
 }
 
 export interface DataCoverage {
@@ -310,6 +309,12 @@ export interface DataSyncResult {
   error?: string | null;
 }
 
+export interface SyncProgressSnapshot {
+  done: number;
+  total: number;
+  current_symbol: string | null;
+}
+
 export interface DataSyncJob {
   job_id: string;
   status: "queued" | "running" | "done" | "failed";
@@ -320,6 +325,34 @@ export interface DataSyncJob {
     results: DataSyncResult[];
   } | null;
   error: string | null;
+  progress?: SyncProgressSnapshot | null;
+}
+
+export interface MembershipSyncRequest {
+  symbols: string[];
+  expected_start: string;
+}
+
+export interface MembershipSyncResult {
+  symbol: string;
+  status: "resolved" | "failed";
+  entry?: string | null;
+  exit?: string | null;
+  delisted: boolean;
+  list_date?: string | null;
+  last_date?: string | null;
+  error?: string | null;
+}
+
+export interface MembershipSyncJob {
+  job_id: string;
+  status: "queued" | "running" | "done" | "failed";
+  result: {
+    expected_start: string;
+    results: MembershipSyncResult[];
+  } | null;
+  error: string | null;
+  progress?: SyncProgressSnapshot | null;
 }
 
 export interface OperatorDraftNode {
