@@ -216,6 +216,17 @@ export interface OperatorSpec {
   body: FactorNode; // a typed body tree with $arg leaves
 }
 
+export interface FormulaSpec {
+  name: string;
+  display_name: string;
+  description: string;
+  arg_types: string[];
+  out_type: string;
+  body: FactorNode;
+  registered?: boolean;
+  error?: string | null;
+}
+
 export interface UniverseMembership {
   symbol: string;
   entry: string;
@@ -235,6 +246,80 @@ export interface UniverseInfo extends UniverseSpec {
 export interface UniverseDraft {
   name: string;
   rows: Array<{ symbol: string; entry: string; exit: string }>;
+  selectedUniverse?: string;
+  syncStart?: string;
+  syncEnd?: string;
+  syncMode?: "incremental" | "refresh";
+}
+
+export interface FormulaDraft {
+  name: string;
+  display_name: string;
+  description: string;
+  template: string;
+  arg_types?: string[];
+  out_type?: string;
+  body?: FactorNode;
+}
+
+export interface SymbolCandidate {
+  symbol: string;
+  name: string;
+  exchange: string;
+  quote_type: string;
+  currency: string;
+  source: string;
+}
+
+export interface SymbolValidation {
+  symbol: string;
+  valid: boolean;
+  rows: number;
+  first_date?: string | null;
+  last_date?: string | null;
+  provider?: string | null;
+  error?: string | null;
+}
+
+export interface DataCoverage {
+  symbol: string;
+  cached: boolean;
+  rows: number;
+  first_date?: string | null;
+  last_date?: string | null;
+  requested_start?: string | null;
+  requested_end?: string | null;
+  needs_sync: boolean;
+}
+
+export interface DataSyncRequest {
+  symbols: string[];
+  start: string;
+  end?: string | null;
+  mode: "incremental" | "refresh";
+}
+
+export interface DataSyncResult {
+  symbol: string;
+  status: "queued" | "running" | "done" | "failed" | "fetched" | "skipped";
+  rows_fetched: number;
+  rows_cached: number;
+  first_date?: string | null;
+  last_date?: string | null;
+  provider?: string | null;
+  error?: string | null;
+}
+
+export interface DataSyncJob {
+  job_id: string;
+  status: "queued" | "running" | "done" | "failed";
+  result: {
+    mode: "incremental" | "refresh";
+    start: string;
+    end?: string | null;
+    results: DataSyncResult[];
+  } | null;
+  error: string | null;
 }
 
 export interface OperatorDraftNode {
@@ -276,6 +361,7 @@ export interface WorkspaceSnapshot {
   universes: UniverseSpec[];
   operators: OperatorSpec[];
   universeDraft?: UniverseDraft;
+  formulaDraft?: FormulaDraft;
   operatorDraft?: OperatorComposerDraft;
   ui: WorkspaceUiState;
 }

@@ -5,12 +5,15 @@ vi.mock("../api/client", () => ({
   getPrimitives: vi.fn(async () => [
     { name: "sub", kind: "operator", arg_types: ["series", "series"], out_type: "series", user: false },
   ]),
-  registerOperator: vi.fn(async () => ({
+  addFormula: vi.fn(async () => ({
     name: "x",
-    kind: "operator",
+    display_name: "x",
+    description: "",
     arg_types: [],
     out_type: "series",
-    user: true,
+    body: { name: "close" },
+    registered: true,
+    error: null,
   })),
 }));
 

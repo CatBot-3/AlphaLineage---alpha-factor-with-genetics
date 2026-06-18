@@ -1,4 +1,4 @@
-// AlphaForge C++ expression-tree evaluator (the hot path; opt-in accelerator).
+// AlphaLineage C++ expression-tree evaluator (the hot path; opt-in accelerator).
 //
 // Walks a flat instruction list (post-order, built by core/cpp.py:flatten) over the panel's
 // stacked operand arrays, computing each op into a T x N row-major buffer. NaN / rolling /
@@ -180,6 +180,6 @@ static py::array_t<double> evaluate(Arr<double> fields, Arr<int32_t> ops, Arr<in
 }
 
 PYBIND11_MODULE(_evaluator, m) {
-  m.doc() = "AlphaForge C++ expression-tree evaluator";
+  m.doc() = "AlphaLineage C++ expression-tree evaluator";
   m.def("evaluate", &evaluate, "Evaluate a flattened expression tree over stacked panel arrays.");
 }

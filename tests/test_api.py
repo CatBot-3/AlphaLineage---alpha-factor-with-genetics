@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -35,6 +36,17 @@ def _poll(client: TestClient, job_id: str, *, timeout: float = 60.0) -> dict:
         if payload["status"] in ("done", "failed"):
             return payload
         time.sleep(0.2)
+    return payload
+
+
+def _poll_data_sync(client: TestClient, job_id: str, *, timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    payload: dict = {}
+    while time.monotonic() < deadline:
+        payload = client.get(f"/data/sync/{job_id}").json()
+        if payload["status"] in ("done", "failed"):
+            return payload
+        time.sleep(0.02)
     return payload
 
 
@@ -98,6 +110,40 @@ def test_register_operator_and_reject_unknown(client):
     assert client.post("/operators", json=bad).status_code == 400
 
 
+def test_formula_save_reload_delete_and_validation(client):
+    spec = {
+        "name": "moving_average_api",
+        "display_name": "Moving average API",
+        "description": "Trailing mean with a caller-provided window.",
+        "arg_types": ["series", "window"],
+        "out_type": "series",
+        "body": {
+            "name": "ts_mean",
+            "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+        },
+    }
+    saved = client.post("/formulas", json=spec)
+    assert saved.status_code == 200
+    assert saved.json()["registered"] is True
+    assert client.post("/formulas", json=spec).status_code == 400
+
+    extensions.clear_user_operators()
+    restored = client.get("/formulas")
+    assert restored.status_code == 200
+    assert restored.json()[0]["registered"] is True
+    assert any(item["name"] == spec["name"] for item in client.get("/primitives").json())
+
+    bad = {
+        **spec,
+        "name": "unknown_formula",
+        "body": {"name": "not_a_primitive"},
+    }
+    assert client.post("/formulas", json=bad).status_code == 400
+
+    assert client.delete(f"/formulas/{spec['name']}").status_code == 200
+    assert client.get("/formulas").json() == []
+
+
 def test_define_point_in_time_universe(client):
     spec = {
         "name": "my-universe",
@@ -127,6 +173,180 @@ def test_universe_persistence_survives_memory_clear(client):
 
     assert restored["source"] == "custom"
     assert set(restored["symbols"]) == {"AAA", "BBB"}
+
+
+def test_universe_get_update_delete_and_sample_protection(client):
+    original = {
+        "name": "editable-universe",
+        "memberships": [{"symbol": "AAA", "entry": "2020-01-01"}],
+    }
+    assert client.post("/universes", json=original).status_code == 200
+
+    loaded = client.get("/universes/editable-universe")
+    assert loaded.status_code == 200
+    assert loaded.json()["source"] == "custom"
+
+    updated = {
+        "name": "editable-universe",
+        "memberships": [
+            {"symbol": "AAA", "entry": "2020-01-01"},
+            {"symbol": "BBB", "entry": "2021-01-01", "exit": "2024-01-01"},
+        ],
+    }
+    response = client.put("/universes/editable-universe", json=updated)
+    assert response.status_code == 200
+    assert set(response.json()["symbols"]) == {"AAA", "BBB"}
+
+    assert client.delete("/universes/sp500-lite").status_code == 400
+    assert (
+        client.post(
+            "/universes",
+            json={"name": "sp500-lite", "memberships": original["memberships"]},
+        ).status_code
+        == 400
+    )
+
+    assert client.delete("/universes/editable-universe").status_code == 200
+    assert client.get("/universes/editable-universe").status_code == 404
+
+
+def test_symbol_search_and_validation(client, monkeypatch, synthetic_prices):
+    candidates = [
+        api_app.SymbolCandidate(
+            symbol="AAPL",
+            name="Apple Inc.",
+            exchange="Nasdaq",
+            quote_type="Equity",
+            currency="USD",
+        ),
+        api_app.SymbolCandidate(
+            symbol="APC.F",
+            name="Apple Inc.",
+            exchange="Frankfurt",
+            quote_type="Equity",
+            currency="EUR",
+        ),
+    ]
+    monkeypatch.setattr(api_app, "_search_symbol_candidates", lambda query, limit=8: candidates)
+    prices = api_app.schema.normalize(synthetic_prices)
+
+    class FakeProvider:
+        name = "fake"
+
+        def get_prices(self, symbol, start=None, end=None):
+            if symbol == "BAD":
+                raise RuntimeError("unknown symbol")
+            return prices
+
+    monkeypatch.setattr(api_app, "_price_provider", FakeProvider)
+
+    search = client.get("/symbols/search", params={"query": "AAPL"})
+    assert search.status_code == 200
+    assert [item["symbol"] for item in search.json()] == ["AAPL", "APC.F"]
+
+    valid = client.post("/symbols/validate", json={"symbol": "AAPL", "start": "2020-01-01"})
+    assert valid.status_code == 200
+    assert valid.json()["valid"] is True
+    assert valid.json()["provider"] == "fake"
+
+    invalid = client.post("/symbols/validate", json={"symbol": "BAD"})
+    assert invalid.status_code == 200
+    assert invalid.json()["valid"] is False
+    assert "unknown symbol" in invalid.json()["error"]
+
+
+def test_incremental_and_refresh_data_sync(client, monkeypatch, synthetic_prices):
+    prices = api_app.schema.normalize(synthetic_prices)
+
+    class FakeProvider:
+        name = "fake"
+
+        def __init__(self):
+            self.calls = []
+
+        def get_prices(self, symbol, start=None, end=None):
+            self.calls.append((symbol, start, end))
+            frame = prices
+            if start:
+                frame = frame[frame.index >= pd.Timestamp(start)]
+            if end:
+                frame = frame[frame.index < pd.Timestamp(end)]
+            return frame.copy()
+
+    provider = FakeProvider()
+    monkeypatch.setattr(api_app, "_price_provider", lambda: provider)
+    cache = api_app.ParquetCache()
+    cache.store("AAPL", prices.loc["2020-01-06":"2020-01-10"])
+
+    coverage = client.get(
+        "/data/coverage",
+        params={"symbols": "AAPL", "start": "2020-01-01", "end": "2020-01-20"},
+    )
+    assert coverage.json()[0]["needs_sync"] is True
+
+    started = client.post(
+        "/data/sync",
+        json={
+            "symbols": ["AAPL"],
+            "start": "2020-01-01",
+            "end": "2020-01-20",
+            "mode": "incremental",
+        },
+    )
+    final = _poll_data_sync(client, started.json()["job_id"])
+    assert final["status"] == "done", final
+    assert provider.calls == [
+        ("AAPL", "2020-01-01", "2020-01-06"),
+        ("AAPL", "2020-01-11", "2020-01-20"),
+    ]
+    merged = cache.load("AAPL")
+    assert not merged.index.duplicated().any()
+    assert merged.index.min() == pd.Timestamp("2020-01-01")
+
+    provider.calls.clear()
+    refreshed = client.post(
+        "/data/sync",
+        json={
+            "symbols": ["AAPL"],
+            "start": "2020-01-03",
+            "end": "2020-01-09",
+            "mode": "refresh",
+        },
+    )
+    final = _poll_data_sync(client, refreshed.json()["job_id"])
+    assert final["status"] == "done", final
+    assert provider.calls == [("AAPL", "2020-01-03", "2020-01-09")]
+    replaced = cache.load("AAPL")
+    assert replaced.index.min() >= pd.Timestamp("2020-01-03")
+    assert replaced.index.max() < pd.Timestamp("2020-01-09")
+
+
+def test_data_sync_keeps_other_symbols_running_after_failure(client, monkeypatch, synthetic_prices):
+    prices = api_app.schema.normalize(synthetic_prices)
+
+    class MixedProvider:
+        name = "mixed"
+
+        def get_prices(self, symbol, start=None, end=None):
+            if symbol == "BAD":
+                raise RuntimeError("provider rejected symbol")
+            return prices
+
+    monkeypatch.setattr(api_app, "_price_provider", MixedProvider)
+    started = client.post(
+        "/data/sync",
+        json={
+            "symbols": ["AAPL", "BAD"],
+            "start": "2020-01-01",
+            "end": "2020-02-01",
+            "mode": "refresh",
+        },
+    )
+    final = _poll_data_sync(client, started.json()["job_id"])
+    assert final["status"] == "done", final
+    results = {item["symbol"]: item for item in final["result"]["results"]}
+    assert results["AAPL"]["status"] == "fetched"
+    assert results["BAD"]["status"] == "failed"
 
 
 def test_workspace_save_load_list_delete(client):

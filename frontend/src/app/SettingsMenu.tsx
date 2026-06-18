@@ -1,10 +1,10 @@
-// The gear (⚙) menu in the header. Absorbs the workspace save/load actions and adds settings
-// (Tiingo key, evaluator backend, factors directory), a local-data cleaner, and Quit. Closes on
-// outside click or Escape. Settings/data state is owned here so the rest of the app stays lean.
+// The settings menu in the header. Absorbs workspace save/load actions, backend settings,
+// local-data cleanup, and Quit. The sections intentionally reopen collapsed.
 
 import { useEffect, useRef, useState } from "react";
 import { clearData, getDataUsage, getSettings, putSettings } from "../api/client";
 import type { AppMode, DataUsageRow, Settings } from "../api/types";
+import { CompactSection } from "./CompactSection";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -42,6 +42,7 @@ export function SettingsMenu({
   const [tiingoKey, setTiingoKey] = useState("");
   const [factorsDir, setFactorsDir] = useState("");
   const ref = useRef<HTMLDivElement>(null);
+  const usageBytes = usage.reduce((sum, row) => sum + row.bytes, 0);
 
   function refreshSettings() {
     getSettings()
@@ -102,13 +103,16 @@ export function SettingsMenu({
         aria-haspopup="menu"
         onClick={() => setOpen((v) => !v)}
       >
-        ⚙
+        Settings
       </button>
 
       {open && (
         <div className="settings-popover" role="menu" data-testid="settings-popover">
-          <section className="settings-section">
-            <h5>Workspace</h5>
+          <CompactSection
+            title="Workspace"
+            summary={backend ? "Backend connected" : "Static demo"}
+            className="settings-section"
+          >
             <button type="button" onClick={onRefreshRun}>
               {backend ? "Run search" : "Load demo"}
             </button>
@@ -124,64 +128,78 @@ export function SettingsMenu({
             <button type="button" onClick={onLoadBackend} disabled={!backend}>
               Load backend
             </button>
-          </section>
+          </CompactSection>
 
-          {backend && settings && (
-            <section className="settings-section">
-              <h5>Settings</h5>
-              <label className="field">
-                <span className="field-label">
-                  Tiingo API key {settings.tiingo_api_key_set ? "(set)" : "(not set)"}
-                </span>
-                <input
-                  type="password"
-                  aria-label="Tiingo API key"
-                  placeholder="paste key"
-                  value={tiingoKey}
-                  onChange={(e) => setTiingoKey(e.target.value)}
-                />
-              </label>
-              <button type="button" className="ghost" onClick={saveTiingo}>
-                Save key
-              </button>
+          <CompactSection
+            title="Settings"
+            summary={backend ? "Data keys and evaluator" : "Backend only"}
+            className="settings-section"
+          >
+            {backend && settings ? (
+              <>
+                <label className="field">
+                  <span className="field-label">
+                    Tiingo API key {settings.tiingo_api_key_set ? "(set)" : "(not set)"}
+                  </span>
+                  <input
+                    type="password"
+                    aria-label="Tiingo API key"
+                    placeholder="paste key"
+                    value={tiingoKey}
+                    onChange={(e) => setTiingoKey(e.target.value)}
+                  />
+                </label>
+                <button type="button" className="ghost" onClick={saveTiingo}>
+                  Save key
+                </button>
 
-              <label className="field">
-                <span className="field-label">Evaluator backend</span>
-                <select
-                  aria-label="Evaluator backend"
-                  value={settings.evaluator}
-                  onChange={(e) => saveEvaluator(e.target.value as Settings["evaluator"])}
-                >
-                  <option value="auto">auto</option>
-                  <option value="python">python</option>
-                  <option value="cpp" disabled={!settings.cpp_available}>
-                    cpp{settings.cpp_available ? "" : " (not built)"}
-                  </option>
-                </select>
-              </label>
+                <label className="field">
+                  <span className="field-label">Evaluator backend</span>
+                  <select
+                    aria-label="Evaluator backend"
+                    value={settings.evaluator}
+                    onChange={(e) => saveEvaluator(e.target.value as Settings["evaluator"])}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="python">python</option>
+                    <option value="cpp" disabled={!settings.cpp_available}>
+                      cpp{settings.cpp_available ? "" : " (not built)"}
+                    </option>
+                  </select>
+                </label>
 
-              <label className="field">
-                <span className="field-label">Factors directory</span>
-                <input
-                  aria-label="Factors directory"
-                  value={factorsDir}
-                  onChange={(e) => setFactorsDir(e.target.value)}
-                />
-              </label>
-              <button type="button" className="ghost" onClick={saveFactorsDir}>
-                Save folder
-              </button>
-            </section>
-          )}
+                <label className="field">
+                  <span className="field-label">Factors directory</span>
+                  <input
+                    aria-label="Factors directory"
+                    value={factorsDir}
+                    onChange={(e) => setFactorsDir(e.target.value)}
+                  />
+                </label>
+                <button type="button" className="ghost" onClick={saveFactorsDir}>
+                  Save folder
+                </button>
+              </>
+            ) : (
+              <p className="panel-note">
+                {backend
+                  ? "Loading settings..."
+                  : "Backend settings are available when the local backend is running."}
+              </p>
+            )}
+          </CompactSection>
 
-          {backend && (
-            <section className="settings-section">
-              <h5>Local data</h5>
+          <CompactSection
+            title="Local data"
+            summary={backend ? `${formatBytes(usageBytes)} cached` : "Backend only"}
+            className="settings-section"
+          >
+            {backend ? (
               <ul className="data-rows" data-testid="data-rows">
                 {usage.map((row) => (
                   <li key={row.key} className="data-row">
                     <span>
-                      {row.label} — {formatBytes(row.bytes)} ({row.count})
+                      {row.label} - {formatBytes(row.bytes)} ({row.count})
                     </span>
                     <button
                       type="button"
@@ -194,11 +212,17 @@ export function SettingsMenu({
                   </li>
                 ))}
               </ul>
-            </section>
-          )}
+            ) : (
+              <p className="panel-note">Cached data can be reviewed after connecting the backend.</p>
+            )}
+          </CompactSection>
 
-          {backend && (
-            <section className="settings-section">
+          <CompactSection
+            title="Quit"
+            summary={backend ? "Stop local servers" : "Backend only"}
+            className="settings-section"
+          >
+            {backend ? (
               <button
                 type="button"
                 className="quit-action"
@@ -210,8 +234,10 @@ export function SettingsMenu({
               >
                 Quit AlphaLineage
               </button>
-            </section>
-          )}
+            ) : (
+              <p className="panel-note">The static demo has no local backend process to stop.</p>
+            )}
+          </CompactSection>
         </div>
       )}
     </div>

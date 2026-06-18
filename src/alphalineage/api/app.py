@@ -15,7 +15,7 @@ import os
 import re
 import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -40,11 +40,16 @@ from alphalineage.core.extensions import (
 from alphalineage.core.gp import GPConfig, validate_seed
 from alphalineage.core.panel import Panel
 from alphalineage.core.primitives import REGISTRY, Primitive
+from alphalineage.core.tree import Node
 from alphalineage.core.tree import from_dict as tree_from_dict
 from alphalineage.core.tree import validate as validate_tree
 from alphalineage.core.types import DType
-from alphalineage.data import paths, usage
+from alphalineage.data import paths, schema, usage
+from alphalineage.data.cache import ParquetCache
+from alphalineage.data.provider import FallbackProvider, PriceProvider
+from alphalineage.data.tiingo_client import TiingoProvider
 from alphalineage.data.universe import Membership, Universe, sample_universe
+from alphalineage.data.yfinance_provider import YFinanceProvider
 from alphalineage.library.factors import FactorStore
 
 app = FastAPI(title="AlphaLineage", version="0.1.0")
@@ -57,15 +62,26 @@ app.add_middleware(
 )
 _jobs = JobStore()
 _universes: dict[str, Universe] = {}
+_data_jobs = JobStore()
 
 _DEFAULT_UNIVERSE = "sp500-lite"
 _DEFAULT_AS_OF = "2026-06-01"
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+_FORMULA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 # --- models ----------------------------------------------------------------------
 class OperatorSpec(BaseModel):
     name: str
+    arg_types: list[str]
+    out_type: str
+    body: dict[str, Any]
+
+
+class FormulaSpec(BaseModel):
+    name: str
+    display_name: str = ""
+    description: str = ""
     arg_types: list[str]
     out_type: str
     body: dict[str, Any]
@@ -102,6 +118,7 @@ class WorkspaceSnapshot(BaseModel):
     universes: list[UniverseSpec] = Field(default_factory=list)
     operators: list[OperatorSpec] = Field(default_factory=list)
     universeDraft: dict[str, Any] | None = None
+    formulaDraft: dict[str, Any] | None = None
     operatorDraft: dict[str, Any] | None = None
     ui: dict[str, Any] = Field(default_factory=dict)
 
@@ -136,7 +153,62 @@ class DataClearRequest(BaseModel):
     category: str
 
 
+class SymbolCandidate(BaseModel):
+    symbol: str
+    name: str = ""
+    exchange: str = ""
+    quote_type: str = ""
+    currency: str = ""
+    source: str = "yfinance"
+
+
+class SymbolValidationRequest(BaseModel):
+    symbol: str
+    start: str | None = None
+    end: str | None = None
+
+
+class SymbolValidation(BaseModel):
+    symbol: str
+    valid: bool
+    rows: int = 0
+    first_date: str | None = None
+    last_date: str | None = None
+    provider: str | None = None
+    error: str | None = None
+
+
+class DataCoverage(BaseModel):
+    symbol: str
+    cached: bool
+    rows: int
+    first_date: str | None
+    last_date: str | None
+    requested_start: str | None
+    requested_end: str | None
+    needs_sync: bool
+
+
+class DataSyncRequest(BaseModel):
+    symbols: list[str]
+    start: str
+    end: str | None = None
+    mode: str = "incremental"
+
+
+class DataSyncResult(BaseModel):
+    symbol: str
+    status: str
+    rows_fetched: int = 0
+    rows_cached: int = 0
+    first_date: str | None = None
+    last_date: str | None = None
+    provider: str | None = None
+    error: str | None = None
+
+
 _EVALUATORS = {"auto", "python", "cpp"}
+_SYNC_MODES = {"incremental", "refresh"}
 
 
 class SessionCreateRequest(BaseModel):
@@ -176,6 +248,304 @@ def _register(spec: OperatorSpec) -> Primitive:
         )
     except (InvalidOperator, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _normalize_formula_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9_]+", "_", name.strip().lower()).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    if not _FORMULA_NAME_RE.fullmatch(slug):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "formula name must be lowercase snake case, start with a letter, "
+                "and be 2-64 characters"
+            ),
+        )
+    return slug
+
+
+def _read_formula_specs() -> list[FormulaSpec]:
+    path = paths.formulas_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="invalid formula store") from exc
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=500, detail="invalid formula store")
+    return [FormulaSpec(**item) for item in payload]
+
+
+def _write_formula_specs(specs: list[FormulaSpec]) -> None:
+    paths.meta_dir().mkdir(parents=True, exist_ok=True)
+    payload = [_model_dump(spec) for spec in specs]
+    paths.formulas_path().write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _tree_uses(node: Node, primitive_name: str) -> bool:
+    return node.name == primitive_name or any(
+        _tree_uses(child, primitive_name) for child in node.children
+    )
+
+
+def _formula_operator_spec(spec: FormulaSpec) -> OperatorSpec:
+    return OperatorSpec(
+        name=spec.name,
+        arg_types=spec.arg_types,
+        out_type=spec.out_type,
+        body=spec.body,
+    )
+
+
+def _load_persisted_formulas() -> list[dict[str, Any]]:
+    formulas: list[dict[str, Any]] = []
+    for spec in _read_formula_specs():
+        registered = False
+        error = None
+        try:
+            ensure_operator(
+                spec.name,
+                [DType(t) for t in spec.arg_types],
+                DType(spec.out_type),
+                spec.body,
+            )
+            registered = True
+        except (InvalidOperator, ValueError) as exc:
+            error = str(exc)
+        formulas.append({**_model_dump(spec), "registered": registered, "error": error})
+    return formulas
+
+
+def _price_provider() -> PriceProvider:
+    providers: list[PriceProvider] = []
+    if paths.tiingo_api_key():
+        providers.append(TiingoProvider())
+    providers.append(YFinanceProvider())
+    return FallbackProvider(providers)
+
+
+def _provider_source(provider: PriceProvider, symbol: str) -> str:
+    if isinstance(provider, FallbackProvider):
+        return provider.sources.get(symbol, provider.name)
+    return provider.name
+
+
+def _date_iso(value: Any) -> str:
+    return pd.Timestamp(value).date().isoformat()
+
+
+def _today_iso() -> str:
+    return datetime.now(UTC).date().isoformat()
+
+
+def _next_day_iso(value: Any) -> str:
+    return (pd.Timestamp(value).date() + timedelta(days=1)).isoformat()
+
+
+def _search_symbol_candidates(query: str, limit: int = 8) -> list[SymbolCandidate]:
+    import yfinance as yf
+
+    clean = query.strip()
+    if not clean:
+        return []
+    search = yf.Search(
+        clean,
+        max_results=limit,
+        news_count=0,
+        lists_count=0,
+        include_research=False,
+        include_cultural_assets=False,
+        recommended=0,
+    )
+    raw_quotes = getattr(search, "quotes", None) or []
+    candidates: list[SymbolCandidate] = []
+    seen: set[str] = set()
+    for raw in raw_quotes:
+        if not isinstance(raw, dict):
+            continue
+        symbol = str(raw.get("symbol") or raw.get("ticker") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        candidates.append(
+            SymbolCandidate(
+                symbol=symbol,
+                name=str(raw.get("shortname") or raw.get("longname") or raw.get("name") or ""),
+                exchange=str(raw.get("exchDisp") or raw.get("exchange") or ""),
+                quote_type=str(raw.get("quoteType") or raw.get("typeDisp") or ""),
+                currency=str(raw.get("currency") or ""),
+            )
+        )
+    return candidates
+
+
+def _validate_symbol(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> SymbolValidation:
+    clean = symbol.strip().upper()
+    provider = _price_provider()
+    try:
+        frame = provider.get_prices(clean, start, end)
+    except Exception as exc:  # noqa: BLE001 - validation should return readable failure payloads
+        return SymbolValidation(symbol=clean, valid=False, provider=provider.name, error=str(exc))
+    if frame.empty:
+        return SymbolValidation(
+            symbol=clean,
+            valid=False,
+            rows=0,
+            provider=_provider_source(provider, clean),
+            error="provider returned no rows",
+        )
+    return SymbolValidation(
+        symbol=clean,
+        valid=True,
+        rows=len(frame),
+        first_date=_date_iso(frame.index.min()),
+        last_date=_date_iso(frame.index.max()),
+        provider=_provider_source(provider, clean),
+    )
+
+
+def _coverage_for_symbol(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    cache: ParquetCache | None = None,
+) -> DataCoverage:
+    clean = symbol.strip().upper()
+    requested_end = end or _today_iso()
+    store = cache or ParquetCache()
+    if not store.has(clean):
+        return DataCoverage(
+            symbol=clean,
+            cached=False,
+            rows=0,
+            first_date=None,
+            last_date=None,
+            requested_start=start,
+            requested_end=requested_end,
+            needs_sync=True,
+        )
+    frame = store.load(clean)
+    if frame.empty:
+        first_date = last_date = None
+        needs_sync = True
+    else:
+        first_date = _date_iso(frame.index.min())
+        last_date = _date_iso(frame.index.max())
+        needs_sync = bool(
+            (start and pd.Timestamp(first_date) > pd.Timestamp(start)) or last_date < requested_end
+        )
+    return DataCoverage(
+        symbol=clean,
+        cached=True,
+        rows=len(frame),
+        first_date=first_date,
+        last_date=last_date,
+        requested_start=start,
+        requested_end=requested_end,
+        needs_sync=needs_sync,
+    )
+
+
+def _merge_price_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    merged = pd.concat(frames).sort_index()
+    merged = merged[~merged.index.duplicated(keep="last")]
+    return schema.validate(merged[schema.PRICE_COLUMNS].astype("float64"))
+
+
+def _sync_one_symbol(
+    symbol: str,
+    *,
+    start: str,
+    end: str | None,
+    mode: str,
+    provider: PriceProvider,
+    cache: ParquetCache,
+) -> DataSyncResult:
+    clean = symbol.strip().upper()
+    requested_end = end or _today_iso()
+    try:
+        existing = cache.load(clean) if cache.has(clean) else None
+        fetch_ranges: list[tuple[str, str | None]] = []
+        if mode == "refresh" or existing is None or existing.empty:
+            fetch_ranges.append((start, end))
+            existing = None if mode == "refresh" else existing
+        else:
+            first = _date_iso(existing.index.min())
+            last = _date_iso(existing.index.max())
+            if pd.Timestamp(first) > pd.Timestamp(start):
+                fetch_ranges.append((start, first))
+            if last < requested_end:
+                fetch_ranges.append((_next_day_iso(last), end))
+
+        if not fetch_ranges and existing is not None:
+            return DataSyncResult(
+                symbol=clean,
+                status="skipped",
+                rows_cached=len(existing),
+                first_date=_date_iso(existing.index.min()),
+                last_date=_date_iso(existing.index.max()),
+                provider=_provider_source(provider, clean),
+            )
+
+        fetched: list[pd.DataFrame] = []
+        for range_start, range_end in fetch_ranges:
+            frame = provider.get_prices(clean, range_start, range_end)
+            if not frame.empty:
+                fetched.append(frame)
+        if not fetched and existing is None:
+            return DataSyncResult(
+                symbol=clean,
+                status="failed",
+                provider=_provider_source(provider, clean),
+                error="provider returned no rows",
+            )
+
+        frames = [*fetched] if existing is None else [existing, *fetched]
+        merged = _merge_price_frames(frames)
+        cache.store(clean, merged)
+        stored = cache.load(clean)
+        return DataSyncResult(
+            symbol=clean,
+            status="fetched" if fetched else "skipped",
+            rows_fetched=sum(len(frame) for frame in fetched),
+            rows_cached=len(stored),
+            first_date=_date_iso(stored.index.min()),
+            last_date=_date_iso(stored.index.max()),
+            provider=_provider_source(provider, clean),
+        )
+    except Exception as exc:  # noqa: BLE001 - one failed symbol should not abort the batch
+        return DataSyncResult(symbol=clean, status="failed", provider=provider.name, error=str(exc))
+
+
+def _run_data_sync(req: DataSyncRequest) -> dict[str, Any]:
+    provider = _price_provider()
+    cache = ParquetCache()
+    results = [
+        _sync_one_symbol(
+            symbol,
+            start=req.start,
+            end=req.end,
+            mode=req.mode,
+            provider=provider,
+            cache=cache,
+        )
+        for symbol in req.symbols
+        if symbol.strip()
+    ]
+    return {
+        "mode": req.mode,
+        "start": req.start,
+        "end": req.end,
+        "results": [_model_dump(result) for result in results],
+    }
 
 
 def _now_iso() -> str:
@@ -346,6 +716,7 @@ def health() -> dict[str, str]:
 @app.get("/primitives")
 def list_primitives() -> list[dict[str, Any]]:
     """The primitive palette (built-ins + user operators) for the operator composer."""
+    _load_persisted_formulas()
     return [_primitive_info(p) for p in REGISTRY.values()]
 
 
@@ -365,6 +736,47 @@ def remove_operator(name: str) -> dict[str, str]:
     return {"removed": name}
 
 
+@app.get("/formulas")
+def list_formulas() -> list[dict[str, Any]]:
+    return _load_persisted_formulas()
+
+
+@app.post("/formulas")
+def add_formula(spec: FormulaSpec) -> dict[str, Any]:
+    normalized = _normalize_formula_name(spec.name)
+    spec = FormulaSpec(
+        **{
+            **_model_dump(spec),
+            "name": normalized,
+            "display_name": spec.display_name or normalized.replace("_", " "),
+        }
+    )
+    saved = _read_formula_specs()
+    if any(item.name == spec.name for item in saved):
+        raise HTTPException(status_code=400, detail="formula name already exists")
+    _register(_formula_operator_spec(spec))
+    saved.append(spec)
+    _write_formula_specs(saved)
+    return {**_model_dump(spec), "registered": True, "error": None}
+
+
+@app.delete("/formulas/{name}")
+def delete_formula(name: str) -> dict[str, str]:
+    normalized = _normalize_formula_name(name)
+    saved = _read_formula_specs()
+    target = next((spec for spec in saved if spec.name == normalized), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="unknown formula")
+    for spec in saved:
+        if spec.name == normalized:
+            continue
+        if _tree_uses(tree_from_dict(spec.body), normalized):
+            raise HTTPException(status_code=400, detail=f"formula is used by {spec.name!r}")
+    unregister_operator(normalized)
+    _write_formula_specs([spec for spec in saved if spec.name != normalized])
+    return {"removed": normalized}
+
+
 @app.get("/universes")
 def list_universes() -> list[dict[str, Any]]:
     _load_persisted_universes()
@@ -381,8 +793,50 @@ def list_universes() -> list[dict[str, Any]]:
 
 @app.post("/universes")
 def add_universe(spec: UniverseSpec) -> dict[str, Any]:
+    if spec.name == _DEFAULT_UNIVERSE:
+        raise HTTPException(status_code=400, detail="sample universes cannot be replaced")
     universe = _persist_universe(spec)
     return {"name": spec.name, "symbols": universe.all_symbols()}
+
+
+@app.get("/universes/{name}")
+def get_universe(name: str) -> dict[str, Any]:
+    _load_persisted_universes()
+    if name == _DEFAULT_UNIVERSE:
+        universe = sample_universe(_DEFAULT_UNIVERSE)
+        return {
+            **_universe_to_spec(universe),
+            "symbols": universe.all_symbols(),
+            "source": "sample",
+        }
+    universe = _universes.get(name)
+    if universe is None:
+        raise HTTPException(status_code=404, detail="unknown universe")
+    return {**_universe_to_spec(universe), "symbols": universe.all_symbols(), "source": "custom"}
+
+
+@app.put("/universes/{name}")
+def update_universe(name: str, spec: UniverseSpec) -> dict[str, Any]:
+    if name == _DEFAULT_UNIVERSE:
+        raise HTTPException(status_code=400, detail="sample universes cannot be updated")
+    if spec.name != name:
+        raise HTTPException(status_code=400, detail="universe name must match the path")
+    universe = _persist_universe(spec)
+    return {"name": spec.name, "symbols": universe.all_symbols()}
+
+
+@app.delete("/universes/{name}")
+def delete_universe(name: str) -> dict[str, str]:
+    if name == _DEFAULT_UNIVERSE:
+        raise HTTPException(status_code=400, detail="sample universes cannot be deleted")
+    _load_persisted_universes()
+    target = paths.universe_dir() / f"{name}.parquet"
+    if name not in _universes and not target.exists():
+        raise HTTPException(status_code=404, detail="unknown universe")
+    _universes.pop(name, None)
+    if target.exists():
+        target.unlink()
+    return {"removed": name}
 
 
 @app.get("/workspaces", response_model=list[WorkspaceSummary])
@@ -431,6 +885,7 @@ def delete_workspace(workspace_id: str) -> dict[str, str]:
 
 @app.post("/runs", response_model=JobResponse)
 def submit_run(req: RunRequest, panel: Panel = Depends(get_panel)) -> JobResponse:  # noqa: B008
+    _load_persisted_formulas()
     for spec in req.operators:  # register user operators before the search sees them
         _register(spec)
     panel = _panel_for_universe(req.universe, _DEFAULT_AS_OF, panel)
@@ -563,9 +1018,58 @@ def update_settings(update: SettingsUpdate) -> dict[str, Any]:
 
 
 # --- local data usage + cleanup --------------------------------------------------
+@app.get("/symbols/search", response_model=list[SymbolCandidate])
+def search_symbols(query: str, limit: int = 8) -> list[SymbolCandidate]:
+    try:
+        return _search_symbol_candidates(query, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - surface provider/search failures clearly
+        raise HTTPException(status_code=502, detail=f"symbol search failed: {exc}") from exc
+
+
+@app.post("/symbols/validate", response_model=SymbolValidation)
+def validate_symbol(req: SymbolValidationRequest) -> SymbolValidation:
+    return _validate_symbol(req.symbol, req.start, req.end)
+
+
 @app.get("/data/usage")
 def data_usage() -> list[dict[str, Any]]:
     return usage.usage()
+
+
+@app.get("/data/coverage", response_model=list[DataCoverage])
+def data_coverage(
+    symbols: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[DataCoverage]:
+    parsed = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
+    return [_coverage_for_symbol(symbol, start, end) for symbol in parsed]
+
+
+@app.post("/data/sync")
+def data_sync(req: DataSyncRequest) -> dict[str, str]:
+    mode = req.mode.lower()
+    if mode not in _SYNC_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_SYNC_MODES)}")
+    symbols = sorted({symbol.strip().upper() for symbol in req.symbols if symbol.strip()})
+    if not symbols:
+        raise HTTPException(status_code=400, detail="at least one symbol is required")
+    request = DataSyncRequest(symbols=symbols, start=req.start, end=req.end, mode=mode)
+    job_id = _data_jobs.submit(lambda: _run_data_sync(request))
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/data/sync/{job_id}")
+def data_sync_status(job_id: str) -> dict[str, Any]:
+    job = _data_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown sync job")
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "result": job.result,
+        "error": job.error,
+    }
 
 
 @app.post("/data/clear")
@@ -601,6 +1105,7 @@ def create_session(
     req: SessionCreateRequest,
     panel: Panel = Depends(get_panel),  # noqa: B008
 ) -> dict[str, str]:
+    _load_persisted_formulas()
     for spec in req.operators:
         _register(spec)
     panel = _panel_for_universe(req.universe, req.as_of, panel)
@@ -653,6 +1158,7 @@ def continue_session(
     req: SessionContinueRequest,
     panel: Panel = Depends(get_panel),  # noqa: B008
 ) -> dict[str, str]:
+    _load_persisted_formulas()
     if not sessions.exists(session_id):
         raise HTTPException(status_code=404, detail="unknown session")
     session = sessions.load_session(session_id)
@@ -819,6 +1325,7 @@ if _STATIC_DIR and Path(_STATIC_DIR).is_dir():
 def _apply_persisted_settings() -> None:
     """Apply runtime-relevant settings (the evaluator choice) once at startup."""
     try:
+        _load_persisted_formulas()
         evaluator = paths.read_settings().get("evaluator")
         if evaluator:
             cpp.set_backend(evaluator)

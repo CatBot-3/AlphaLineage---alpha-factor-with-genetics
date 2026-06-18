@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const getSettings = vi.fn();
@@ -50,15 +50,22 @@ describe("SettingsMenu (L6)", () => {
     renderMenu();
     fireEvent.click(screen.getByLabelText("Settings menu"));
     const popover = await screen.findByTestId("settings-popover");
+    expect(within(popover).getByRole("button", { name: /Workspace/ })).toBeInTheDocument();
+    expect(within(popover).getByRole("button", { name: /Quit/ })).toBeInTheDocument();
+
+    fireEvent.click(within(popover).getByRole("button", { name: /Workspace/ }));
     expect(popover).toHaveTextContent("Save local");
     expect(popover).toHaveTextContent("Load backend");
+
+    fireEvent.click(within(popover).getByRole("button", { name: /Quit/ }));
     expect(screen.getByTestId("quit")).toBeInTheDocument();
   });
 
   it("saves the evaluator backend choice", async () => {
     renderMenu();
     fireEvent.click(screen.getByLabelText("Settings menu"));
-    await screen.findByTestId("settings-popover");
+    const popover = await screen.findByTestId("settings-popover");
+    fireEvent.click(within(popover).getByRole("button", { name: /Settings/ }));
     fireEvent.change(await screen.findByLabelText("Evaluator backend"), {
       target: { value: "python" },
     });
@@ -69,6 +76,8 @@ describe("SettingsMenu (L6)", () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     renderMenu();
     fireEvent.click(screen.getByLabelText("Settings menu"));
+    const popover = await screen.findByTestId("settings-popover");
+    fireEvent.click(within(popover).getByRole("button", { name: /Local data/ }));
     await screen.findByTestId("data-rows");
     fireEvent.click(screen.getByText("Clear"));
     await waitFor(() => expect(clearData).toHaveBeenCalledWith("sessions"));
@@ -77,6 +86,8 @@ describe("SettingsMenu (L6)", () => {
   it("invokes onQuit from the Quit action", async () => {
     const onQuit = renderMenu();
     fireEvent.click(screen.getByLabelText("Settings menu"));
+    const popover = await screen.findByTestId("settings-popover");
+    fireEvent.click(within(popover).getByRole("button", { name: /Quit/ }));
     fireEvent.click(await screen.findByTestId("quit"));
     expect(onQuit).toHaveBeenCalled();
   });

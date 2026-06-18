@@ -7,6 +7,7 @@ default, overridable via the ``ALPHALINEAGE_DATA_DIR`` environment variable):
       prices/{SYMBOL}.parquet            raw OHLCV + div_cash + split_factor
       universe/{name}.parquet            constituents with entry/exit dates
       workspaces/{id}.json               saved UI/backend workspaces
+      meta/formulas.json                  saved user formula primitives
       reports/survivorship_{name}.md     audit reports
       meta/fetch_log.json                provenance + rate-limit accounting
 """
@@ -56,6 +57,10 @@ def meta_dir() -> Path:
 # --- settings (user-editable, persisted under meta/) -----------------------------
 def settings_path() -> Path:
     return meta_dir() / "settings.json"
+
+
+def formulas_path() -> Path:
+    return meta_dir() / "formulas.json"
 
 
 def read_settings() -> dict[str, Any]:

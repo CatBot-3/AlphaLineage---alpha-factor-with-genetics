@@ -43,6 +43,15 @@ describe("workspace storage", () => {
         nodes: [{ id: "n1", kind: "$arg", argIndex: 0, x: 10, y: 20 }],
         edges: [],
       },
+      formulaDraft: {
+        name: "momentum",
+        display_name: "Momentum",
+        description: "Current value minus delayed value.",
+        template: "momentum",
+        arg_types: ["series", "window"],
+        out_type: "series",
+        body: { name: "sub", children: [{ name: "$arg", value: 0 }, { name: "close" }] },
+      },
     });
 
     writeLocalWorkspace(snapshot);
@@ -51,6 +60,7 @@ describe("workspace storage", () => {
     expect(loaded?.run?.best_factor).toEqual({ name: "close" });
     expect(loaded?.universes[0].memberships[0].symbol).toBe("AAPL");
     expect(loaded?.operatorDraft?.nodes[0].kind).toBe("$arg");
+    expect(loaded?.formulaDraft?.template).toBe("momentum");
     expect(loaded?.ui.selectedLineage).toBe(7);
   });
 

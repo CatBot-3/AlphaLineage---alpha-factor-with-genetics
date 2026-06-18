@@ -1,4 +1,5 @@
 import type {
+  FormulaDraft,
   OperatorComposerDraft,
   RunResult,
   UniverseDraft,
@@ -14,6 +15,7 @@ export interface WorkspaceInput {
   run: RunResult | null;
   ui: WorkspaceUiState;
   universeDraft?: UniverseDraft;
+  formulaDraft?: FormulaDraft;
   operatorDraft?: OperatorComposerDraft;
 }
 
@@ -37,6 +39,7 @@ export function makeWorkspaceSnapshot(input: WorkspaceInput): WorkspaceSnapshot 
     universes: universesFromDraft(input.universeDraft),
     operators: [],
     universeDraft: input.universeDraft,
+    formulaDraft: input.formulaDraft,
     operatorDraft: input.operatorDraft,
     ui: input.ui,
   };

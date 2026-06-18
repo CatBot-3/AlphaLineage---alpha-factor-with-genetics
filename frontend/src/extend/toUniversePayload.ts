@@ -1,4 +1,4 @@
-// P7-T1 (pure): turn the universe-builder rows into a point-in-time universe payload.
+// Turn universe-updater rows into a point-in-time universe payload.
 
 import type { UniverseSpec } from "../api/types";
 

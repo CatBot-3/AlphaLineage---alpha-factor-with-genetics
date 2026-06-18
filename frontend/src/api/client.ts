@@ -1,7 +1,11 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
 import type {
+  DataCoverage,
+  DataSyncJob,
+  DataSyncRequest,
   DataUsageRow,
+  FormulaSpec,
   Lineage,
   OperatorSpec,
   RunResult,
@@ -13,6 +17,8 @@ import type {
   SessionSummary,
   Settings,
   SettingsUpdate,
+  SymbolCandidate,
+  SymbolValidation,
   UniverseInfo,
   UniverseSpec,
   WorkspaceSnapshot,
@@ -116,6 +122,19 @@ export async function registerOperator(spec: OperatorSpec): Promise<PrimitiveInf
   return (await res.json()) as PrimitiveInfo;
 }
 
+export async function listFormulas(): Promise<FormulaSpec[]> {
+  return jsonOrThrow(await fetch(`${BASE}/formulas`), "list formulas");
+}
+
+export async function addFormula(spec: FormulaSpec): Promise<FormulaSpec> {
+  return jsonOrThrow(await POST("/formulas", spec), "save formula");
+}
+
+export async function deleteFormula(name: string): Promise<void> {
+  const res = await fetch(`${BASE}/formulas/${encodeURIComponent(name)}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`delete formula failed: ${res.status}`);
+}
+
 export async function defineUniverse(
   spec: UniverseSpec,
 ): Promise<{ name: string; symbols: string[] }> {
@@ -132,6 +151,59 @@ export async function listUniverses(): Promise<UniverseInfo[]> {
   const res = await fetch(`${BASE}/universes`);
   if (!res.ok) throw new Error(`universes failed: ${res.status}`);
   return (await res.json()) as UniverseInfo[];
+}
+
+export async function getUniverse(name: string): Promise<UniverseInfo> {
+  return jsonOrThrow(await fetch(`${BASE}/universes/${encodeURIComponent(name)}`), "load universe");
+}
+
+export async function updateUniverse(
+  name: string,
+  spec: UniverseSpec,
+): Promise<{ name: string; symbols: string[] }> {
+  const res = await fetch(`${BASE}/universes/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec),
+  });
+  return jsonOrThrow(res, "update universe");
+}
+
+export async function deleteUniverse(name: string): Promise<void> {
+  const res = await fetch(`${BASE}/universes/${encodeURIComponent(name)}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`delete universe failed: ${res.status}`);
+}
+
+export async function searchSymbols(query: string): Promise<SymbolCandidate[]> {
+  const params = new URLSearchParams({ query });
+  return jsonOrThrow(await fetch(`${BASE}/symbols/search?${params}`), "search symbols");
+}
+
+export async function validateSymbol(payload: {
+  symbol: string;
+  start?: string;
+  end?: string;
+}): Promise<SymbolValidation> {
+  return jsonOrThrow(await POST("/symbols/validate", payload), "validate symbol");
+}
+
+export async function getDataCoverage(
+  symbols: string[],
+  start?: string,
+  end?: string,
+): Promise<DataCoverage[]> {
+  const params = new URLSearchParams({ symbols: symbols.join(",") });
+  if (start) params.set("start", start);
+  if (end) params.set("end", end);
+  return jsonOrThrow(await fetch(`${BASE}/data/coverage?${params}`), "load data coverage");
+}
+
+export async function startDataSync(req: DataSyncRequest): Promise<{ job_id: string; status: string }> {
+  return jsonOrThrow(await POST("/data/sync", req), "start data sync");
+}
+
+export async function getDataSync(jobId: string): Promise<DataSyncJob> {
+  return jsonOrThrow(await fetch(`${BASE}/data/sync/${encodeURIComponent(jobId)}`), "load sync job");
 }
 
 export async function listWorkspaces(): Promise<WorkspaceSummary[]> {

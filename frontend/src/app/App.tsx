@@ -11,6 +11,7 @@ import {
 import { loadRun } from "../api/dataSource";
 import {
   parseFactor,
+  type FormulaDraft,
   type LineageNode,
   type OperatorComposerDraft,
   type RunResult,
@@ -19,7 +20,7 @@ import {
 } from "../api/types";
 import { Dashboard } from "../dashboard/Dashboard";
 import { OperatorComposer } from "../extend/OperatorComposer";
-import { UniverseBuilder } from "../extend/UniverseBuilder";
+import { UniverseUpdater } from "../extend/UniverseUpdater";
 import { FactorDetail } from "../factor/FactorDetail";
 import { FactorTree } from "../factor/FactorTree";
 import type { TreeNodeData } from "../factor/treeToFlow";
@@ -65,6 +66,9 @@ export function App() {
   const [operatorDraft, setOperatorDraft] = useState<OperatorComposerDraft | undefined>(
     initialWorkspace?.operatorDraft,
   );
+  const [formulaDraft, setFormulaDraft] = useState<FormulaDraft | undefined>(
+    initialWorkspace?.formulaDraft,
+  );
   const [seedIds, setSeedIds] = useState<string[]>([]);
   const [searchRunning, setSearchRunning] = useState(false);
   const [runningSessionId, setRunningSessionId] = useState<string | null>(null);
@@ -80,6 +84,7 @@ export function App() {
       makeWorkspaceSnapshot({
         run,
         universeDraft,
+        formulaDraft,
         operatorDraft,
         ui: {
           selectedTab: tab,
@@ -90,7 +95,7 @@ export function App() {
           sessionId: run?.session_id ?? null,
         },
       }),
-    [operatorDraft, run, selectedLineage, selectedNode, tab, universeDraft],
+    [formulaDraft, operatorDraft, run, selectedLineage, selectedNode, tab, universeDraft],
   );
 
   const applyWorkspace = useCallback((snapshot: WorkspaceSnapshot) => {
@@ -99,6 +104,7 @@ export function App() {
     setSelectedNode(applyNode(snapshot.ui.selectedFactorNode));
     setSelectedLineage(snapshot.ui.selectedLineage ?? null);
     setUniverseDraft(snapshot.universeDraft);
+    setFormulaDraft(snapshot.formulaDraft);
     setOperatorDraft(snapshot.operatorDraft);
     setStatus(`Loaded ${snapshot.name}`);
   }, []);
@@ -298,7 +304,7 @@ export function App() {
         <header className="view-head">
           <div className="view-tag">
             <span className="view-tag__mark" aria-hidden="true" />
-            <span>#ALPHALINEAGE</span>
+            <span>AlphaLineage</span>
           </div>
           <h1>Honest factor evolution</h1>
           <p>Trace each generated alpha from metrics to tree structure to genetic lineage.</p>
@@ -401,9 +407,11 @@ export function App() {
               <span />
             </div>
             <div className="view-body extend">
-              <UniverseBuilder
+              <UniverseUpdater
                 draft={universeDraft}
+                formulaDraft={formulaDraft}
                 onDraftChange={setUniverseDraft}
+                onFormulaDraftChange={setFormulaDraft}
                 canSubmit={mode === "app"}
               />
               <OperatorComposer

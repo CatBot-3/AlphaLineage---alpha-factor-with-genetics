@@ -13,7 +13,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getPrimitives, registerOperator } from "../api/client";
+import { addFormula, getPrimitives } from "../api/client";
 import type { OperatorComposerDraft, PrimitiveInfo } from "../api/types";
 import { type ComposerEdge, type ComposerNode, findRoot, graphToBody } from "./graphToBody";
 
@@ -122,8 +122,17 @@ export function OperatorComposer({
     }
     try {
       const body = graphToBody(composerNodes, composerEdges, root);
-      registerOperator({ name, arg_types: argTypes, out_type: outType, body })
-        .then((p) => setMessage(`Registered ${p.name}(${p.arg_types.join(", ")}) -> ${p.out_type}`))
+      addFormula({
+        name,
+        display_name: name.replace(/_/g, " "),
+        description: "Composed in the graph editor.",
+        arg_types: argTypes,
+        out_type: outType,
+        body,
+      })
+        .then((p) =>
+          setMessage(`Saved ${p.name}(${p.arg_types.join(", ")}) -> ${p.out_type}`),
+        )
         .catch((e: Error) => setError(e.message));
     } catch (e) {
       setError(String(e));

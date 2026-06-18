@@ -26,6 +26,19 @@ vi.mock("../api/client", () => ({
   getDataUsage: () => Promise.resolve([]),
   putSettings: vi.fn(),
   clearData: vi.fn(),
+  getPrimitives: () => Promise.resolve([]),
+  listFormulas: () => Promise.resolve([]),
+  addFormula: vi.fn(),
+  deleteFormula: vi.fn(),
+  defineUniverse: vi.fn(),
+  getUniverse: vi.fn(),
+  updateUniverse: vi.fn(),
+  deleteUniverse: vi.fn(),
+  searchSymbols: () => Promise.resolve([]),
+  validateSymbol: vi.fn(),
+  getDataCoverage: () => Promise.resolve([]),
+  startDataSync: vi.fn(),
+  getDataSync: vi.fn(),
   listUniverses: () => Promise.resolve([]),
   listFactors: () => Promise.resolve([]),
   createSession: vi.fn(),
@@ -43,6 +56,7 @@ describe("Quit flow (L7)", () => {
     render(<App />);
 
     fireEvent.click(screen.getByLabelText("Settings menu"));
+    fireEvent.click(await screen.findByRole("button", { name: /Quit/ }));
     fireEvent.click(await screen.findByTestId("quit"));
     expect(await screen.findByTestId("quit-dialog")).toBeInTheDocument();
 
