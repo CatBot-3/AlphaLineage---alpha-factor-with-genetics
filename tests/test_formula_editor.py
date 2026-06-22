@@ -233,6 +233,127 @@ def test_user_formula_window_arg_is_gp_mutable(synthetic_panel):
     assert observed - {5}, "GP point mutation never altered the call-site window argument"
 
 
+def test_primitive_catalog_has_readable_metadata_and_named_inputs(client):
+    primitives = client.get("/primitives").json()
+    assert primitives
+    for primitive in primitives:
+        assert primitive["display_name"]
+        assert primitive["description"]
+        assert primitive["origin"] in {"builtin", "user_formula", "data", "value"}
+        assert len(primitive["inputs"]) == len(primitive["arg_types"])
+        assert all(item["name"] and item["type"] for item in primitive["inputs"])
+    assert next(item for item in primitives if item["name"] == "ts_mean")["inputs"] == [
+        {
+            "name": "series",
+            "type": "series",
+            "description": "Series to average.",
+        },
+        {
+            "name": "lookback",
+            "type": "window",
+            "description": "Number of periods in the trailing window.",
+        },
+    ]
+
+
+def test_legacy_formula_store_migrates_named_inputs_on_write(client):
+    from alphalineage.data import paths
+
+    legacy = {
+        "name": "legacy_ma",
+        "arg_types": ["series", "window"],
+        "out_type": "series",
+        "body": {
+            "name": "ts_mean",
+            "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+        },
+    }
+    _write_formulas([legacy])
+    loaded = client.get("/formulas").json()[0]
+    assert [item["name"] for item in loaded["inputs"]] == ["input_1", "input_2"]
+    assert loaded["revision"] == 1
+    assert loaded["runtime_name"] == "legacy_ma"
+
+    loaded["description"] = "Readable moving average."
+    assert client.put("/formulas/legacy_ma", json=loaded).status_code == 200
+    payload = json.loads(paths.formulas_path().read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["families"][0]["revisions"][0]["inputs"][0]["name"] == "input_1"
+
+
+def test_formula_impact_and_transitive_upgrade_preserve_old_revisions(client):
+    ma = {
+        "name": "ma_shared",
+        "description": "Moving average.",
+        "arg_types": ["series", "window"],
+        "inputs": [
+            {"name": "price", "type": "series", "description": "Input series."},
+            {"name": "lookback", "type": "window", "description": "Period count."},
+        ],
+        "out_type": "series",
+        "body": {
+            "name": "ts_mean",
+            "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+        },
+    }
+    dif = {
+        "name": "dif_shared",
+        "arg_types": ["series", "window"],
+        "out_type": "series",
+        "body": {
+            "name": "ma_shared",
+            "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+        },
+    }
+    signal = {
+        "name": "signal_shared",
+        "arg_types": ["series", "window"],
+        "out_type": "signal",
+        "body": {
+            "name": "rank",
+            "children": [
+                {
+                    "name": "dif_shared",
+                    "children": [
+                        {"name": "$arg", "value": 0},
+                        {"name": "$arg", "value": 1},
+                    ],
+                }
+            ],
+        },
+    }
+    for spec in (ma, dif, signal):
+        assert client.post("/formulas", json=spec).status_code == 200
+
+    changed = {
+        **ma,
+        "body": {
+            "name": "delta",
+            "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+        },
+    }
+    impact = client.post("/formulas/ma_shared/impact", json=changed).json()
+    assert impact["direct_formulas"] == ["dif_shared"]
+    assert impact["transitive_formulas"] == ["dif_shared", "signal_shared"]
+    assert client.put("/formulas/ma_shared", json=changed).status_code == 400
+
+    upgraded = client.put("/formulas/ma_shared?strategy=upgrade_references", json=changed)
+    assert upgraded.status_code == 200, upgraded.text
+    assert upgraded.json()["revision"] == 2
+    assert upgraded.json()["upgraded"] == ["dif_shared", "signal_shared"]
+
+    ma_detail = client.get("/formulas/ma_shared").json()
+    assert [item["runtime_name"] for item in ma_detail["revisions"]] == [
+        "ma_shared",
+        "ma_shared__r2",
+    ]
+    dif_detail = client.get("/formulas/dif_shared").json()
+    assert dif_detail["body"]["name"] == "ma_shared__r2"
+    signal_detail = client.get("/formulas/signal_shared").json()
+    assert signal_detail["body"]["children"][0]["name"] == "dif_shared__r2"
+    assert "ma_shared" in REGISTRY and "ma_shared__r2" in REGISTRY
+
+
 # --- Stage 3: boolean / condition ops --------------------------------------------
 _CONDITION_OPS = {"gt", "lt", "ge", "le", "and_", "or_", "not_", "where"}
 

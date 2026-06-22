@@ -173,6 +173,7 @@ export interface SavedFactor {
   metrics: Record<string, number>;
   provenance: FactorProvenance;
   required_operators: OperatorSpec[];
+  expanded_tree?: FactorNode;
   notes: string;
   disclaimer: string;
 }
@@ -204,11 +205,19 @@ export function parseFactor(factor: string | FactorNode): FactorNode {
 // --- extensibility (Phase 7) ---------------------------------------------------
 export interface PrimitiveInfo {
   name: string;
+  logical_name?: string;
+  display_name?: string;
+  description?: string;
   kind: string; // operator | operand | ephemeral
   arg_types: string[];
+  inputs?: FormulaInputSpec[];
   out_type: string;
   user: boolean;
+  origin?: "builtin" | "user_formula" | "data" | "value";
+  editable?: boolean;
   category?: string;
+  revision?: number | null;
+  runtime_name?: string;
 }
 
 export interface OperatorSpec {
@@ -223,11 +232,38 @@ export interface FormulaSpec {
   display_name: string;
   description: string;
   arg_types: string[];
+  inputs?: FormulaInputSpec[];
   out_type: string;
   body: FactorNode;
   category?: string;
   registered?: boolean;
   error?: string | null;
+  revision?: number;
+  runtime_name?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface FormulaInputSpec {
+  name: string;
+  type: string;
+  description: string;
+}
+
+export interface FormulaImpact {
+  name: string;
+  runtime_name: string;
+  change: "none" | "metadata" | "calculation";
+  direct_formulas: string[];
+  transitive_formulas: string[];
+  factors: string[];
+  sessions: string[];
+  has_references: boolean;
+}
+
+export interface FormulaDetail extends FormulaSpec {
+  revisions: FormulaSpec[];
+  impact: FormulaImpact;
 }
 
 export interface FormulaValidation {
@@ -269,10 +305,35 @@ export interface FormulaDraft {
   name: string;
   display_name: string;
   description: string;
-  template: string;
+  template?: string;
   arg_types?: string[];
   out_type?: string;
   body?: FactorNode;
+  inputs?: FormulaInputSpec[];
+  category?: string;
+  expression?: string;
+  activeMode?: "visual" | "expression";
+  loadedName?: string | null;
+  loadedRevision?: number | null;
+  graphNodes?: FormulaDraftNode[];
+  graphEdges?: FormulaDraftEdge[];
+  selectedNodeId?: string | null;
+}
+
+export interface FormulaDraftNode {
+  id: string;
+  type: string;
+  x: number;
+  y: number;
+  data: Record<string, unknown>;
+}
+
+export interface FormulaDraftEdge {
+  id: string;
+  source: string;
+  target: string;
+  sourceHandle?: string | null;
+  targetHandle?: string | null;
 }
 
 export interface SymbolCandidate {

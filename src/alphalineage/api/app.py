@@ -41,6 +41,7 @@ from alphalineage.core.extensions import (
 )
 from alphalineage.core.gp import GPConfig, validate_seed
 from alphalineage.core.panel import Panel
+from alphalineage.core.primitive_docs import primitive_doc
 from alphalineage.core.primitives import OPERATORS, REGISTRY, Primitive
 from alphalineage.core.tree import Node
 from alphalineage.core.tree import from_dict as tree_from_dict
@@ -70,6 +71,7 @@ _DEFAULT_UNIVERSE = "sp500-lite"
 _DEFAULT_AS_OF = "2026-06-01"
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _FORMULA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_FORMULA_INPUT_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 
 # --- models ----------------------------------------------------------------------
@@ -80,14 +82,25 @@ class OperatorSpec(BaseModel):
     body: dict[str, Any]
 
 
+class FormulaInputSpec(BaseModel):
+    name: str
+    type: str
+    description: str = ""
+
+
 class FormulaSpec(BaseModel):
     name: str
     display_name: str = ""
     description: str = ""
-    arg_types: list[str]
+    arg_types: list[str] = Field(default_factory=list)
+    inputs: list[FormulaInputSpec] = Field(default_factory=list)
     out_type: str
     body: dict[str, Any]
     category: str = ""
+    revision: int = 1
+    runtime_name: str = ""
+    created_at: str = ""
+    updated_at: str = ""
 
 
 class CategoryUpdate(BaseModel):
@@ -262,8 +275,12 @@ class SessionContinueRequest(BaseModel):
 
 
 def _formula_categories() -> dict[str, str]:
-    """The category each saved user formula declares (empty string when unset)."""
-    return {spec.name: spec.category for spec in _read_formula_specs() if spec.category}
+    """Category for each persisted formula runtime revision."""
+    return {
+        spec.runtime_name: spec.category
+        for spec in _all_formula_specs()
+        if spec.category and spec.runtime_name
+    }
 
 
 def _resolve_category(name: str, *, is_user: bool, formula_categories: dict[str, str]) -> str:
@@ -278,20 +295,21 @@ def _resolve_category(name: str, *, is_user: bool, formula_categories: dict[str,
     return core_categories.builtin_category(name)
 
 
-def _allowed_operators(config: GPConfig) -> set[str] | None:
+def _allowed_operators(
+    config: GPConfig, formula_runtime_names: set[str] | None = None
+) -> set[str] | None:
     """The operator names the GP may use, from the config's ``enabled_categories``.
 
     ``None`` (the default) leaves the GP on its default pool (condition category excluded), so
     the classic numeric search space is unchanged unless a run opts categories in.
     """
-    enabled = config.enabled_categories
-    if enabled is None:
-        return None
-    enabled_set = set(enabled)
+    enabled_set = set(config.enabled_categories or core_categories.DEFAULT_ENABLED_CATEGORIES)
     cats = _formula_categories()
+    current = formula_runtime_names or {spec.runtime_name for spec in _read_formula_specs()}
     return {
         prim.name
         for prim in OPERATORS.values()
+        if (prim.macro_body is None or prim.name in current)
         if _resolve_category(
             prim.name, is_user=prim.macro_body is not None, formula_categories=cats
         )
@@ -304,13 +322,51 @@ def _primitive_info(
 ) -> dict[str, Any]:
     is_user = prim.macro_body is not None
     cats = formula_categories if formula_categories is not None else _formula_categories()
+    formula = _formula_for_runtime(prim.name) if is_user else None
+    doc = (
+        {
+            "display_name": formula.display_name or formula.name.replace("_", " ").title(),
+            "description": formula.description or "User-defined typed formula.",
+            "inputs": [
+                {"name": item.name, "description": item.description} for item in formula.inputs
+            ],
+        }
+        if formula is not None
+        else primitive_doc(prim.name, prim.arity)
+    )
+    inputs = []
+    for index, arg_type in enumerate(prim.arg_types):
+        meta = doc["inputs"][index] if index < len(doc["inputs"]) else {}
+        inputs.append(
+            {
+                "name": str(meta.get("name") or f"input_{index + 1}"),
+                "type": arg_type.value,
+                "description": str(meta.get("description") or "Function input."),
+            }
+        )
+    if prim.kind.value == "operand":
+        origin = "data"
+    elif prim.kind.value == "ephemeral":
+        origin = "value"
+    elif is_user:
+        origin = "user_formula"
+    else:
+        origin = "builtin"
     return {
         "name": prim.name,
+        "logical_name": formula.name if formula is not None else prim.name,
+        "display_name": doc["display_name"],
+        "description": doc["description"],
         "kind": prim.kind.value,
         "arg_types": [t.value for t in prim.arg_types],
+        "inputs": inputs,
         "out_type": prim.out_type.value,
         "user": is_user,
+        "origin": origin,
+        "editable": is_user,
         "category": _resolve_category(prim.name, is_user=is_user, formula_categories=cats),
+        "revision": formula.revision if formula is not None else None,
+        "runtime_name": prim.name,
     }
 
 
@@ -337,25 +393,163 @@ def _normalize_formula_name(name: str) -> str:
     return slug
 
 
-def _read_formula_specs() -> list[FormulaSpec]:
+def _formula_inputs(
+    arg_types: list[str], supplied: list[FormulaInputSpec]
+) -> list[FormulaInputSpec]:
+    if supplied and len(supplied) != len(arg_types):
+        raise HTTPException(status_code=400, detail="formula inputs must match argument types")
+    inputs = supplied or [
+        FormulaInputSpec(name=f"input_{index + 1}", type=arg_type)
+        for index, arg_type in enumerate(arg_types)
+    ]
+    seen: set[str] = set()
+    normalized: list[FormulaInputSpec] = []
+    for index, item in enumerate(inputs):
+        name = re.sub(r"[^a-z0-9_]+", "_", item.name.strip().lower()).strip("_")
+        if not _FORMULA_INPUT_RE.fullmatch(name):
+            raise HTTPException(status_code=400, detail=f"invalid formula input name {item.name!r}")
+        if name in seen:
+            raise HTTPException(status_code=400, detail=f"duplicate formula input {name!r}")
+        if item.type != arg_types[index]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"input {name!r} type does not match argument {index + 1}",
+            )
+        seen.add(name)
+        normalized.append(
+            FormulaInputSpec(name=name, type=item.type, description=item.description.strip())
+        )
+    return normalized
+
+
+def _normalize_formula_spec(
+    spec: FormulaSpec,
+    *,
+    revision: int | None = None,
+    runtime_name: str | None = None,
+    created_at: str | None = None,
+) -> FormulaSpec:
+    name = _normalize_formula_name(spec.name)
+    arg_types = list(spec.arg_types or [item.type for item in spec.inputs])
+    for arg_type in arg_types:
+        try:
+            DType(arg_type)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"unknown input type {arg_type!r}") from exc
+    try:
+        DType(spec.out_type)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"unknown output type {spec.out_type!r}"
+        ) from exc
+    rev = revision if revision is not None else max(1, int(spec.revision or 1))
+    now = _now_iso()
+    return FormulaSpec(
+        name=name,
+        display_name=spec.display_name.strip() or name.replace("_", " ").title(),
+        description=spec.description.strip(),
+        arg_types=arg_types,
+        inputs=_formula_inputs(arg_types, list(spec.inputs)),
+        out_type=spec.out_type,
+        body=spec.body,
+        category=spec.category.strip() or core_categories.CUSTOM,
+        revision=rev,
+        runtime_name=runtime_name or spec.runtime_name or (name if rev == 1 else f"{name}__r{rev}"),
+        created_at=created_at or spec.created_at or now,
+        updated_at=now,
+    )
+
+
+def _legacy_formula_store(items: list[Any]) -> dict[str, Any]:
+    families: list[dict[str, Any]] = []
+    for item in items:
+        spec = _normalize_formula_spec(FormulaSpec(**item), revision=1)
+        families.append({"name": spec.name, "latest_revision": 1, "revisions": [_model_dump(spec)]})
+    return {"schema_version": 2, "families": families}
+
+
+def _read_formula_store() -> dict[str, Any]:
     path = paths.formulas_path()
     if not path.exists():
-        return []
+        return {"schema_version": 2, "families": []}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=500, detail="invalid formula store") from exc
-    if not isinstance(payload, list):
+    if isinstance(payload, list):
+        return _legacy_formula_store(payload)
+    if not isinstance(payload, dict) or not isinstance(payload.get("families"), list):
         raise HTTPException(status_code=500, detail="invalid formula store")
-    return [FormulaSpec(**item) for item in payload]
+    families: list[dict[str, Any]] = []
+    for raw in payload["families"]:
+        revisions = [
+            _model_dump(_normalize_formula_spec(FormulaSpec(**item)))
+            for item in raw.get("revisions", [])
+        ]
+        if not revisions:
+            continue
+        latest = int(raw.get("latest_revision") or max(item["revision"] for item in revisions))
+        families.append(
+            {
+                "name": str(raw.get("name") or revisions[-1]["name"]),
+                "latest_revision": latest,
+                "revisions": revisions,
+            }
+        )
+    return {"schema_version": 2, "families": families}
+
+
+def _write_formula_store(store: dict[str, Any]) -> None:
+    paths.meta_dir().mkdir(parents=True, exist_ok=True)
+    paths.formulas_path().write_text(
+        json.dumps(store, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def _write_formula_specs(specs: list[FormulaSpec]) -> None:
-    paths.meta_dir().mkdir(parents=True, exist_ok=True)
-    payload = [_model_dump(spec) for spec in specs]
-    paths.formulas_path().write_text(
-        json.dumps(payload, indent=2, sort_keys=True),
-        encoding="utf-8",
+    """Compatibility helper used by older callers and tests."""
+    _write_formula_store(
+        {
+            "schema_version": 2,
+            "families": [
+                {
+                    "name": spec.name,
+                    "latest_revision": spec.revision,
+                    "revisions": [_model_dump(_normalize_formula_spec(spec))],
+                }
+                for spec in specs
+            ],
+        }
+    )
+
+
+def _family_latest(family: dict[str, Any]) -> FormulaSpec:
+    latest = int(family["latest_revision"])
+    item = next(
+        (entry for entry in family["revisions"] if int(entry.get("revision", 1)) == latest),
+        family["revisions"][-1],
+    )
+    return _normalize_formula_spec(FormulaSpec(**item))
+
+
+def _read_formula_specs() -> list[FormulaSpec]:
+    return [_family_latest(family) for family in _read_formula_store()["families"]]
+
+
+def _all_formula_specs(store: dict[str, Any] | None = None) -> list[FormulaSpec]:
+    current = store or _read_formula_store()
+    return [
+        _normalize_formula_spec(FormulaSpec(**item))
+        for family in current["families"]
+        for item in family["revisions"]
+    ]
+
+
+def _formula_for_runtime(runtime_name: str) -> FormulaSpec | None:
+    return next(
+        (spec for spec in _all_formula_specs() if spec.runtime_name == runtime_name),
+        None,
     )
 
 
@@ -367,7 +561,7 @@ def _tree_uses(node: Node, primitive_name: str) -> bool:
 
 def _formula_operator_spec(spec: FormulaSpec) -> OperatorSpec:
     return OperatorSpec(
-        name=spec.name,
+        name=spec.runtime_name,
         arg_types=spec.arg_types,
         out_type=spec.out_type,
         body=spec.body,
@@ -381,22 +575,22 @@ def _topo_sort_formulas(specs: list[FormulaSpec]) -> list[FormulaSpec]:
     dependency happens to sit later in the file. On a cycle (which the type gate makes
     impossible to create through the API), the original order is preserved as a fallback.
     """
-    by_name = {spec.name: spec for spec in specs}
+    by_name = {spec.runtime_name: spec for spec in specs}
     ordered: list[FormulaSpec] = []
     visiting: set[str] = set()
     placed: set[str] = set()
 
     def visit(spec: FormulaSpec) -> None:
-        if spec.name in placed or spec.name in visiting:
+        if spec.runtime_name in placed or spec.runtime_name in visiting:
             return
-        visiting.add(spec.name)
+        visiting.add(spec.runtime_name)
         body = tree_from_dict(spec.body)
         for other in specs:
-            if other.name != spec.name and _tree_uses(body, other.name):
-                visit(by_name[other.name])
-        visiting.discard(spec.name)
-        if spec.name not in placed:
-            placed.add(spec.name)
+            if other.runtime_name != spec.runtime_name and _tree_uses(body, other.runtime_name):
+                visit(by_name[other.runtime_name])
+        visiting.discard(spec.runtime_name)
+        if spec.runtime_name not in placed:
+            placed.add(spec.runtime_name)
             ordered.append(spec)
 
     for spec in specs:
@@ -405,7 +599,7 @@ def _topo_sort_formulas(specs: list[FormulaSpec]) -> list[FormulaSpec]:
 
 
 def _load_persisted_formulas() -> list[dict[str, Any]]:
-    specs = _read_formula_specs()
+    specs = _all_formula_specs()
     status: dict[str, tuple[bool, str | None]] = {}
     for spec in _topo_sort_formulas(specs):
         try:
@@ -415,15 +609,135 @@ def _load_persisted_formulas() -> list[dict[str, Any]]:
                 DType(spec.out_type),
                 spec.body,
             )
-            status[spec.name] = (True, None)
+            status[spec.runtime_name] = (True, None)
         except (InvalidOperator, ValueError) as exc:
-            status[spec.name] = (False, str(exc))
-    # Report in the original file order; registration happened in dependency order above.
+            status[spec.runtime_name] = (False, str(exc))
+    latest = _read_formula_specs()
     formulas: list[dict[str, Any]] = []
-    for spec in specs:
-        registered, error = status.get(spec.name, (False, None))
+    for spec in latest:
+        registered, error = status.get(spec.runtime_name, (False, None))
         formulas.append({**_model_dump(spec), "registered": registered, "error": error})
     return formulas
+
+
+def _formula_family(store: dict[str, Any], name: str) -> dict[str, Any] | None:
+    return next((family for family in store["families"] if family["name"] == name), None)
+
+
+def _replace_tree_names(tree: dict[str, Any], replacements: dict[str, str]) -> dict[str, Any]:
+    result: dict[str, Any] = {"name": replacements.get(str(tree["name"]), str(tree["name"]))}
+    if "value" in tree:
+        result["value"] = tree["value"]
+    if tree.get("children"):
+        result["children"] = [
+            _replace_tree_names(child, replacements) for child in tree["children"]
+        ]
+    return result
+
+
+def _tree_names(tree: dict[str, Any]) -> set[str]:
+    names = {str(tree.get("name", ""))}
+    for child in tree.get("children", []):
+        names.update(_tree_names(child))
+    return names
+
+
+def _formula_impact(name: str, proposed: FormulaSpec | None = None) -> dict[str, Any]:
+    store = _read_formula_store()
+    family = _formula_family(store, name)
+    if family is None:
+        raise HTTPException(status_code=404, detail="unknown formula")
+    current = _family_latest(family)
+    direct: list[str] = []
+    reverse: dict[str, set[str]] = {}
+    latest = _read_formula_specs()
+    for spec in latest:
+        used = _tree_names(spec.body)
+        for candidate in latest:
+            if candidate.runtime_name in used:
+                reverse.setdefault(candidate.name, set()).add(spec.name)
+        if spec.name != name and current.runtime_name in used:
+            direct.append(spec.name)
+
+    transitive: set[str] = set(direct)
+    pending = list(direct)
+    while pending:
+        dependency = pending.pop()
+        for caller in reverse.get(dependency, set()):
+            if caller not in transitive and caller != name:
+                transitive.add(caller)
+                pending.append(caller)
+
+    factor_refs: list[str] = []
+    try:
+        for factor in _factor_store().list():
+            required = {item.get("name") for item in factor.required_operators}
+            if current.runtime_name in required or current.runtime_name in {
+                node.name for node in factor.tree.iter_nodes()
+            }:
+                factor_refs.append(factor.id)
+    except OSError:
+        pass
+
+    session_refs: list[str] = []
+    root = paths.sessions_dir()
+    if root.exists():
+        for directory in root.iterdir():
+            session_file = directory / "session.json"
+            if not session_file.exists():
+                continue
+            try:
+                session = json.loads(session_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            pinned = {
+                item.get("runtime_name") or item.get("name")
+                for item in session.get("formula_revisions", [])
+            }
+            if current.runtime_name in pinned:
+                session_refs.append(str(session.get("id") or directory.name))
+
+    change = "none"
+    if proposed is not None:
+        normalized = _normalize_formula_spec(
+            proposed,
+            revision=current.revision,
+            runtime_name=current.runtime_name,
+            created_at=current.created_at,
+        )
+        if (
+            normalized.body != current.body
+            or normalized.arg_types != current.arg_types
+            or normalized.out_type != current.out_type
+        ):
+            change = "calculation"
+        elif (
+            normalized.display_name != current.display_name
+            or normalized.description != current.description
+            or normalized.category != current.category
+            or normalized.inputs != current.inputs
+        ):
+            change = "metadata"
+    return {
+        "name": name,
+        "runtime_name": current.runtime_name,
+        "change": change,
+        "direct_formulas": sorted(set(direct)),
+        "transitive_formulas": sorted(transitive),
+        "factors": sorted(set(factor_refs)),
+        "sessions": sorted(set(session_refs)),
+        "has_references": bool(transitive or factor_refs or session_refs),
+    }
+
+
+def _active_formula_operator_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            **_model_dump(spec),
+            "name": spec.runtime_name,
+        }
+        for spec in _read_formula_specs()
+    ]
 
 
 def _price_provider() -> PriceProvider:
@@ -915,20 +1229,15 @@ def list_formulas() -> list[dict[str, Any]]:
 
 @app.post("/formulas")
 def add_formula(spec: FormulaSpec) -> dict[str, Any]:
-    normalized = _normalize_formula_name(spec.name)
-    spec = FormulaSpec(
-        **{
-            **_model_dump(spec),
-            "name": normalized,
-            "display_name": spec.display_name or normalized.replace("_", " "),
-        }
-    )
-    saved = _read_formula_specs()
-    if any(item.name == spec.name for item in saved):
+    spec = _normalize_formula_spec(spec, revision=1)
+    store = _read_formula_store()
+    if _formula_family(store, spec.name) is not None:
         raise HTTPException(status_code=400, detail="formula name already exists")
     _register(_formula_operator_spec(spec))
-    saved.append(spec)
-    _write_formula_specs(saved)
+    store["families"].append(
+        {"name": spec.name, "latest_revision": 1, "revisions": [_model_dump(spec)]}
+    )
+    _write_formula_store(store)
     return {**_model_dump(spec), "registered": True, "error": None}
 
 
@@ -936,14 +1245,17 @@ def add_formula(spec: FormulaSpec) -> dict[str, Any]:
 def validate_formula(spec: FormulaSpec) -> dict[str, Any]:
     """Type-check a formula body without registering it or touching disk (live editor feedback)."""
     try:
-        name = _normalize_formula_name(spec.name) if spec.name else None
+        normalized = _normalize_formula_spec(spec)
+        name = normalized.name
     except HTTPException as exc:
         return {"ok": False, "error": str(exc.detail), "name": None}
     try:
-        out = infer_macro_type(tree_from_dict(spec.body), [DType(t) for t in spec.arg_types])
+        out = infer_macro_type(
+            tree_from_dict(normalized.body), [DType(t) for t in normalized.arg_types]
+        )
     except (InvalidOperator, ValueError, KeyError) as exc:
         return {"ok": False, "error": str(exc), "name": name}
-    declared = DType(spec.out_type)
+    declared = DType(normalized.out_type)
     if not is_subtype(out, declared):
         return {
             "ok": False,
@@ -953,38 +1265,43 @@ def validate_formula(spec: FormulaSpec) -> dict[str, Any]:
     return {"ok": True, "out_type": out.value, "name": name, "error": None}
 
 
-@app.put("/formulas/{name}")
-def update_formula(name: str, spec: FormulaSpec) -> dict[str, Any]:
+@app.get("/formulas/{name}")
+def get_formula(name: str) -> dict[str, Any]:
     normalized = _normalize_formula_name(name)
-    saved = _read_formula_specs()
-    existing = next((item for item in saved if item.name == normalized), None)
-    if existing is None:
+    store = _read_formula_store()
+    family = _formula_family(store, normalized)
+    if family is None:
         raise HTTPException(status_code=404, detail="unknown formula")
+    latest = _family_latest(family)
+    return {
+        **_model_dump(latest),
+        "revisions": family["revisions"],
+        "impact": _formula_impact(normalized),
+    }
 
-    updated = FormulaSpec(
-        **{
-            **_model_dump(spec),
-            "name": normalized,
-            "display_name": spec.display_name or normalized.replace("_", " "),
-        }
-    )
-    signature_changed = (
-        updated.arg_types != existing.arg_types or updated.out_type != existing.out_type
-    )
-    if signature_changed:
-        for other in saved:
-            if other.name == normalized:
-                continue
-            if _tree_uses(tree_from_dict(other.body), normalized):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"cannot change the signature of {normalized!r}; "
-                        f"it is used by {other.name!r}"
-                    ),
-                )
 
-    # Validate the new body BEFORE mutating the registry so a bad update leaves the old intact.
+@app.post("/formulas/{name}/impact")
+def formula_impact(name: str, spec: FormulaSpec) -> dict[str, Any]:
+    normalized = _normalize_formula_name(name)
+    return _formula_impact(normalized, spec)
+
+
+@app.put("/formulas/{name}")
+def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> dict[str, Any]:
+    normalized = _normalize_formula_name(name)
+    store = _read_formula_store()
+    family = _formula_family(store, normalized)
+    if family is None:
+        raise HTTPException(status_code=404, detail="unknown formula")
+    existing = _family_latest(family)
+    requested = FormulaSpec(**{**_model_dump(spec), "name": normalized})
+    updated = _normalize_formula_spec(
+        requested,
+        revision=existing.revision,
+        runtime_name=existing.runtime_name,
+        created_at=existing.created_at,
+    )
+    impact = _formula_impact(normalized, updated)
     try:
         out = infer_macro_type(tree_from_dict(updated.body), [DType(t) for t in updated.arg_types])
         if not is_subtype(out, DType(updated.out_type)):
@@ -994,28 +1311,103 @@ def update_formula(name: str, spec: FormulaSpec) -> dict[str, Any]:
     except (InvalidOperator, ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    unregister_operator(normalized)
-    _register(_formula_operator_spec(updated))
-    _write_formula_specs([updated if item.name == normalized else item for item in saved])
-    # Re-resolve the whole set so dependents pick up the new body (dependency-ordered).
-    _load_persisted_formulas()
-    return {**_model_dump(updated), "registered": True, "error": None}
+    if impact["change"] != "calculation":
+        family["revisions"] = [
+            _model_dump(updated) if int(item.get("revision", 1)) == existing.revision else item
+            for item in family["revisions"]
+        ]
+        _write_formula_store(store)
+        return {**_model_dump(updated), "registered": True, "error": None, "upgraded": []}
+
+    if impact["has_references"] and strategy != "upgrade_references":
+        raise HTTPException(status_code=400, detail={"message": "formula is in use", **impact})
+
+    if not impact["has_references"]:
+        unregister_operator(existing.runtime_name)
+        try:
+            _register(_formula_operator_spec(updated))
+        except HTTPException:
+            _register(_formula_operator_spec(existing))
+            raise
+        family["revisions"] = [
+            _model_dump(updated) if int(item.get("revision", 1)) == existing.revision else item
+            for item in family["revisions"]
+        ]
+        _write_formula_store(store)
+        return {**_model_dump(updated), "registered": True, "error": None, "upgraded": []}
+
+    if strategy != "upgrade_references":
+        raise HTTPException(status_code=400, detail="unknown formula update strategy")
+
+    replacements: dict[str, str] = {}
+    candidates: list[FormulaSpec] = []
+    target_revision = existing.revision + 1
+    target = _normalize_formula_spec(
+        requested,
+        revision=target_revision,
+        runtime_name=f"{normalized}__r{target_revision}",
+    )
+    replacements[existing.runtime_name] = target.runtime_name
+    candidates.append(target)
+
+    for dependent in _topo_sort_formulas(_read_formula_specs()):
+        if dependent.name == normalized:
+            continue
+        if not (_tree_names(dependent.body) & replacements.keys()):
+            continue
+        revision = dependent.revision + 1
+        candidate = _normalize_formula_spec(
+            FormulaSpec(
+                **{
+                    **_model_dump(dependent),
+                    "body": _replace_tree_names(dependent.body, replacements),
+                }
+            ),
+            revision=revision,
+            runtime_name=f"{dependent.name}__r{revision}",
+        )
+        replacements[dependent.runtime_name] = candidate.runtime_name
+        candidates.append(candidate)
+
+    registered: list[str] = []
+    try:
+        for candidate in candidates:
+            _register(_formula_operator_spec(candidate))
+            registered.append(candidate.runtime_name)
+    except HTTPException:
+        for runtime_name in registered:
+            unregister_operator(runtime_name)
+        raise
+
+    for candidate in candidates:
+        candidate_family = _formula_family(store, candidate.name)
+        if candidate_family is None:
+            continue
+        candidate_family["revisions"].append(_model_dump(candidate))
+        candidate_family["latest_revision"] = candidate.revision
+    _write_formula_store(store)
+    return {
+        **_model_dump(target),
+        "registered": True,
+        "error": None,
+        "upgraded": [item.name for item in candidates[1:]],
+    }
 
 
 @app.delete("/formulas/{name}")
 def delete_formula(name: str) -> dict[str, str]:
     normalized = _normalize_formula_name(name)
-    saved = _read_formula_specs()
-    target = next((spec for spec in saved if spec.name == normalized), None)
-    if target is None:
+    store = _read_formula_store()
+    family = _formula_family(store, normalized)
+    if family is None:
         raise HTTPException(status_code=404, detail="unknown formula")
-    for spec in saved:
-        if spec.name == normalized:
-            continue
-        if _tree_uses(tree_from_dict(spec.body), normalized):
-            raise HTTPException(status_code=400, detail=f"formula is used by {spec.name!r}")
-    unregister_operator(normalized)
-    _write_formula_specs([spec for spec in saved if spec.name != normalized])
+    impact = _formula_impact(normalized)
+    if impact["has_references"]:
+        raise HTTPException(status_code=400, detail={"message": "formula is in use", **impact})
+    for item in family["revisions"]:
+        unregister_operator(str(item.get("runtime_name") or item.get("name")))
+    store["families"] = [item for item in store["families"] if item["name"] != normalized]
+    _write_formula_store(store)
     return {"removed": normalized}
 
 
@@ -1436,12 +1828,14 @@ def create_session(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    formula_revisions = _active_formula_operator_specs()
     session = sessions.new_session(
         name=req.name,
         universe=req.universe,
         as_of=req.as_of,
         config=config,
         operators=[_model_dump(spec) for spec in req.operators],
+        formula_revisions=formula_revisions,
         seed_factor_ids=req.seed_factor_ids,
         boundaries=boundaries,
         trial_baseline=trial_baseline,
@@ -1449,7 +1843,7 @@ def create_session(
         created_at=_now_iso(),
     )
     session_id = session["id"]
-    allowed = _allowed_operators(config)
+    allowed = _allowed_operators(config, {str(item["name"]) for item in formula_revisions})
     progress = RunProgress(target_generations=config.generations)
     cancel = threading.Event()
     job_id = uuid.uuid4().hex
@@ -1504,6 +1898,17 @@ def continue_session(
             )
         except (InvalidOperator, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    pinned_formulas = session.get("formula_revisions") or _active_formula_operator_specs()
+    for stored in pinned_formulas:
+        try:
+            ensure_operator(
+                stored["name"],
+                [DType(t) for t in stored["arg_types"]],
+                DType(stored["out_type"]),
+                stored["body"],
+            )
+        except (InvalidOperator, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     universe = req.universe or session["universe"]
     new_panel = _panel_for_universe(universe, session["as_of"], panel)
@@ -1529,7 +1934,7 @@ def continue_session(
         session["config"] = merged
         sessions.save_session(session)
 
-    allowed = _allowed_operators(config)
+    allowed = _allowed_operators(config, {str(item["name"]) for item in pinned_formulas})
     progress = RunProgress(target_generations=config.generations)
     cancel = threading.Event()
     job_id = uuid.uuid4().hex

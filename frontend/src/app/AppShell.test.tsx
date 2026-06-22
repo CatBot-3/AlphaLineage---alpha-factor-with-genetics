@@ -58,8 +58,13 @@ describe("AppShell", () => {
     expect(onSelectExtendPage).toHaveBeenCalledWith("formula");
   });
 
-  it("marks the Extend dropdown read-only in static demo mode", () => {
-    renderShell("demo");
-    expect(screen.getByRole("button", { name: "Extend" })).toHaveAttribute("aria-disabled", "true");
+  it("keeps the local Extend workspace accessible in static demo mode", () => {
+    const { onSelectExtendPage } = renderShell("demo");
+    const extend = screen.getByRole("button", { name: "Extend" });
+
+    expect(extend).not.toHaveAttribute("aria-disabled");
+    fireEvent.click(extend);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Formula Editor" }));
+    expect(onSelectExtendPage).toHaveBeenCalledWith("formula");
   });
 });

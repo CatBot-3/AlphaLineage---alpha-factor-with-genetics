@@ -1,13 +1,13 @@
-// Extend > Formula Editor: author functions by text (kept in sync with a node display) or by
-// dragging in the graph composer, customize every parameter, promote parameters to GP-tunable
-// arguments, branch from any function, and organize functions into categories.
-
+import type { Connection, ReactFlowInstance } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   addFormula,
   deleteFormula,
   getCategories,
+  getFormula,
+  getFormulaImpact,
   getPrimitives,
+  listFactors,
   listFormulas,
   putCategories,
   setPrimitiveCategory,
@@ -15,155 +15,459 @@ import {
   validateFormula,
 } from "../api/client";
 import type {
-  CategorySettings,
   FactorNode,
+  FormulaDetail,
+  FormulaDraft,
+  FormulaDraftEdge,
+  FormulaDraftNode,
+  FormulaImpact,
+  FormulaInputSpec,
   FormulaSpec,
-  FormulaValidation,
-  OperatorComposerDraft,
   PrimitiveInfo,
+  SavedFactor,
 } from "../api/types";
-import { OperatorComposer } from "./OperatorComposer";
+import { FormulaCanvas } from "./FormulaCanvas";
+import {
+  autoLayoutGraph,
+  blankFormulaGraph,
+  bodyToFormulaGraph,
+  graphToFormulaBody,
+  nodeOutputType,
+  OUTPUT_NODE_ID,
+  primitiveNode,
+  targetInputType,
+  typesCompatible,
+  type FormulaGraph,
+  type FormulaNodeData,
+} from "./formulaGraph";
 import { parseFormula, serializeFormula } from "./formulaText";
-import { leafType, paramLeaves, promoteToArg, setLeafValue } from "./treeEdit";
 
 const TYPE_OPTIONS = ["series", "signal", "window", "scalar", "bool"];
-const DEFAULT_TREE: FactorNode = { name: "rank", children: [{ name: "$arg", value: 0 }] };
+const DEFAULT_INPUTS: FormulaInputSpec[] = [
+  { name: "price", type: "series", description: "Price or derived series to transform." },
+];
 
-function skeleton(prim: PrimitiveInfo): string {
-  if (prim.arg_types.length === 0) return prim.name;
-  const args = prim.arg_types.map((t) => (t === "window" ? "10" : t === "scalar" ? "1" : "$0"));
-  return `${prim.name}(${args.join(", ")})`;
+const DEMO_PRIMITIVES: PrimitiveInfo[] = [
+  { name: "close", display_name: "Close", description: "Closing price for each symbol and date.", kind: "operand", arg_types: [], inputs: [], out_type: "series", user: false, origin: "data", category: "data" },
+  { name: "returns", display_name: "Returns", description: "Single-period return derived from closing prices.", kind: "operand", arg_types: [], inputs: [], out_type: "series", user: false, origin: "data", category: "data" },
+  { name: "rank", display_name: "Cross-sectional rank", description: "Ranks symbols against one another on each date.", kind: "operator", arg_types: ["series"], inputs: [{ name: "series", type: "series", description: "Series to rank." }], out_type: "signal", user: false, origin: "builtin", category: "cross_sectional" },
+  { name: "ts_mean", display_name: "Moving average", description: "Trailing arithmetic mean over a lookback window.", kind: "operator", arg_types: ["series", "window"], inputs: [{ name: "series", type: "series", description: "Series to average." }, { name: "lookback", type: "window", description: "Trailing period count." }], out_type: "series", user: false, origin: "builtin", category: "time_series" },
+  { name: "sub", display_name: "Subtract", description: "Subtracts the second series from the first.", kind: "operator", arg_types: ["series", "series"], inputs: [{ name: "left", type: "series", description: "Series to subtract from." }, { name: "right", type: "series", description: "Series to subtract." }], out_type: "series", user: false, origin: "builtin", category: "arithmetic" },
+  { name: "window", display_name: "Window", description: "A whole-number lookback.", kind: "ephemeral", arg_types: [], inputs: [], out_type: "window", user: false, origin: "value", category: "constant" },
+  { name: "const", display_name: "Scalar", description: "A numeric constant.", kind: "ephemeral", arg_types: [], inputs: [], out_type: "scalar", user: false, origin: "value", category: "constant" },
+];
+
+interface PendingInsert {
+  primitiveName: string;
+  nodeId: string;
+  inputIndex: number;
 }
 
-function NodeView({ node, userNames }: { node: FactorNode; userNames: Set<string> }) {
-  if (node.name === "$arg") return <span className="fnode fnode-arg">${node.value ?? 0}</span>;
-  if (!node.children?.length && node.value !== undefined) {
-    return <span className="fnode fnode-leaf">{node.value}</span>;
+function humanCategory(value: string): string {
+  return value.replace(/_/g, " ");
+}
+
+function draftGraph(draft: FormulaDraft | undefined, inputs: FormulaInputSpec[], outType: string): FormulaGraph {
+  if (draft?.graphNodes?.length) {
+    return { nodes: draft.graphNodes, edges: draft.graphEdges ?? [] };
   }
-  if (!node.children?.length) return <span className="fnode fnode-operand">{node.name}</span>;
-  const isUser = userNames.has(node.name);
-  return (
-    <span className={`fnode fnode-op${isUser ? " fnode-user" : ""}`}>
-      <span className="fnode-name">{node.name}</span>
-      <span className="fnode-args">
-        {node.children.map((c, i) => (
-          <NodeView key={i} node={c} userNames={userNames} />
-        ))}
-      </span>
-    </span>
-  );
+  return blankFormulaGraph(inputs, outType);
+}
+
+function factorOutputType(factor: SavedFactor, primitives: PrimitiveInfo[]): string {
+  const root = factor.expanded_tree ?? factor.tree;
+  return primitives.find((primitive) => primitive.name === root.name)?.out_type ?? "signal";
 }
 
 export function FormulaEditorPage({
-  operatorDraft,
-  onOperatorDraftChange,
+  formulaDraft,
+  onFormulaDraftChange,
   canSubmit = true,
 }: {
-  operatorDraft?: OperatorComposerDraft;
-  onOperatorDraftChange?: (draft: OperatorComposerDraft) => void;
+  formulaDraft?: FormulaDraft;
+  onFormulaDraftChange?: (draft: FormulaDraft) => void;
   canSubmit?: boolean;
 }) {
-  const [primitives, setPrimitives] = useState<PrimitiveInfo[]>([]);
-  const [formulas, setFormulas] = useState<FormulaSpec[]>([]);
-  const [categories, setCategories] = useState<CategorySettings>({ order: [], overrides: {} });
+  const initialInputs = formulaDraft?.inputs?.length ? formulaDraft.inputs : DEFAULT_INPUTS;
+  const initialOutType = formulaDraft?.out_type ?? "signal";
+  const initialGraph = draftGraph(formulaDraft, initialInputs, initialOutType);
 
-  const [name, setName] = useState("my_formula");
-  const [argTypes, setArgTypes] = useState<string[]>(["series"]);
-  const [outType, setOutType] = useState("signal");
-  const [category, setCategory] = useState("custom");
-  const [description, setDescription] = useState("");
-  const [tree, setTree] = useState<FactorNode>(DEFAULT_TREE);
-  const [text, setText] = useState(serializeFormula(DEFAULT_TREE));
-  const [loadedName, setLoadedName] = useState<string | null>(null);
+  const [primitives, setPrimitives] = useState<PrimitiveInfo[]>(canSubmit ? [] : DEMO_PRIMITIVES);
+  const [formulas, setFormulas] = useState<FormulaSpec[]>([]);
+  const [factors, setFactors] = useState<SavedFactor[]>([]);
+  const [categories, setCategories] = useState<string[]>(["custom"]);
+  const [name, setName] = useState(formulaDraft?.name ?? "my_formula");
+  const [displayName, setDisplayName] = useState(formulaDraft?.display_name ?? "My formula");
+  const [description, setDescription] = useState(formulaDraft?.description ?? "");
+  const [inputs, setInputs] = useState<FormulaInputSpec[]>(initialInputs);
+  const [outType, setOutType] = useState(initialOutType);
+  const [category, setCategory] = useState(formulaDraft?.category ?? "custom");
+  const [nodes, setNodes] = useState<FormulaDraftNode[]>(initialGraph.nodes);
+  const [edges, setEdges] = useState<FormulaDraftEdge[]>(initialGraph.edges);
+  const [expression, setExpression] = useState(formulaDraft?.expression ?? "");
+  const [activeMode, setActiveMode] = useState<"visual" | "expression">(formulaDraft?.activeMode ?? "visual");
+  const [mobilePane, setMobilePane] = useState<"library" | "canvas" | "inspector">("canvas");
+  const [loadedName, setLoadedName] = useState<string | null>(formulaDraft?.loadedName ?? null);
+  const [loadedRevision, setLoadedRevision] = useState<number | null>(formulaDraft?.loadedRevision ?? null);
+  const [formulaDetail, setFormulaDetail] = useState<FormulaDetail | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(formulaDraft?.selectedNodeId ?? null);
+  const [selectedSlot, setSelectedSlot] = useState<{ nodeId: string; index: number } | null>(null);
+  const [selectedSource, setSelectedSource] = useState<PrimitiveInfo | SavedFactor | null>(null);
+  const [search, setSearch] = useState("");
   const [parseError, setParseError] = useState<string | null>(null);
-  const [validation, setValidation] = useState<FormulaValidation | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [newCategory, setNewCategory] = useState("");
-  const textRef = useRef<HTMLTextAreaElement>(null);
+  const [dirty, setDirty] = useState(false);
+  const [pendingInsert, setPendingInsert] = useState<PendingInsert | null>(null);
+  const [pendingSave, setPendingSave] = useState<{ spec: FormulaSpec; impact: FormulaImpact } | null>(null);
+  const [past, setPast] = useState<FormulaGraph[]>([]);
+  const [future, setFuture] = useState<FormulaGraph[]>([]);
+  const flowRef = useRef<ReactFlowInstance | null>(null);
+  const nodeCounter = useRef(nodes.length + 1);
+  const shouldSeedGraph = useRef(!formulaDraft?.graphNodes?.length);
+  const seedBody = useRef(formulaDraft?.body);
 
-  const userNames = useMemo(() => new Set(formulas.map((f) => f.name)), [formulas]);
-  const leaves = useMemo(() => paramLeaves(tree), [tree]);
-  // Editable numeric leaves (window/const) get contiguous testids; $arg leaves are read-only.
-  const numericLeaves = useMemo(() => leaves.filter((l) => l.node.name !== "$arg"), [leaves]);
-  const argLeaves = useMemo(() => leaves.filter((l) => l.node.name === "$arg"), [leaves]);
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
+  const selectedData = selectedNode?.data as FormulaNodeData | undefined;
 
-  function refreshLists() {
+  function refresh() {
     if (!canSubmit) return;
-    getPrimitives().then(setPrimitives).catch(() => setPrimitives([]));
-    listFormulas().then(setFormulas).catch(() => setFormulas([]));
-    getCategories().then(setCategories).catch(() => undefined);
+    Promise.all([getPrimitives(), listFormulas(), listFactors(), getCategories()])
+      .then(([nextPrimitives, nextFormulas, nextFactors, nextCategories]) => {
+        setPrimitives(nextPrimitives);
+        setFormulas(nextFormulas);
+        setFactors(nextFactors);
+        setCategories([...new Set([...nextCategories.order, "custom"])]);
+      })
+      .catch((reason) => setError(String(reason)));
   }
 
-  useEffect(refreshLists, [canSubmit]);
+  useEffect(refresh, [canSubmit]);
 
-  // Programmatic tree edits update text too; raw text edits only update the tree (preserve caret).
-  function setTreeAndText(next: FactorNode) {
-    setTree(next);
-    setText(serializeFormula(next));
-  }
-
-  function onTextChange(value: string) {
-    setText(value);
-    const { tree: parsed, errors } = parseFormula(value, argTypes, primitives);
-    if (parsed) {
-      setTree(parsed);
-      setParseError(null);
-    } else {
-      setParseError(errors[0] ? `${errors[0].msg} (at ${errors[0].pos})` : "invalid formula");
+  useEffect(() => {
+    if (shouldSeedGraph.current && primitives.length && edges.length === 0) {
+      shouldSeedGraph.current = false;
+      if (seedBody.current) {
+        const graph = bodyToFormulaGraph(seedBody.current, inputs, primitives, outType);
+        setNodes(graph.nodes);
+        setEdges(graph.edges);
+        setExpression(serializeFormula(seedBody.current, inputs));
+        return;
+      }
+      const rank = primitives.find((primitive) => primitive.logical_name === "rank" || primitive.name === "rank");
+      if (rank) {
+        const body: FactorNode = { name: rank.name, children: [{ name: "$arg", value: 0 }] };
+        const graph = bodyToFormulaGraph(body, inputs, primitives, outType);
+        setNodes(graph.nodes);
+        setEdges(graph.edges);
+        setExpression(serializeFormula(body, inputs));
+      }
     }
-  }
+  }, [primitives]);
 
-  async function runValidate() {
-    if (!canSubmit) return;
-    try {
-      setValidation(await validateFormula(buildSpec()));
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  function buildSpec(): FormulaSpec {
-    return {
+  useEffect(() => {
+    onFormulaDraftChange?.({
       name,
-      display_name: name.replace(/_/g, " "),
+      display_name: displayName,
       description,
-      arg_types: argTypes,
+      arg_types: inputs.map((input) => input.type),
+      inputs,
       out_type: outType,
-      body: tree,
       category,
+      expression,
+      activeMode,
+      loadedName,
+      loadedRevision,
+      graphNodes: nodes,
+      graphEdges: edges,
+      selectedNodeId,
+    });
+  }, [activeMode, category, description, displayName, edges, expression, inputs, loadedName, loadedRevision, name, nodes, onFormulaDraftChange, outType, selectedNodeId]);
+
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => {
+      if (!dirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  function graphSnapshot(): FormulaGraph {
+    return { nodes, edges };
+  }
+
+  function commitGraph(next: FormulaGraph) {
+    setPast((history) => [...history.slice(-39), graphSnapshot()]);
+    setFuture([]);
+    setNodes(next.nodes);
+    setEdges(next.edges);
+    setDirty(true);
+    try {
+      setExpression(serializeFormula(graphToFormulaBody(next.nodes, next.edges), inputs));
+      setParseError(null);
+    } catch {
+      // Incomplete visual drafts are expected while blocks are being assembled.
+    }
+  }
+
+  function undo() {
+    const previous = past[past.length - 1];
+    if (!previous) return;
+    setFuture((items) => [graphSnapshot(), ...items]);
+    setPast((items) => items.slice(0, -1));
+    setNodes(previous.nodes);
+    setEdges(previous.edges);
+  }
+
+  function redo() {
+    const next = future[0];
+    if (!next) return;
+    setPast((items) => [...items, graphSnapshot()]);
+    setFuture((items) => items.slice(1));
+    setNodes(next.nodes);
+    setEdges(next.edges);
+  }
+
+  function updateOutputType(value: string) {
+    setOutType(value);
+    setNodes((items) => items.map((node) => node.id === OUTPUT_NODE_ID
+      ? { ...node, data: { ...node.data, outType: value } }
+      : node));
+    setDirty(true);
+  }
+
+  function updateInput(index: number, patch: Partial<FormulaInputSpec>) {
+    setInputs((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
+    setNodes((items) => items.map((node) => node.id === `formula-input-${index}`
+      ? { ...node, data: { ...node.data, label: patch.name ?? node.data.label, outType: patch.type ?? node.data.outType, description: patch.description ?? node.data.description } }
+      : node));
+    setDirty(true);
+  }
+
+  function addInput() {
+    const index = inputs.length;
+    const input = { name: `input_${index + 1}`, type: "series", description: "Formula input." };
+    setInputs((items) => [...items, input]);
+    commitGraph({
+      nodes: [...nodes, {
+        id: `formula-input-${index}`,
+        type: "formula",
+        x: 40,
+        y: 70 + index * 110,
+        data: { kind: "input", label: input.name, description: input.description, outType: input.type, argIndex: index, locked: true },
+      }],
+      edges,
+    });
+  }
+
+  function removeInput(index: number) {
+    const id = `formula-input-${index}`;
+    if (edges.some((edge) => edge.source === id)) {
+      setError("Disconnect this input before removing it.");
+      return;
+    }
+    setInputs((items) => items.filter((_, itemIndex) => itemIndex !== index));
+    const nextNodes = nodes
+      .filter((node) => node.id !== id)
+      .map((node) => {
+        const data = node.data as FormulaNodeData;
+        if (data.kind !== "input" || Number(data.argIndex) < index) return node;
+        const nextIndex = Number(data.argIndex) - 1;
+        return { ...node, id: `formula-input-${nextIndex}`, data: { ...data, argIndex: nextIndex } };
+      });
+    commitGraph({ nodes: nextNodes, edges: edges.filter((edge) => edge.source !== id) });
+  }
+
+  function nextNodeFor(source: PrimitiveInfo | SavedFactor, point = { x: 260, y: 180 }): FormulaDraftNode {
+    const id = `formula-node-${nodeCounter.current++}`;
+    if ("kind" in source) return primitiveNode(source, id, point.x, point.y);
+    return {
+      id,
+      type: "formula",
+      x: point.x,
+      y: point.y,
+      data: {
+        kind: "factor",
+        label: source.name,
+        description: source.notes || "Saved alpha factor snapshot.",
+        origin: "saved_factor",
+        outType: factorOutputType(source, primitives),
+        factorId: source.id,
+        factorBody: source.expanded_tree ?? source.tree,
+        locked: true,
+      } satisfies FormulaNodeData,
     };
   }
 
-  function insertSkeleton(prim: PrimitiveInfo) {
-    const snippet = skeleton(prim);
-    const el = textRef.current;
-    if (el && typeof el.selectionStart === "number") {
-      const start = el.selectionStart;
-      const end = el.selectionEnd;
-      onTextChange(text.slice(0, start) + snippet + text.slice(end));
-    } else {
-      onTextChange(text ? `${text} ${snippet}` : snippet);
+  function findSource(key: string): PrimitiveInfo | SavedFactor | undefined {
+    if (key.startsWith("factor:")) return factors.find((factor) => factor.id === key.slice(7));
+    return primitives.find((primitive) => primitive.name === key || primitive.logical_name === key);
+  }
+
+  function insertOnCanvas(key: string, point?: { x: number; y: number }) {
+    const source = findSource(key);
+    if (!source) return;
+    if (selectedSlot) {
+      insertIntoSlot(selectedSlot.nodeId, selectedSlot.index, key);
+      return;
     }
+    const node = nextNodeFor(source, point);
+    commitGraph({ nodes: [...nodes, node], edges });
+    setSelectedNodeId(node.id);
   }
 
-  function loadFormula(spec: FormulaSpec) {
-    setName(spec.name);
-    setArgTypes(spec.arg_types);
-    setOutType(spec.out_type);
-    setCategory(spec.category || "custom");
-    setDescription(spec.description ?? "");
-    setTreeAndText(spec.body);
-    setLoadedName(spec.name);
-    setMessage(null);
-    setError(null);
-    setValidation(null);
+  function insertIntoSlot(nodeId: string, inputIndex: number, key: string) {
+    const source = findSource(key);
+    const target = nodes.find((node) => node.id === nodeId);
+    if (!source || !target) return;
+    const candidate = nextNodeFor(source, { x: target.x - 230, y: target.y + inputIndex * 40 });
+    const expected = targetInputType(target, `input-${inputIndex}`);
+    if (!expected || !typesCompatible(nodeOutputType(candidate), expected)) {
+      setError(`${candidate.data.label} produces ${nodeOutputType(candidate)}, but this input expects ${expected}.`);
+      return;
+    }
+    const occupied = edges.some((edge) => edge.target === nodeId && edge.targetHandle === `input-${inputIndex}`);
+    if (occupied) {
+      setPendingInsert({ primitiveName: key, nodeId, inputIndex });
+      return;
+    }
+    commitGraph({
+      nodes: [...nodes, candidate],
+      edges: [...edges, {
+        id: `${candidate.id}-${nodeId}-input-${inputIndex}`,
+        source: candidate.id,
+        target: nodeId,
+        sourceHandle: "output",
+        targetHandle: `input-${inputIndex}`,
+      }],
+    });
+    setSelectedSlot(null);
+    setSelectedNodeId(candidate.id);
   }
 
-  function branch() {
-    setName(`${name}_copy`);
-    setLoadedName(null); // a branch saves as a new formula, leaving the original intact
-    setMessage("Branched - editing a new copy; Save to keep it.");
+  function resolveOccupied(mode: "wrap" | "replace") {
+    if (!pendingInsert) return;
+    const { primitiveName, nodeId, inputIndex } = pendingInsert;
+    const source = findSource(primitiveName);
+    const target = nodes.find((node) => node.id === nodeId);
+    const existing = edges.find((edge) => edge.target === nodeId && edge.targetHandle === `input-${inputIndex}`);
+    if (!source || !target || !existing) return;
+    const candidate = nextNodeFor(source, { x: target.x - 230, y: target.y + inputIndex * 50 });
+    const remaining = edges.filter((edge) => edge.id !== existing.id);
+    const nextEdges: FormulaDraftEdge[] = [...remaining, {
+      id: `${candidate.id}-${nodeId}-input-${inputIndex}`,
+      source: candidate.id,
+      target: nodeId,
+      sourceHandle: "output",
+      targetHandle: `input-${inputIndex}`,
+    }];
+    if (mode === "wrap") {
+      const oldSource = nodes.find((node) => node.id === existing.source);
+      const data = candidate.data as FormulaNodeData;
+      const compatibleIndex = oldSource
+        ? (data.inputTypes ?? []).findIndex((type) => typesCompatible(nodeOutputType(oldSource), type))
+        : -1;
+      if (compatibleIndex < 0) {
+        setError(`${candidate.data.label} cannot wrap the existing value because it has no compatible input.`);
+        return;
+      }
+      nextEdges.push({
+        id: `${existing.source}-${candidate.id}-input-${compatibleIndex}`,
+        source: existing.source,
+        target: candidate.id,
+        sourceHandle: "output",
+        targetHandle: `input-${compatibleIndex}`,
+      });
+    }
+    commitGraph({ nodes: [...nodes, candidate], edges: nextEdges });
+    setPendingInsert(null);
+    setSelectedSlot(null);
+  }
+
+  function connect(connection: Connection) {
+    if (!connection.source || !connection.target || !connection.targetHandle) return;
+    commitGraph({
+      nodes,
+      edges: [...edges, {
+        id: `${connection.source}-${connection.target}-${connection.targetHandle}`,
+        source: connection.source,
+        target: connection.target,
+        sourceHandle: connection.sourceHandle,
+        targetHandle: connection.targetHandle,
+      }],
+    });
+  }
+
+  function duplicateSelected() {
+    if (!selectedNode || selectedNode.id === OUTPUT_NODE_ID || (selectedData?.kind === "input")) return;
+    const copy = { ...selectedNode, id: `formula-node-${nodeCounter.current++}`, x: selectedNode.x + 35, y: selectedNode.y + 35, data: { ...selectedNode.data } };
+    commitGraph({ nodes: [...nodes, copy], edges });
+    setSelectedNodeId(copy.id);
+  }
+
+  function deleteSelected() {
+    if (!selectedNode || selectedNode.id === OUTPUT_NODE_ID || selectedData?.kind === "input") return;
+    commitGraph({
+      nodes: nodes.filter((node) => node.id !== selectedNode.id),
+      edges: edges.filter((edge) => edge.source !== selectedNode.id && edge.target !== selectedNode.id),
+    });
+    setSelectedNodeId(null);
+  }
+
+  function expandSelectedFactor() {
+    if (!selectedNode || selectedData?.kind !== "factor" || !selectedData.factorBody) return;
+    const subgraph = bodyToFormulaGraph(selectedData.factorBody, [], primitives, selectedData.outType);
+    const outputEdge = subgraph.edges.find((edge) => edge.target === OUTPUT_NODE_ID);
+    if (!outputEdge) return;
+    const prefix = `${selectedNode.id}-expanded-`;
+    const subNodes = subgraph.nodes
+      .filter((node) => node.id !== OUTPUT_NODE_ID)
+      .map((node) => ({ ...node, id: `${prefix}${node.id}`, x: node.x + selectedNode.x - 160, y: node.y + selectedNode.y - 80 }));
+    const idMap = new Map(subgraph.nodes.filter((node) => node.id !== OUTPUT_NODE_ID).map((node) => [node.id, `${prefix}${node.id}`]));
+    const subEdges = subgraph.edges
+      .filter((edge) => edge.target !== OUTPUT_NODE_ID)
+      .map((edge) => ({ ...edge, id: `${prefix}${edge.id}`, source: idMap.get(edge.source)!, target: idMap.get(edge.target)! }));
+    const rootId = idMap.get(outputEdge.source);
+    if (!rootId) return;
+    const outgoing = edges.filter((edge) => edge.source === selectedNode.id).map((edge) => ({ ...edge, id: `${rootId}-${edge.target}-${edge.targetHandle}`, source: rootId }));
+    commitGraph({
+      nodes: [...nodes.filter((node) => node.id !== selectedNode.id), ...subNodes],
+      edges: [...edges.filter((edge) => edge.source !== selectedNode.id && edge.target !== selectedNode.id), ...subEdges, ...outgoing],
+    });
+    setSelectedNodeId(rootId);
+  }
+
+  function buildSpec(): FormulaSpec {
+    const body = graphToFormulaBody(nodes, edges);
+    return {
+      name,
+      display_name: displayName,
+      description,
+      arg_types: inputs.map((input) => input.type),
+      inputs,
+      out_type: outType,
+      body,
+      category,
+      revision: loadedRevision ?? 1,
+    };
+  }
+
+  async function persist(spec: FormulaSpec, strategy: "update" | "upgrade_references" = "update") {
+    if (!categories.includes(category)) {
+      await putCategories({ order: [...categories, category] });
+      setCategories((items) => [...new Set([...items, category])]);
+    }
+    const saved = loadedName
+      ? await updateFormula(loadedName, spec, strategy)
+      : await addFormula(spec);
+    setLoadedName(saved.name);
+    setLoadedRevision(saved.revision ?? 1);
+    setDirty(false);
+    setMessage(`Saved ${saved.display_name || saved.name}${saved.revision && saved.revision > 1 ? ` v${saved.revision}` : ""}.`);
+    setPendingSave(null);
+    refresh();
   }
 
   async function save() {
@@ -172,254 +476,331 @@ export function FormulaEditorPage({
     setMessage(null);
     try {
       const spec = buildSpec();
-      const saved = loadedName && loadedName === name ? await updateFormula(name, spec) : await addFormula(spec);
-      setLoadedName(saved.name);
-      setMessage(`Saved ${saved.name}`);
-      refreshLists();
-    } catch (e) {
-      setError(String(e));
+      const validation = await validateFormula(spec);
+      if (!validation.ok) throw new Error(validation.error ?? "Formula is invalid.");
+      if (!loadedName) {
+        await persist(spec);
+        return;
+      }
+      const impact = await getFormulaImpact(loadedName, spec);
+      if (impact.change === "calculation" && impact.has_references) {
+        setPendingSave({ spec, impact });
+        return;
+      }
+      await persist(spec);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
-  async function remove(target: string) {
-    if (!canSubmit) return;
-    try {
-      await deleteFormula(target);
-      if (loadedName === target) setLoadedName(null);
-      refreshLists();
-    } catch (e) {
-      setError(String(e));
+  async function branchPending() {
+    if (!pendingSave) return;
+    const branchName = `${pendingSave.spec.name}_branch`;
+    setName(branchName);
+    setDisplayName(`${pendingSave.spec.display_name} branch`);
+    setLoadedName(null);
+    setLoadedRevision(null);
+    setPendingSave(null);
+    setDirty(true);
+    setMessage(`Editing a new branch named ${branchName}. Save when ready.`);
+  }
+
+  function loadFormula(spec: FormulaSpec) {
+    const nextInputs = spec.inputs?.length
+      ? spec.inputs
+      : spec.arg_types.map((type, index) => ({ name: `input_${index + 1}`, type, description: "Formula input." }));
+    const graph = bodyToFormulaGraph(spec.body, nextInputs, primitives, spec.out_type);
+    setName(spec.name);
+    setDisplayName(spec.display_name || spec.name.replace(/_/g, " "));
+    setDescription(spec.description ?? "");
+    setInputs(nextInputs);
+    setOutType(spec.out_type);
+    setCategory(spec.category || "custom");
+    setNodes(graph.nodes);
+    setEdges(graph.edges);
+    setExpression(serializeFormula(spec.body, nextInputs));
+    setLoadedName(spec.name);
+    setLoadedRevision(spec.revision ?? 1);
+    setSelectedNodeId(null);
+    setDirty(false);
+    setMessage(null);
+    setError(null);
+    if (canSubmit) getFormula(spec.name).then(setFormulaDetail).catch(() => setFormulaDetail(null));
+  }
+
+  function newFormula() {
+    if (dirty && !window.confirm("Discard the current unsaved draft?")) return;
+    const graph = blankFormulaGraph(DEFAULT_INPUTS, "signal");
+    setName("my_formula");
+    setDisplayName("My formula");
+    setDescription("");
+    setInputs(DEFAULT_INPUTS);
+    setOutType("signal");
+    setCategory("custom");
+    setNodes(graph.nodes);
+    setEdges(graph.edges);
+    setExpression("");
+    setLoadedName(null);
+    setLoadedRevision(null);
+    setFormulaDetail(null);
+    setDirty(false);
+  }
+
+  function useBuiltin(source: PrimitiveInfo) {
+    if (!window.confirm(`Create a user-defined formula that starts from ${source.display_name ?? source.name}?`)) return;
+    const nextInputs = (source.inputs ?? source.arg_types.map((type, index) => ({ name: `input_${index + 1}`, type, description: "Function input." }))).map((input) => ({ ...input }));
+    const body: FactorNode = {
+      name: source.runtime_name ?? source.name,
+      children: nextInputs.map((_, index) => ({ name: "$arg", value: index })),
+    };
+    const graph = bodyToFormulaGraph(body, nextInputs, primitives, source.out_type);
+    setName(`${source.logical_name ?? source.name}_custom`);
+    setDisplayName(`${source.display_name ?? source.name} custom`);
+    setDescription(`User-defined formula based on ${source.display_name ?? source.name}.`);
+    setInputs(nextInputs);
+    setOutType(source.out_type);
+    setCategory("custom");
+    setNodes(graph.nodes);
+    setEdges(graph.edges);
+    setExpression(serializeFormula(body, nextInputs));
+    setLoadedName(null);
+    setLoadedRevision(null);
+    setSelectedSource(null);
+    setDirty(true);
+  }
+
+  function editExpression(value: string) {
+    setExpression(value);
+    setDirty(true);
+    const parsed = parseFormula(value, inputs, primitives);
+    if (!parsed.tree) {
+      setParseError(parsed.errors[0] ? `${parsed.errors[0].msg} at character ${parsed.errors[0].pos}` : "Invalid expression.");
+      return;
     }
+    setParseError(null);
+    const graph = bodyToFormulaGraph(parsed.tree, inputs, primitives, outType);
+    setNodes(graph.nodes);
+    setEdges(graph.edges);
   }
 
-  function setLeaf(path: number[], value: number) {
-    setTreeAndText(setLeafValue(tree, path, value));
-  }
-
-  function promote(path: number[], type: string) {
-    const nextArgs = [...argTypes, type];
-    setArgTypes(nextArgs);
-    setTreeAndText(promoteToArg(tree, path, nextArgs.length - 1));
-    setMessage("Promoted to argument - the GP can now tune this value during training.");
-  }
-
-  async function recategorize(prim: string, value: string) {
-    if (!canSubmit) return;
-    setCategories(await setPrimitiveCategory(prim, value));
-    refreshLists();
-  }
-
-  async function addCategory() {
-    const trimmed = newCategory.trim();
-    if (!trimmed || !canSubmit) return;
-    setCategories(await putCategories({ order: [...categories.order, trimmed] }));
-    setNewCategory("");
-  }
+  const filteredPrimitives = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return primitives.filter((primitive) => !query || [primitive.name, primitive.display_name, primitive.description, primitive.category].some((value) => value?.toLowerCase().includes(query)));
+  }, [primitives, search]);
 
   const grouped = useMemo(() => {
     const groups = new Map<string, PrimitiveInfo[]>();
-    for (const p of primitives) {
-      if (p.kind === "ephemeral") continue;
-      const key = p.category ?? "uncategorized";
-      (groups.get(key) ?? groups.set(key, []).get(key)!).push(p);
+    for (const primitive of filteredPrimitives) {
+      const key = primitive.category ?? "uncategorized";
+      (groups.get(key) ?? groups.set(key, []).get(key)!).push(primitive);
     }
     return groups;
-  }, [primitives]);
+  }, [filteredPrimitives]);
 
   return (
-    <div className="formula-editor-page" data-testid="formula-editor-page">
-      <section className="panel">
-        <header className="panel-head">
-          <div>
-            <h3>Formula editor</h3>
-            <p className="panel-note">
-              Compose functions from existing ones; the text and the node view stay in sync.
-              Promote a constant to an argument to let training tune it.
-            </p>
-          </div>
-          <span className="mode-chip">{canSubmit ? `${formulas.length} saved` : "Local draft"}</span>
-        </header>
-
-        {!canSubmit && (
-          <p className="panel-note">Saving and validation unlock when the backend is running.</p>
-        )}
-
-        <div className="formula-signature">
-          <label className="field">
-            <span className="field-label">Name</span>
-            <input aria-label="Formula name" value={name} onChange={(e) => setName(e.target.value)} />
-          </label>
-          <label className="field">
-            <span className="field-label">Arguments (comma types)</span>
-            <input
-              aria-label="Formula arg types"
-              value={argTypes.join(", ")}
-              onChange={(e) =>
-                setArgTypes(e.target.value.split(",").map((s) => s.trim()).filter(Boolean))
-              }
-            />
-          </label>
-          <label className="field">
-            <span className="field-label">Output</span>
-            <select aria-label="Formula output type" value={outType} onChange={(e) => setOutType(e.target.value)}>
-              {TYPE_OPTIONS.map((t) => (
-                <option key={t}>{t}</option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            <span className="field-label">Category</span>
-            <select aria-label="Formula category" value={category} onChange={(e) => setCategory(e.target.value)}>
-              {[...new Set([category, ...categories.order, "custom"])].map((c) => (
-                <option key={c}>{c}</option>
-              ))}
-            </select>
-          </label>
+    <div className="formula-workspace" data-testid="formula-editor-page">
+      <header className="formula-workspace__toolbar">
+        <div>
+          <h3>Formula workspace</h3>
+          <p className="panel-note">Build a reusable calculation from typed inputs and functions.</p>
         </div>
-
-        <label className="field formula-text-field">
-          <span className="field-label">Formula text</span>
-          <textarea
-            ref={textRef}
-            aria-label="Formula text"
-            className="formula-text"
-            rows={3}
-            value={text}
-            onChange={(e) => onTextChange(e.target.value)}
-            onBlur={runValidate}
-          />
-        </label>
-        {parseError && <p className="error">{parseError}</p>}
-        {validation && (
-          <p className={validation.ok ? "ok" : "error"} data-testid="formula-validation">
-            {validation.ok ? `Valid - produces ${validation.out_type}` : validation.error}
-          </p>
-        )}
-
-        <div className="formula-tree" data-testid="formula-tree">
-          <NodeView node={tree} userNames={userNames} />
+        <div className="formula-toolbar__actions">
+          <button type="button" onClick={newFormula}>New</button>
+          <button type="button" onClick={save} className="primary-action" disabled={!canSubmit}>Save</button>
+          <button type="button" onClick={undo} disabled={!past.length} title="Undo">Undo</button>
+          <button type="button" onClick={redo} disabled={!future.length} title="Redo">Redo</button>
+          <button type="button" onClick={duplicateSelected} disabled={!selectedNodeId}>Duplicate</button>
+          <button type="button" onClick={deleteSelected} disabled={!selectedNodeId}>Delete</button>
+          <button type="button" onClick={() => commitGraph(autoLayoutGraph(nodes, edges))}>Auto-layout</button>
+          <button type="button" onClick={() => flowRef.current?.fitView({ padding: 0.18 })}>Fit</button>
         </div>
-
-        {leaves.length > 0 && (
-          <div className="param-pane" data-testid="param-pane">
-            <span className="field-label">Parameters</span>
-            {numericLeaves.map((leaf, i) => (
-              <span key={`p${i}`} className="param-row">
-                <code>{leaf.node.name}</code>
-                <input
-                  type="number"
-                  aria-label={`param-${i}`}
-                  value={leaf.node.value ?? 0}
-                  onChange={(e) => setLeaf(leaf.path, Number(e.target.value))}
-                />
-                <button
-                  type="button"
-                  className="ghost"
-                  data-testid={`promote-${i}`}
-                  onClick={() => promote(leaf.path, leafType(leaf.node, argTypes))}
-                >
-                  Promote to argument
-                </button>
-              </span>
-            ))}
-            {argLeaves.map((leaf, i) => (
-              <span key={`a${i}`} className="param-row">
-                <code>${leaf.node.value ?? 0}</code> <em>(argument)</em>
-              </span>
-            ))}
-          </div>
-        )}
-
-        <div className="actions">
-          <button type="button" className="primary-action" data-testid="save-formula" onClick={save} disabled={!canSubmit}>
-            {loadedName && loadedName === name ? "Update formula" : "Save formula"}
-          </button>
-          <button type="button" className="ghost" data-testid="branch-formula" onClick={branch}>
-            Branch as new
-          </button>
+        <div className="formula-mode" role="tablist" aria-label="Formula editor mode">
+          <button type="button" role="tab" aria-selected={activeMode === "visual"} onClick={() => setActiveMode("visual")}>Visual</button>
+          <button type="button" role="tab" aria-selected={activeMode === "expression"} onClick={() => setActiveMode("expression")}>Expression</button>
         </div>
-        {message && <p className="ok">{message}</p>}
-        {error && <p className="error">{error}</p>}
-      </section>
+      </header>
 
-      <section className="panel">
-        <h3>Building blocks</h3>
-        <p className="panel-note">Click a function to insert it; re-categorize any function below.</p>
-        {[...grouped.entries()].map(([cat, prims]) => (
-          <div key={cat} className="function-group" data-testid={`group-${cat}`}>
-            <span className="field-label">{cat}</span>
-            <div className="function-chips">
-              {prims.map((p) => (
-                <span key={p.name} className="function-chip">
-                  <button
-                    type="button"
-                    className={p.user ? "palette-user" : undefined}
-                    onClick={() => insertSkeleton(p)}
-                  >
-                    {p.name}
-                  </button>
-                  {canSubmit && (
-                    <select
-                      aria-label={`category-${p.name}`}
-                      value={p.category ?? "uncategorized"}
-                      onChange={(e) => recategorize(p.name, e.target.value)}
-                    >
-                      {[...new Set([p.category ?? "uncategorized", ...categories.order])].map((c) => (
-                        <option key={c}>{c}</option>
-                      ))}
-                    </select>
-                  )}
-                </span>
-              ))}
-            </div>
-          </div>
+      {!canSubmit && <p className="surface-message">Static demo mode keeps this workspace as a local draft. Connect the backend to validate and save formulas.</p>}
+      {message && <p className="ok">{message}</p>}
+      {error && <p className="error">{error}</p>}
+
+      <nav className="formula-mobile-nav" aria-label="Formula workspace panels">
+        {(["library", "canvas", "inspector"] as const).map((pane) => (
+          <button key={pane} type="button" aria-pressed={mobilePane === pane} onClick={() => setMobilePane(pane)}>{pane}</button>
         ))}
-        <div className="inline-tools">
-          <label className="field">
-            <span className="field-label">New category</span>
-            <input
-              aria-label="New category"
-              value={newCategory}
-              onChange={(e) => setNewCategory(e.target.value)}
-            />
-          </label>
-          <button type="button" className="ghost" onClick={addCategory} disabled={!canSubmit}>
-            Add category
-          </button>
-        </div>
-      </section>
+      </nav>
 
-      {formulas.length > 0 && (
-        <section className="panel">
-          <h3>Saved formulas</h3>
-          <ul className="formula-list" data-testid="formula-list">
-            {formulas.map((f) => (
-              <li key={f.name}>
-                <div>
-                  <strong>{f.display_name || f.name}</strong>
-                  <span>
-                    {f.name}({f.arg_types.join(", ")}) {"->"} {f.out_type} · {f.category || "custom"}
-                  </span>
-                  {f.error && <span className="error">{f.error}</span>}
-                </div>
-                <button type="button" className="ghost" onClick={() => loadFormula(f)}>
-                  Edit
-                </button>
-                <button type="button" className="ghost" onClick={() => remove(f.name)}>
-                  Delete
-                </button>
-              </li>
-            ))}
-          </ul>
-        </section>
+      <div className={`formula-workspace__grid formula-pane--${mobilePane}`}>
+        <aside className="formula-library" data-testid="formula-library">
+          <label className="field">
+            <span className="field-label">Find a building block</span>
+            <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search functions and fields" />
+          </label>
+          {[...grouped.entries()].map(([group, items]) => (
+            <details key={group} open>
+              <summary>{humanCategory(group)} <span>{items.length}</span></summary>
+              <div className="formula-library__items">
+                {items.map((item) => (
+                  <article
+                    key={item.name}
+                    className={`formula-library__item formula-library__item--${item.origin ?? "builtin"}`}
+                    draggable
+                    onDragStart={(event) => event.dataTransfer.setData("application/x-alphalineage-primitive", item.name)}
+                  >
+                    <button type="button" className="formula-library__insert" onClick={() => insertOnCanvas(item.name)}>
+                      <strong>{item.display_name ?? item.logical_name ?? item.name}</strong>
+                      <span>{item.description ?? "Typed calculation block."}</span>
+                      <code>{(item.inputs ?? []).map((input) => input.name).join(", ")} {"->"} {item.out_type}</code>
+                    </button>
+                    <button type="button" className="ghost" onClick={() => setSelectedSource(item)}>{item.user ? "Open" : "Inspect"}</button>
+                  </article>
+                ))}
+              </div>
+            </details>
+          ))}
+
+          {factors.length > 0 && (
+            <details open>
+              <summary>Saved factors <span>{factors.length}</span></summary>
+              <div className="formula-library__items">
+                {factors.map((factor) => (
+                  <article
+                    key={factor.id}
+                    className="formula-library__item formula-library__item--factor"
+                    draggable
+                    onDragStart={(event) => event.dataTransfer.setData("application/x-alphalineage-primitive", `factor:${factor.id}`)}
+                  >
+                    <button type="button" className="formula-library__insert" onClick={() => insertOnCanvas(`factor:${factor.id}`)}>
+                      <strong>{factor.name}</strong>
+                      <span>{factor.notes || `Saved from ${factor.provenance?.universe ?? "a training session"}.`}</span>
+                      <code>Snapshot {"->"} {factorOutputType(factor, primitives)}</code>
+                    </button>
+                    <button type="button" className="ghost" onClick={() => setSelectedSource(factor)}>Inspect</button>
+                  </article>
+                ))}
+              </div>
+            </details>
+          )}
+        </aside>
+
+        <main className="formula-stage">
+          {activeMode === "visual" ? (
+            <FormulaCanvas
+              nodes={nodes}
+              edges={edges}
+              selectedNodeId={selectedNodeId}
+              selectedSlot={selectedSlot}
+              onNodesChange={setNodes}
+              onEdgesChange={(nextEdges) => commitGraph({ nodes, edges: nextEdges })}
+              onConnect={connect}
+              onSelectNode={(id) => { setSelectedNodeId(id); setSelectedSource(null); }}
+              onSelectSlot={(nodeId, index) => setSelectedSlot({ nodeId, index })}
+              onDropPrimitive={insertIntoSlot}
+              onDropCanvas={insertOnCanvas}
+              onValueChange={(nodeId, value) => commitGraph({ nodes: nodes.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, value } } : node), edges })}
+              onInit={(instance) => { flowRef.current = instance; }}
+            />
+          ) : (
+            <section className="formula-expression-panel">
+              <label className="field">
+                <span className="field-label">Expression</span>
+                <textarea rows={14} value={expression} onChange={(event) => editExpression(event.target.value)} aria-label="Formula expression" spellCheck={false} />
+              </label>
+              <p className="hint">Named inputs use a dollar sign, for example <code>ts_mean($price, $lookback)</code>.</p>
+              {parseError && <p className="error">{parseError}</p>}
+            </section>
+          )}
+        </main>
+
+        <aside className="formula-inspector" data-testid="formula-inspector">
+          {selectedSource && "kind" in selectedSource ? (
+            <section>
+              <span className="mode-chip">{selectedSource.origin?.replace("_", " ") ?? "built in"}</span>
+              <h3>{selectedSource.display_name ?? selectedSource.name}</h3>
+              <p>{selectedSource.description}</p>
+              <dl className="formula-inspector__signature">
+                {(selectedSource.inputs ?? []).map((input) => <div key={input.name}><dt>{input.name}: {input.type}</dt><dd>{input.description}</dd></div>)}
+                <div><dt>Output</dt><dd>{selectedSource.out_type}</dd></div>
+              </dl>
+              {selectedSource.user ? (
+                <button type="button" className="primary-action" onClick={() => {
+                  const spec = formulas.find((formula) => formula.name === selectedSource.logical_name);
+                  if (spec) loadFormula(spec);
+                }}>Open formula</button>
+              ) : (
+                <>
+                  <label className="field"><span className="field-label">Category</span><select value={selectedSource.category ?? "uncategorized"} onChange={async (event) => {
+                    if (!canSubmit) return;
+                    await setPrimitiveCategory(selectedSource.name, event.target.value);
+                    refresh();
+                  }}>{[...new Set([selectedSource.category ?? "uncategorized", ...categories])].map((item) => <option key={item} value={item}>{humanCategory(item)}</option>)}</select></label>
+                  {selectedSource.kind === "operator" && <button type="button" className="primary-action" onClick={() => useBuiltin(selectedSource)}>Use as starting point</button>}
+                </>
+              )}
+            </section>
+          ) : selectedSource ? (
+            <section>
+              <span className="mode-chip">Saved factor</span>
+              <h3>{selectedSource.name}</h3>
+              <p>{selectedSource.notes || "Locked calculation snapshot from training."}</p>
+              <dl className="formula-inspector__signature"><div><dt>Saved</dt><dd>{selectedSource.saved_at}</dd></div><div><dt>Universe</dt><dd>{selectedSource.provenance?.universe ?? "Unknown"}</dd></div><div><dt>Research IC</dt><dd>{selectedSource.metrics?.oos_ic?.toFixed?.(3) ?? "-"}</dd></div></dl>
+              <button type="button" onClick={() => insertOnCanvas(`factor:${selectedSource.id}`)}>Insert snapshot</button>
+            </section>
+          ) : selectedNode ? (
+            <section>
+              <span className="mode-chip">{selectedData?.origin?.replace("_", " ") ?? selectedData?.kind}</span>
+              <h3>{String(selectedData?.label ?? "Block")}</h3>
+              <p>{String(selectedData?.description ?? "Calculation block in the current formula.")}</p>
+              <p className="hint">Output: {selectedData?.outType}</p>
+              {selectedData?.kind === "factor" && <button type="button" className="primary-action" onClick={expandSelectedFactor}>Expand copy</button>}
+            </section>
+          ) : (
+            <section className="formula-definition">
+              <h3>Formula definition</h3>
+              <label className="field"><span className="field-label">Internal name</span><input value={name} disabled={Boolean(loadedName)} onChange={(event) => { setName(event.target.value); setDirty(true); }} /></label>
+              <label className="field"><span className="field-label">Display name</span><input value={displayName} onChange={(event) => { setDisplayName(event.target.value); setDirty(true); }} /></label>
+              <label className="field"><span className="field-label">Description</span><textarea rows={4} value={description} onChange={(event) => { setDescription(event.target.value); setDirty(true); }} /></label>
+              <label className="field"><span className="field-label">Category</span><input list="formula-categories" value={category} onChange={(event) => { setCategory(event.target.value); setDirty(true); }} /></label>
+              <datalist id="formula-categories">{categories.map((item) => <option key={item} value={item} />)}</datalist>
+              <label className="field"><span className="field-label">Output type</span><select value={outType} onChange={(event) => updateOutputType(event.target.value)}>{TYPE_OPTIONS.map((type) => <option key={type}>{type}</option>)}</select></label>
+              <div className="formula-inputs">
+                <div className="formula-inputs__head"><span className="field-label">Named inputs</span><button type="button" onClick={addInput}>Add input</button></div>
+                {inputs.map((input, index) => (
+                  <div className="formula-input-row" key={`input-${index}`}>
+                    <input aria-label={`Input ${index + 1} name`} value={input.name} onChange={(event) => updateInput(index, { name: event.target.value })} />
+                    <select aria-label={`Input ${index + 1} type`} value={input.type} onChange={(event) => updateInput(index, { type: event.target.value })}>{TYPE_OPTIONS.map((type) => <option key={type}>{type}</option>)}</select>
+                    <input aria-label={`Input ${index + 1} description`} value={input.description} onChange={(event) => updateInput(index, { description: event.target.value })} placeholder="Description" />
+                    <button type="button" onClick={() => removeInput(index)} aria-label={`Remove input ${index + 1}`}>Remove</button>
+                  </div>
+                ))}
+              </div>
+              {formulaDetail && formulaDetail.revisions.length > 1 && <details><summary>History ({formulaDetail.revisions.length})</summary><ul className="formula-history">{formulaDetail.revisions.map((revision) => <li key={revision.runtime_name}>v{revision.revision} <code>{revision.runtime_name}</code></li>)}</ul></details>}
+              {loadedName && <button type="button" className="ghost danger" onClick={async () => { if (!window.confirm(`Delete ${displayName}?`)) return; try { await deleteFormula(loadedName); newFormula(); refresh(); } catch (reason) { setError(String(reason)); } }}>Delete formula</button>}
+            </section>
+          )}
+        </aside>
+      </div>
+
+      {pendingInsert && (
+        <div className="formula-dialog-backdrop" role="presentation">
+          <section className="formula-dialog" role="dialog" aria-modal="true" aria-labelledby="insert-title">
+            <h3 id="insert-title">This input already has a value</h3>
+            <p>Wrap keeps the current calculation inside the new block. Replace disconnects it and leaves the old blocks on the canvas.</p>
+            <div className="actions"><button type="button" className="primary-action" onClick={() => resolveOccupied("wrap")}>Wrap existing</button><button type="button" onClick={() => resolveOccupied("replace")}>Replace</button><button type="button" onClick={() => setPendingInsert(null)}>Cancel</button></div>
+          </section>
+        </div>
       )}
 
-      <OperatorComposer
-        draft={operatorDraft}
-        onDraftChange={onOperatorDraftChange}
-        canSubmit={canSubmit}
-        onUseBody={setTreeAndText}
-      />
+      {pendingSave && (
+        <div className="formula-dialog-backdrop" role="presentation">
+          <section className="formula-dialog" role="dialog" aria-modal="true" aria-labelledby="save-impact-title">
+            <h3 id="save-impact-title">This calculation is already in use</h3>
+            <p>Changing it affects {pendingSave.impact.transitive_formulas.length} saved formula(s). {pendingSave.impact.factors.length} factor(s) and {pendingSave.impact.sessions.length} session(s) will remain pinned to their historical calculation.</p>
+            {pendingSave.impact.transitive_formulas.length > 0 && <p className="hint">Formula references: {pendingSave.impact.transitive_formulas.join(", ")}</p>}
+            <div className="actions"><button type="button" className="primary-action" onClick={() => persist(pendingSave.spec, "upgrade_references").catch((reason) => setError(String(reason)))}>Upgrade formula references</button><button type="button" onClick={branchPending}>Branch as new formula</button><button type="button" onClick={() => setPendingSave(null)}>Cancel</button></div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

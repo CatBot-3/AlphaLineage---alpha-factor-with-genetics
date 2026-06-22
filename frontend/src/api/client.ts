@@ -7,6 +7,8 @@ import type {
   DataSyncRequest,
   DataUsageRow,
   FormulaSpec,
+  FormulaDetail,
+  FormulaImpact,
   FormulaValidation,
   Lineage,
   MembershipSyncJob,
@@ -134,13 +136,35 @@ export async function addFormula(spec: FormulaSpec): Promise<FormulaSpec> {
   return jsonOrThrow(await POST("/formulas", spec), "save formula");
 }
 
-export async function updateFormula(name: string, spec: FormulaSpec): Promise<FormulaSpec> {
-  const res = await fetch(`${BASE}/formulas/${encodeURIComponent(name)}`, {
+export async function updateFormula(
+  name: string,
+  spec: FormulaSpec,
+  strategy: "update" | "upgrade_references" = "update",
+): Promise<FormulaSpec> {
+  const path = `${BASE}/formulas/${encodeURIComponent(name)}`;
+  const res = await fetch(
+    strategy === "update" ? path : `${path}?strategy=${encodeURIComponent(strategy)}`,
+    {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(spec),
-  });
+    },
+  );
   return jsonOrThrow(res, "update formula");
+}
+
+export async function getFormula(name: string): Promise<FormulaDetail> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/formulas/${encodeURIComponent(name)}`),
+    "load formula",
+  );
+}
+
+export async function getFormulaImpact(name: string, spec: FormulaSpec): Promise<FormulaImpact> {
+  return jsonOrThrow(
+    await POST(`/formulas/${encodeURIComponent(name)}/impact`, spec),
+    "check formula references",
+  );
 }
 
 export async function validateFormula(spec: FormulaSpec): Promise<FormulaValidation> {

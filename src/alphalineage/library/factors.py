@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from alphalineage.core.extensions import USER_OPERATORS
+from alphalineage.core.extensions import USER_OPERATORS, expand
 from alphalineage.core.tree import Node
 from alphalineage.core.tree import from_dict as tree_from_dict
 from alphalineage.core.tree import to_dict as tree_to_dict
@@ -56,6 +56,19 @@ def required_operators(tree: Node) -> list[dict[str, Any]]:
     return list(specs.values())
 
 
+def expanded_snapshot(tree: Node, specs: list[dict[str, Any]]) -> Node:
+    """Expand a factor with its embedded operator specs, independent of the live registry."""
+    bodies = {item["name"]: tree_from_dict(item["body"]) for item in specs}
+
+    def visit(node: Node) -> Node:
+        body = bodies.get(node.name)
+        if body is not None:
+            return visit(expand(node, body))
+        return Node(node.name, tuple(visit(child) for child in node.children), node.value)
+
+    return visit(tree)
+
+
 @dataclass
 class SavedFactor:
     id: str
@@ -65,6 +78,7 @@ class SavedFactor:
     metrics: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
     required_operators: list[dict[str, Any]] = field(default_factory=list)
+    expanded_tree: Node | None = None
     notes: str = ""
     disclaimer: str = DISCLAIMER
 
@@ -77,20 +91,28 @@ class SavedFactor:
             "metrics": self.metrics,
             "provenance": self.provenance,
             "required_operators": self.required_operators,
+            "expanded_tree": tree_to_dict(self.expanded_tree or self.tree),
             "notes": self.notes,
             "disclaimer": self.disclaimer,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SavedFactor:
+        required = data.get("required_operators", [])
+        tree = tree_from_dict(data["tree"])
         return cls(
             id=data["id"],
             name=data["name"],
             saved_at=data["saved_at"],
-            tree=tree_from_dict(data["tree"]),
+            tree=tree,
             metrics=data.get("metrics", {}),
             provenance=data.get("provenance", {}),
-            required_operators=data.get("required_operators", []),
+            required_operators=required,
+            expanded_tree=(
+                tree_from_dict(data["expanded_tree"])
+                if data.get("expanded_tree")
+                else expanded_snapshot(tree, required)
+            ),
             notes=data.get("notes", ""),
             disclaimer=data.get("disclaimer", DISCLAIMER),
         )
@@ -120,6 +142,7 @@ class FactorStore:
         notes: str = "",
         saved_at: str = "",
     ) -> SavedFactor:
+        operator_specs = required_operators(tree)
         factor = SavedFactor(
             id=_slug(name),
             name=name,
@@ -127,7 +150,8 @@ class FactorStore:
             tree=tree,
             metrics=metrics or {},
             provenance=provenance or {},
-            required_operators=required_operators(tree),
+            required_operators=operator_specs,
+            expanded_tree=expanded_snapshot(tree, operator_specs),
             notes=notes,
         )
         self.directory.mkdir(parents=True, exist_ok=True)

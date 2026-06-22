@@ -44,6 +44,26 @@ if (-not $env:ALPHALINEAGE_DATA_DIR) {
     $env:ALPHALINEAGE_DATA_DIR = Join-Path $RepoRoot "data_cache"
 }
 
+# --- free the port if a previous AlphaLineage instance was left running ------------
+# Closing the window (instead of Ctrl+C) can orphan the foreground uvicorn, which keeps
+# holding the port; the next launch would then boot, fail to bind, and exit immediately.
+# Detect that here: stop a stale AlphaLineage instance automatically, but never kill
+# an unrelated process that happens to own the port.
+foreach ($conn in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
+    if ($proc -and $proc.Name -eq "python.exe" -and $proc.CommandLine -match "alphalineage\.api\.app") {
+        Write-Host "Stopping a stale AlphaLineage instance on port $Port (PID $($proc.ProcessId))..."
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+    }
+    else {
+        $who = if ($proc) { "$($proc.Name) (PID $($proc.ProcessId))" } else { "PID $($conn.OwningProcess)" }
+        Write-Host "Port $Port is already in use by $who."
+        Write-Host "Stop it, or relaunch on another port:  start.cmd -Port <other>"
+        exit 1
+    }
+}
+
 # --- open the browser once the server is healthy ----------------------------------
 if (-not $NoOpen) {
     Start-Job -ScriptBlock {
@@ -65,4 +85,16 @@ Write-Host "Quit from the in-app gear menu, or press Ctrl+C here."
 Write-Host ""
 
 # --- run the server in the foreground (Quit / Ctrl+C ends it) ---------------------
-& $Python -m uvicorn alphalineage.api.app:app --host 127.0.0.1 --port $Port
+try {
+    & $Python -m uvicorn alphalineage.api.app:app --host 127.0.0.1 --port $Port
+}
+finally {
+    # Best-effort: if this run's server is somehow still bound on exit, reclaim the port
+    # so the next launch starts cleanly. (The pre-flight check above is the primary guard.)
+    foreach ($conn in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
+        if ($p -and $p.Name -eq "python.exe" -and $p.CommandLine -match "alphalineage\.api\.app") {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+}

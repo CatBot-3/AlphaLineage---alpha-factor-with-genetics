@@ -441,8 +441,8 @@ export function App() {
                 page={extendPage}
                 universeDraft={universeDraft}
                 onUniverseDraftChange={setUniverseDraft}
-                operatorDraft={operatorDraft}
-                onOperatorDraftChange={setOperatorDraft}
+                formulaDraft={formulaDraft}
+                onFormulaDraftChange={setFormulaDraft}
                 canSubmit={mode === "app"}
                 onDataPullProgressChange={setDataPullProgress}
               />

@@ -103,6 +103,22 @@ def test_session_create_run_complete(client):
     assert result["test_reads"] == 1
 
 
+def test_session_pins_active_formula_revisions(client):
+    formula = {
+        "name": "session_rank",
+        "arg_types": ["series"],
+        "inputs": [{"name": "price", "type": "series", "description": "Price input."}],
+        "out_type": "signal",
+        "body": {"name": "rank", "children": [{"name": "$arg", "value": 0}]},
+    }
+    assert client.post("/formulas", json=formula).status_code == 200
+    session_id, _ = _create(client)
+    state = client.get(f"/sessions/{session_id}").json()
+    pinned = {item["name"]: item for item in state["formula_revisions"]}
+    assert pinned["session_rank"]["runtime_name"] == "session_rank"
+    assert pinned["session_rank"]["body"] == formula["body"]
+
+
 def test_session_lineage_persists_and_replays(client):
     session_id, _ = _create(client)
     lineage = client.get(f"/sessions/{session_id}/lineage").json()

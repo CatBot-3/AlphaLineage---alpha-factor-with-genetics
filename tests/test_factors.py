@@ -86,6 +86,8 @@ def test_saved_factor_embeds_required_operators(client, tmp_path):
     specs = saved["required_operators"]
     assert [s["name"] for s in specs] == ["mom20"]
     assert specs[0]["out_type"] == "signal"
+    assert saved["expanded_tree"]["name"] == "rank"
+    assert saved["expanded_tree"]["children"][0]["name"] == "ts_mean"
 
 
 def test_settings_endpoint_relocates_store(client, tmp_path):

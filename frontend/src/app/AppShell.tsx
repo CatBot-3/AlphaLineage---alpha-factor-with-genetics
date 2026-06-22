@@ -13,7 +13,7 @@ const TABS: Array<{ id: Tab; label: string; backendOnly?: boolean }> = [
   { id: "factor", label: "Best factor" },
   { id: "genealogy", label: "Genealogy" },
   { id: "library", label: "Library", backendOnly: true },
-  { id: "extend", label: "Extend", backendOnly: true },
+  { id: "extend", label: "Extend" },
 ];
 
 export function AppShell({

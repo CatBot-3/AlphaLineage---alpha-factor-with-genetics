@@ -9,6 +9,7 @@ const getCategories = vi.fn();
 vi.mock("../api/client", () => ({
   listUniverses: () => listUniverses(),
   listFormulas: () => listFormulas(),
+  listFactors: () => Promise.resolve([]),
   getPrimitives: () => getPrimitives(),
   getCategories: () => getCategories(),
 }));

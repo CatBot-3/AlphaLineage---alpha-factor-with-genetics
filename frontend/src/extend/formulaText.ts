@@ -7,7 +7,7 @@
 // resolve to a primitive or user formula; a bare identifier with no parens is a leaf operand.
 // The tree is the single source of truth; this module keeps the text pane in sync with it.
 
-import type { FactorNode, PrimitiveInfo } from "../api/types";
+import type { FactorNode, FormulaInputSpec, PrimitiveInfo } from "../api/types";
 
 export interface ParseError {
   pos: number;
@@ -26,7 +26,7 @@ interface Token {
   pos: number;
 }
 
-const TOKEN_RE = /\s+|(\$\d+)|(-?\d+(?:\.\d+)?)|([a-zA-Z_][a-zA-Z0-9_]*)|(\()|(\))|(,)/y;
+const TOKEN_RE = /\s+|(\$(?:\d+|[a-zA-Z_][a-zA-Z0-9_]*))|(-?\d+(?:\.\d+)?)|([a-zA-Z_][a-zA-Z0-9_]*)|(\()|(\))|(,)/y;
 
 function tokenize(text: string): { tokens: Token[]; errors: ParseError[] } {
   const tokens: Token[] = [];
@@ -55,9 +55,15 @@ function tokenize(text: string): { tokens: Token[]; errors: ParseError[] } {
 
 export function parseFormula(
   text: string,
-  argTypes: string[],
+  inputSpecs: string[] | FormulaInputSpec[],
   primitives: PrimitiveInfo[],
 ): ParseResult {
+  const inputs: FormulaInputSpec[] = inputSpecs.map((item, index) =>
+    typeof item === "string"
+      ? { name: `input_${index + 1}`, type: item, description: "" }
+      : item,
+  );
+  const argTypes = inputs.map((item) => item.type);
   const byName = new Map(primitives.map((p) => [p.name, p]));
   const { tokens, errors } = tokenize(text);
   if (errors.length) return { errors };
@@ -83,8 +89,18 @@ export function parseFormula(
     if (!tok) return fail(text.length, "unexpected end of formula");
     if (tok.kind === "arg") {
       idx += 1;
-      const i = parseInt(tok.text.slice(1), 10);
-      if (i < 0 || i >= argTypes.length) fail(tok.pos, `$${i} is out of range (${argTypes.length} args)`);
+      const reference = tok.text.slice(1);
+      const i = /^\d+$/.test(reference)
+        ? parseInt(reference, 10)
+        : inputs.findIndex((input) => input.name === reference);
+      if (i < 0 || i >= argTypes.length) {
+        fail(
+          tok.pos,
+          /^\d+$/.test(reference)
+            ? `${tok.text} is out of range (${argTypes.length} inputs)`
+            : `${tok.text} is not a declared formula input`,
+        );
+      }
       return { name: "$arg", value: i };
     }
     if (tok.kind === "number") {
@@ -138,10 +154,13 @@ export function parseFormula(
   }
 }
 
-export function serializeFormula(tree: FactorNode): string {
-  if (tree.name === "$arg") return `$${tree.value ?? 0}`;
+export function serializeFormula(tree: FactorNode, inputs: FormulaInputSpec[] = []): string {
+  if (tree.name === "$arg") {
+    const index = Number(tree.value ?? 0);
+    return `$${inputs[index]?.name ?? index}`;
+  }
   if (tree.children && tree.children.length) {
-    return `${tree.name}(${tree.children.map(serializeFormula).join(", ")})`;
+    return `${tree.name}(${tree.children.map((child) => serializeFormula(child, inputs)).join(", ")})`;
   }
   if (tree.value !== undefined) return String(tree.value);
   return tree.name;

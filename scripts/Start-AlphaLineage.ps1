@@ -51,6 +51,24 @@ function Test-ProcessAlive {
     return [bool](Get-Process -Id ([int]$processIdText) -ErrorAction SilentlyContinue)
 }
 
+function Clear-StaleBackendPort {
+    # Stop a stale AlphaLineage backend that was left holding $Port (e.g. orphaned by a
+    # window close), so a fresh --reload uvicorn can bind. Only ever stops our own backend
+    # (matched by command line); an unrelated owner is reported, never killed.
+    param([int]$Port)
+    foreach ($conn in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
+        if ($proc -and $proc.Name -eq "python.exe" -and $proc.CommandLine -match "alphalineage\.api\.app") {
+            Write-Host "Stopping a stale AlphaLineage backend on port $Port (PID $($proc.ProcessId))..."
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 300
+        }
+        elseif ($proc) {
+            Write-Warning "Port $Port is in use by $($proc.Name) (PID $($proc.ProcessId)); the backend may fail to bind."
+        }
+    }
+}
+
 function Start-LoggedCommand {
     param(
         [string]$Name,
@@ -108,6 +126,7 @@ if ($Mode -eq "app") {
         Set-ProcessEnv -Name "TEMP" -Value $TempDir
         Set-ProcessEnv -Name "TMP" -Value $TempDir
         Set-ProcessEnv -Name "PYTHONPATH" -Value (Join-Path $RepoRoot "src")
+        Clear-StaleBackendPort -Port $BackendPort
         Start-LoggedCommand `
             -Name "backend" `
             -FilePath $Python `

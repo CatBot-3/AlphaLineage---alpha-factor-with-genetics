@@ -1,7 +1,7 @@
 // Extend tab body: renders whichever of the three Extend pages the nav dropdown selected.
 // The active page is controlled by App (via the `page` prop); the dropdown lives in the nav.
 
-import type { OperatorComposerDraft, SyncProgressSnapshot, UniverseDraft } from "../api/types";
+import type { FormulaDraft, SyncProgressSnapshot, UniverseDraft } from "../api/types";
 import { FormulaEditorPage } from "./FormulaEditorPage";
 import { SyncDataPage } from "./SyncDataPage";
 import { UniverseEditorPage } from "./UniverseEditorPage";
@@ -12,16 +12,16 @@ export function ExtendPanel({
   page,
   universeDraft,
   onUniverseDraftChange,
-  operatorDraft,
-  onOperatorDraftChange,
+  formulaDraft,
+  onFormulaDraftChange,
   canSubmit = true,
   onDataPullProgressChange,
 }: {
   page: ExtendPage;
   universeDraft?: UniverseDraft;
   onUniverseDraftChange?: (draft: UniverseDraft) => void;
-  operatorDraft?: OperatorComposerDraft;
-  onOperatorDraftChange?: (draft: OperatorComposerDraft) => void;
+  formulaDraft?: FormulaDraft;
+  onFormulaDraftChange?: (draft: FormulaDraft) => void;
   canSubmit?: boolean;
   onDataPullProgressChange?: (snapshot: SyncProgressSnapshot | null) => void;
 }) {
@@ -42,8 +42,8 @@ export function ExtendPanel({
       )}
       {page === "formula" && (
         <FormulaEditorPage
-          operatorDraft={operatorDraft}
-          onOperatorDraftChange={onOperatorDraftChange}
+          formulaDraft={formulaDraft}
+          onFormulaDraftChange={onFormulaDraftChange}
           canSubmit={canSubmit}
         />
       )}
