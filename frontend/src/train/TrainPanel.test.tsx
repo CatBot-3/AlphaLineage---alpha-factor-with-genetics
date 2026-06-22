@@ -27,6 +27,7 @@ vi.mock("../api/client", () => ({
   stopSession: (id: string) => stopSession(id),
   listUniverses: () => Promise.resolve([]),
   listFactors: () => Promise.resolve([]),
+  getPrimitives: () => Promise.resolve([]),
 }));
 
 import { TrainPanel } from "./TrainPanel";

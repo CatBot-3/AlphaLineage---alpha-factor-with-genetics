@@ -14,7 +14,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { addFormula, getPrimitives } from "../api/client";
-import type { OperatorComposerDraft, PrimitiveInfo } from "../api/types";
+import type { FactorNode, OperatorComposerDraft, PrimitiveInfo } from "../api/types";
 import { type ComposerEdge, type ComposerNode, findRoot, graphToBody } from "./graphToBody";
 
 const OUTPUT_TYPES = ["series", "signal", "window", "scalar"];
@@ -44,10 +44,12 @@ export function OperatorComposer({
   draft,
   onDraftChange,
   canSubmit = true,
+  onUseBody,
 }: {
   draft?: OperatorComposerDraft;
   onDraftChange?: (draft: OperatorComposerDraft) => void;
   canSubmit?: boolean;
+  onUseBody?: (body: FactorNode) => void;
 }) {
   const initialNodes = useMemo(() => nodesFromDraft(draft), [draft]);
   const initialEdges = useMemo(() => edgesFromDraft(draft), [draft]);
@@ -103,10 +105,7 @@ export function OperatorComposer({
     ]);
   }
 
-  function register() {
-    if (!canSubmit) return;
-    setError(null);
-    setMessage(null);
+  function buildBody(): FactorNode | null {
     const composerNodes: ComposerNode[] = nodes.map((n) => ({
       id: n.id,
       kind: String(n.data.kind),
@@ -118,10 +117,29 @@ export function OperatorComposer({
     const root = findRoot(composerNodes, composerEdges);
     if (!root) {
       setError("the graph must have exactly one output (root) node");
-      return;
+      return null;
     }
     try {
-      const body = graphToBody(composerNodes, composerEdges, root);
+      return graphToBody(composerNodes, composerEdges, root);
+    } catch (e) {
+      setError(String(e));
+      return null;
+    }
+  }
+
+  function useInEditor() {
+    setError(null);
+    const body = buildBody();
+    if (body) onUseBody?.(body);
+  }
+
+  function register() {
+    if (!canSubmit) return;
+    setError(null);
+    setMessage(null);
+    const body = buildBody();
+    if (!body) return;
+    try {
       addFormula({
         name,
         display_name: name.replace(/_/g, " "),
@@ -177,6 +195,11 @@ export function OperatorComposer({
         <button onClick={register} data-testid="register-operator" disabled={!canSubmit}>
           Register
         </button>
+        {onUseBody && (
+          <button type="button" onClick={useInEditor} data-testid="use-in-editor">
+            Use in editor
+          </button>
+        )}
       </div>
       <div className="composer-palette" data-testid="palette">
         {argTypes.map((_, i) => (
@@ -189,7 +212,11 @@ export function OperatorComposer({
         {palette
           .filter((p) => p.kind !== "ephemeral")
           .map((p) => (
-            <button key={p.name} onClick={() => addNode(p.name)}>
+            <button
+              key={p.name}
+              className={p.user ? "palette-user" : undefined}
+              onClick={() => addNode(p.name)}
+            >
               {p.name}
             </button>
           ))}

@@ -163,6 +163,39 @@ def _ts_corr(a: pd.DataFrame, b: pd.DataFrame, w: int) -> pd.DataFrame:
     return _finite(cov / denom)
 
 
+def _gt(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    return (a > b) & a.notna() & b.notna()
+
+
+def _lt(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    return (a < b) & a.notna() & b.notna()
+
+
+def _ge(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    return (a >= b) & a.notna() & b.notna()
+
+
+def _le(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    return (a <= b) & a.notna() & b.notna()
+
+
+def _and(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    return a.astype(bool) & b.astype(bool)
+
+
+def _or(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    return a.astype(bool) | b.astype(bool)
+
+
+def _not(a: pd.DataFrame) -> pd.DataFrame:
+    return ~a.astype(bool)
+
+
+def _where(cond: pd.DataFrame, a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    # Keep ``a`` where the condition holds, else ``b`` (index/column aligned).
+    return a.where(cond.astype(bool), b)
+
+
 def _rank(a: pd.DataFrame) -> pd.DataFrame:
     return a.rank(axis=1, pct=True)
 
@@ -180,6 +213,7 @@ def _scale(a: pd.DataFrame) -> pd.DataFrame:
 
 # --- registry construction -------------------------------------------------------
 _SE, _SC, _WI, _SI = DType.SERIES, DType.SCALAR, DType.WINDOW, DType.SIGNAL
+_BO = DType.BOOL
 
 _OPERATOR_SPECS: list[tuple[str, tuple[DType, ...], DType, Callable[..., pd.DataFrame]]] = [
     # arithmetic
@@ -213,6 +247,17 @@ _OPERATOR_SPECS: list[tuple[str, tuple[DType, ...], DType, Callable[..., pd.Data
     ("rank", (_SE,), _SI, _rank),
     ("zscore", (_SE,), _SI, _zscore),
     ("scale", (_SE,), _SI, _scale),
+    # comparisons (produce a BOOL mask)
+    ("gt", (_SE, _SE), _BO, _gt),
+    ("lt", (_SE, _SE), _BO, _lt),
+    ("ge", (_SE, _SE), _BO, _ge),
+    ("le", (_SE, _SE), _BO, _le),
+    # logical (combine BOOL masks)
+    ("and_", (_BO, _BO), _BO, _and),
+    ("or_", (_BO, _BO), _BO, _or),
+    ("not_", (_BO,), _BO, _not),
+    # select: keep the first series where the condition holds, else the second
+    ("where", (_BO, _SE, _SE), _SE, _where),
 ]
 
 #: Panel fields usable as leaf operands (all of type SERIES).

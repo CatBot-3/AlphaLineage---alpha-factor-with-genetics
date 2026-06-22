@@ -1,6 +1,8 @@
 import type { AppMode, SyncProgressSnapshot } from "../api/types";
 import type { ReactNode } from "react";
+import type { ExtendPage } from "../extend/ExtendPanel";
 import { DataPullProgress } from "./DataPullProgress";
+import { ExtendMenu } from "./ExtendMenu";
 import { SettingsMenu } from "./SettingsMenu";
 
 export type Tab = "train" | "dashboard" | "factor" | "genealogy" | "library" | "extend";
@@ -26,6 +28,7 @@ export function AppShell({
   onSaveBackend,
   onLoadBackend,
   onQuit,
+  onSelectExtendPage,
   children,
 }: {
   mode: AppMode;
@@ -39,6 +42,7 @@ export function AppShell({
   onSaveBackend: () => void;
   onLoadBackend: () => void;
   onQuit: () => void;
+  onSelectExtendPage?: (page: ExtendPage) => void;
   children: ReactNode;
 }) {
   const backend = mode === "app";
@@ -52,23 +56,32 @@ export function AppShell({
           </button>
           <span className="nav__divider" aria-hidden="true" />
           <div className="nav__list" data-testid="main-nav">
-            {TABS.map((item) => (
-              <button
-                key={item.id}
-                className="nav__link"
-                type="button"
-                aria-current={tab === item.id ? "page" : undefined}
-                aria-disabled={item.backendOnly && !backend ? "true" : undefined}
-                onClick={() => onTabChange(item.id)}
-                title={
-                  item.backendOnly && !backend
-                    ? "Available as a locally saved draft in static demo mode"
-                    : undefined
-                }
-              >
-                {item.label}
-              </button>
-            ))}
+            {TABS.map((item) =>
+              item.id === "extend" ? (
+                <ExtendMenu
+                  key={item.id}
+                  current={tab === "extend"}
+                  disabled={item.backendOnly && !backend}
+                  onSelect={(page) => onSelectExtendPage?.(page)}
+                />
+              ) : (
+                <button
+                  key={item.id}
+                  className="nav__link"
+                  type="button"
+                  aria-current={tab === item.id ? "page" : undefined}
+                  aria-disabled={item.backendOnly && !backend ? "true" : undefined}
+                  onClick={() => onTabChange(item.id)}
+                  title={
+                    item.backendOnly && !backend
+                      ? "Available as a locally saved draft in static demo mode"
+                      : undefined
+                  }
+                >
+                  {item.label}
+                </button>
+              ),
+            )}
           </div>
         </nav>
         <div className="workspace-tools" aria-label="Workspace">

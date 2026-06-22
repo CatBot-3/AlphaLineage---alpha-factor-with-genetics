@@ -65,6 +65,7 @@ def run_search(
     embargo: int = 5,
     progress: Any = None,
     stop: Callable[[], bool] | None = None,
+    allowed_operators: set[str] | None = None,
 ) -> dict[str, Any]:
     """Run a GP search and return the best factor, its OOS/deflated verdict, and the lineage."""
     split = time_split(panel.dates, train=train, valid=valid, embargo=embargo)
@@ -76,7 +77,7 @@ def run_search(
         progress.attach(store)
         progress.set_target(config.generations)
         recorder = progress
-    gp = GP(config, train_panel, recorder=recorder)
+    gp = GP(config, train_panel, recorder=recorder, allowed_operators=allowed_operators)
     best = gp.run(stop=stop)
 
     trials = [ind.tree for ind in gp.population]

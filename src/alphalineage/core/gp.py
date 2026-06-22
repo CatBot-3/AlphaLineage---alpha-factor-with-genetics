@@ -21,7 +21,7 @@ from typing import Any
 import pandas as pd
 
 from alphalineage.core.fitness import forward_returns, score_tree
-from alphalineage.core.generate import RandomTreeGenerator
+from alphalineage.core.generate import GenerationError, RandomTreeGenerator, operator_allowed
 from alphalineage.core.panel import Panel
 from alphalineage.core.primitives import OPERANDS, OPERATORS, Kind
 from alphalineage.core.simplify import simplify
@@ -50,6 +50,8 @@ class GPConfig:
     min_depth: int = 2
     seed: int = 0
     time_budget_s: float | None = None
+    # Operator categories the GP may draw from. ``None`` => the default pool (condition excluded).
+    enabled_categories: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -123,6 +125,7 @@ class GP:
         *,
         root_type: DType = DType.SIGNAL,
         recorder: Any | None = None,
+        allowed_operators: set[str] | None = None,
     ) -> None:
         self.config = config
         self.panel = panel
@@ -130,9 +133,15 @@ class GP:
         self.root_type = root_type
         # Optional lineage recorder (duck-typed: on_init(trees), on_generation(gen, entries)).
         self.recorder = recorder
+        # Operator name allow-set (None => default pool, condition category excluded).
+        self.allowed_operators = allowed_operators
         self.rng = random.Random(config.seed)
         self.generator = RandomTreeGenerator(
-            self.rng, max_depth=config.max_depth, max_nodes=config.max_nodes, root_type=root_type
+            self.rng,
+            max_depth=config.max_depth,
+            max_nodes=config.max_nodes,
+            root_type=root_type,
+            allowed_operators=allowed_operators,
         )
         self.population: list[Individual] = []
         self.generation = 0
@@ -197,9 +206,12 @@ class GP:
         node_budget = self.config.max_nodes - (tree.size() - sub.size())
         if depth_budget < 1 or node_budget < 1:
             return tree
-        fresh = self.generator.grow_subtree(
-            required, max_depth=depth_budget, max_nodes=node_budget, grow=True
-        )
+        try:
+            fresh = self.generator.grow_subtree(
+                required, max_depth=depth_budget, max_nodes=node_budget, grow=True
+            )
+        except GenerationError:  # budget too small to close this typed hole; leave the tree as-is
+            return tree
         return replace_at(tree, path, fresh)
 
     def _point_mutation(self, tree: Node) -> Node:
@@ -215,7 +227,10 @@ class GP:
         same = [
             p
             for p in OPERATORS.values()
-            if p.arg_types == prim.arg_types and p.out_type == prim.out_type and p.name != node.name
+            if p.arg_types == prim.arg_types
+            and p.out_type == prim.out_type
+            and p.name != node.name
+            and operator_allowed(p, self.allowed_operators)
         ]
         if not same:
             return tree
@@ -372,9 +387,16 @@ class GP:
         fwd: pd.DataFrame | None = None,
         *,
         recorder: Any | None = None,
+        allowed_operators: set[str] | None = None,
     ) -> GP:
         state = json.loads(Path(path).read_text(encoding="utf-8"))
-        gp = cls(GPConfig.from_dict(state["config"]), panel, fwd, recorder=recorder)
+        gp = cls(
+            GPConfig.from_dict(state["config"]),
+            panel,
+            fwd,
+            recorder=recorder,
+            allowed_operators=allowed_operators,
+        )
         gp._prior_trials = int(state.get("trials", 0))
         version, internal, gauss = state["rng_state"]
         gp.rng.setstate((version, tuple(internal), gauss))

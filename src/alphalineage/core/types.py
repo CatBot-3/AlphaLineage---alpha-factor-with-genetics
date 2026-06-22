@@ -22,6 +22,7 @@ class DType(Enum):
     WINDOW = "window"
     SERIES = "series"
     SIGNAL = "signal"
+    BOOL = "bool"  # a date x symbol panel of booleans (produced by comparisons/logical ops)
 
 
 # The structurally-identical panel types; substitutable for one another.

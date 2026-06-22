@@ -15,6 +15,7 @@ export function TrainPanel({
   onRunningChange,
   onOpenDashboard,
   onOpenUniverseEditor,
+  onOpenFormulaEditor,
 }: {
   seedIds?: string[];
   restoreSessionId?: string | null;
@@ -22,6 +23,7 @@ export function TrainPanel({
   onRunningChange?: (running: boolean, sessionId: string | null) => void;
   onOpenDashboard?: () => void;
   onOpenUniverseEditor?: (universeName: string) => void;
+  onOpenFormulaEditor?: () => void;
 }) {
   const { sessionId, state, error, notice, phase, start, cont, stop, attach, reset } =
     useSession(onComplete);
@@ -63,6 +65,7 @@ export function TrainPanel({
           onStart={handleStart}
           disabled={running}
           onEditUniverse={onOpenUniverseEditor}
+          onOpenFormulaEditor={onOpenFormulaEditor}
         />
       )}
 

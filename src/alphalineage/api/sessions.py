@@ -182,6 +182,7 @@ def run_segment(
     rescore: bool = False,
     progress: Any = None,
     stop: Callable[[], bool] | None = None,
+    allowed_operators: set[str] | None = None,
 ) -> dict[str, Any]:
     """Run one segment (fresh start or warm continue) and persist all session state."""
     directory = session_dir(session_id)
@@ -211,7 +212,9 @@ def run_segment(
     prev_cumulative = int(session["cumulative_trials"])
     if warm:
         store.continue_from(_last_generation(store))
-        gp = GP.from_checkpoint(checkpoint, train_panel, recorder=recorder)
+        gp = GP.from_checkpoint(
+            checkpoint, train_panel, recorder=recorder, allowed_operators=allowed_operators
+        )
         gp.config = config  # apply any continue-time overrides
         if rescore:
             gp.rescore_population()
@@ -223,7 +226,7 @@ def run_segment(
             progress.set_target(target)
         best = gp.run(generations=target, stop=stop)
     else:
-        gp = GP(config, train_panel, recorder=recorder)
+        gp = GP(config, train_panel, recorder=recorder, allowed_operators=allowed_operators)
         gen_start = 0
         target = generations
         if progress is not None:

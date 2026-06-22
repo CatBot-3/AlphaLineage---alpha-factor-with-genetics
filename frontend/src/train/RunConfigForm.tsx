@@ -1,9 +1,9 @@
 // The run launcher: pick a universe, set GP hyperparameters, optionally seed from saved
 // factors, and start a session. Replaces the old hardcoded run config in the client.
 
-import { useEffect, useState } from "react";
-import { listFactors, listUniverses } from "../api/client";
-import type { GpConfig, SavedFactor, UniverseInfo } from "../api/types";
+import { useEffect, useMemo, useState } from "react";
+import { getPrimitives, listFactors, listUniverses } from "../api/client";
+import type { GpConfig, PrimitiveInfo, SavedFactor, UniverseInfo } from "../api/types";
 import { ADVANCED_FIELDS, CORE_FIELDS, DEFAULT_CONFIG } from "./defaults";
 
 export interface RunRequestForm {
@@ -12,6 +12,10 @@ export interface RunRequestForm {
   config: GpConfig;
   seed_factor_ids: string[];
 }
+
+// A stable empty default so the `initialSeedIds` effect dependency doesn't change every render
+// (a fresh `[]` literal default would re-fire the effect forever -> infinite re-render).
+const NO_SEEDS: string[] = [];
 
 function numberField(key: keyof GpConfig, value: number, onChange: (v: number) => void, label: string) {
   return (
@@ -29,15 +33,17 @@ function numberField(key: keyof GpConfig, value: number, onChange: (v: number) =
 }
 
 export function RunConfigForm({
-  initialSeedIds = [],
+  initialSeedIds = NO_SEEDS,
   onStart,
   disabled,
   onEditUniverse,
+  onOpenFormulaEditor,
 }: {
   initialSeedIds?: string[];
   onStart: (req: RunRequestForm) => void;
   disabled?: boolean;
   onEditUniverse?: (universeName: string) => void;
+  onOpenFormulaEditor?: () => void;
 }) {
   const [name, setName] = useState("Session");
   const [universe, setUniverse] = useState("sp500-lite");
@@ -45,10 +51,15 @@ export function RunConfigForm({
   const [seedIds, setSeedIds] = useState<string[]>(initialSeedIds);
   const [universes, setUniverses] = useState<UniverseInfo[]>([]);
   const [factors, setFactors] = useState<SavedFactor[]>([]);
+  const [primitives, setPrimitives] = useState<PrimitiveInfo[]>([]);
+  // Operator categories the GP may draw from this run. `condition` (boolean ops) is off by
+  // default so the classic numeric search space is unchanged unless the user opts it in.
+  const [disabledCats, setDisabledCats] = useState<Set<string>>(new Set(["condition"]));
 
   useEffect(() => {
     listUniverses().then(setUniverses).catch(() => setUniverses([]));
     listFactors().then(setFactors).catch(() => setFactors([]));
+    getPrimitives().then(setPrimitives).catch(() => setPrimitives([]));
   }, []);
 
   useEffect(() => setSeedIds(initialSeedIds), [initialSeedIds]);
@@ -60,13 +71,39 @@ export function RunConfigForm({
     setSeedIds((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]));
   }
 
+  // Functions available to training, grouped by category (operators + user formulas only).
+  const functionsByCategory = useMemo(() => {
+    const groups = new Map<string, PrimitiveInfo[]>();
+    for (const p of primitives) {
+      if (p.kind !== "operator") continue;
+      const key = p.category ?? "uncategorized";
+      (groups.get(key) ?? groups.set(key, []).get(key)!).push(p);
+    }
+    return groups;
+  }, [primitives]);
+
+  function toggleCategory(cat: string) {
+    setDisabledCats((prev) => {
+      const next = new Set(prev);
+      if (next.has(cat)) next.delete(cat);
+      else next.add(cat);
+      return next;
+    });
+  }
+
   return (
     <form
       className="run-form"
       data-testid="run-config-form"
       onSubmit={(e) => {
         e.preventDefault();
-        onStart({ name, universe, config, seed_factor_ids: seedIds });
+        const enabled = [...functionsByCategory.keys()].filter((c) => !disabledCats.has(c));
+        onStart({
+          name,
+          universe,
+          config: { ...config, enabled_categories: enabled.length ? enabled : null },
+          seed_factor_ids: seedIds,
+        });
       }}
     >
       <div className="field-grid">
@@ -109,6 +146,42 @@ export function RunConfigForm({
             numberField(f.key, config[f.key] as number, set(f.key), f.label),
           )}
         </div>
+      </details>
+
+      <details className="advanced" data-testid="function-space">
+        <summary>Available functions (current settings)</summary>
+        <div className="function-space-head">
+          <span className="hint">
+            Toggle which operator categories the search may use. Functions are not part of the
+            universe; edit them in the Formula Editor.
+          </span>
+          {onOpenFormulaEditor && (
+            <button
+              type="button"
+              className="edit-universe-btn"
+              data-testid="edit-functions"
+              onClick={onOpenFormulaEditor}
+            >
+              Edit functions
+            </button>
+          )}
+        </div>
+        {[...functionsByCategory.entries()].map(([cat, prims]) => (
+          <fieldset key={cat} className="function-cat" data-testid={`function-cat-${cat}`}>
+            <legend>
+              <label className="seed-option">
+                <input
+                  type="checkbox"
+                  aria-label={`enable ${cat}`}
+                  checked={!disabledCats.has(cat)}
+                  onChange={() => toggleCategory(cat)}
+                />
+                <span>{cat}</span>
+              </label>
+            </legend>
+            <span className="function-cat-names">{prims.map((p) => p.name).join(", ")}</span>
+          </fieldset>
+        ))}
       </details>
 
       {factors.length > 0 && (

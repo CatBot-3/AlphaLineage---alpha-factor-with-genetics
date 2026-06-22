@@ -320,6 +320,10 @@ export function App() {
       onSaveBackend={saveBackend}
       onLoadBackend={loadBackend}
       onQuit={() => setQuitOpen(true)}
+      onSelectExtendPage={(page) => {
+        setExtendPage(page);
+        setTab("extend");
+      }}
     >
       <section className="app-page">
         <header className="view-head">
@@ -350,6 +354,10 @@ export function App() {
                 onRunningChange={onRunningChange}
                 onOpenDashboard={() => setTab("dashboard")}
                 onOpenUniverseEditor={openUniverseEditor}
+                onOpenFormulaEditor={() => {
+                  setExtendPage("formula");
+                  setTab("extend");
+                }}
               />
             </div>
           </section>
@@ -430,11 +438,9 @@ export function App() {
             </div>
             <div className="view-body">
               <ExtendPanel
-                initialPage={extendPage}
+                page={extendPage}
                 universeDraft={universeDraft}
                 onUniverseDraftChange={setUniverseDraft}
-                formulaDraft={formulaDraft}
-                onFormulaDraftChange={setFormulaDraft}
                 operatorDraft={operatorDraft}
                 onOperatorDraftChange={setOperatorDraft}
                 canSubmit={mode === "app"}

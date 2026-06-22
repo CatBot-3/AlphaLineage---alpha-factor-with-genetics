@@ -9,6 +9,7 @@ export interface ComposerNode {
   argIndex?: number; // for "$arg"
   value?: number; // for const / window
   x: number; // horizontal position (orders sibling children)
+  y?: number; // vertical position (for layout only; ignored by graphToBody)
 }
 
 export interface ComposerEdge {

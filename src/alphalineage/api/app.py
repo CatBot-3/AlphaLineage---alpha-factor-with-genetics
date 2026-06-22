@@ -29,21 +29,23 @@ from alphalineage.api import sessions
 from alphalineage.api.jobs import JobStore
 from alphalineage.api.progress import RunProgress, SyncProgress
 from alphalineage.api.service import run_search
+from alphalineage.core import categories as core_categories
 from alphalineage.core import cpp
 from alphalineage.core.extensions import (
     USER_OPERATORS,
     InvalidOperator,
     ensure_operator,
+    infer_macro_type,
     register_operator,
     unregister_operator,
 )
 from alphalineage.core.gp import GPConfig, validate_seed
 from alphalineage.core.panel import Panel
-from alphalineage.core.primitives import REGISTRY, Primitive
+from alphalineage.core.primitives import OPERATORS, REGISTRY, Primitive
 from alphalineage.core.tree import Node
 from alphalineage.core.tree import from_dict as tree_from_dict
 from alphalineage.core.tree import validate as validate_tree
-from alphalineage.core.types import DType
+from alphalineage.core.types import DType, is_subtype
 from alphalineage.data import paths, schema, usage
 from alphalineage.data.cache import ParquetCache
 from alphalineage.data.provider import FallbackProvider, PriceProvider
@@ -85,6 +87,16 @@ class FormulaSpec(BaseModel):
     arg_types: list[str]
     out_type: str
     body: dict[str, Any]
+    category: str = ""
+
+
+class CategoryUpdate(BaseModel):
+    order: list[str] | None = None
+    overrides: dict[str, str] | None = None
+
+
+class PrimitiveCategoryUpdate(BaseModel):
+    category: str
 
 
 class MembershipSpec(BaseModel):
@@ -249,13 +261,56 @@ class SessionContinueRequest(BaseModel):
     seed_factor_ids: list[str] = Field(default_factory=list)
 
 
-def _primitive_info(prim: Primitive) -> dict[str, Any]:
+def _formula_categories() -> dict[str, str]:
+    """The category each saved user formula declares (empty string when unset)."""
+    return {spec.name: spec.category for spec in _read_formula_specs() if spec.category}
+
+
+def _resolve_category(name: str, *, is_user: bool, formula_categories: dict[str, str]) -> str:
+    """Category for a primitive: user override > formula's own > built-in default > custom."""
+    overrides = paths.read_categories().get("overrides", {})
+    if isinstance(overrides, dict) and name in overrides:
+        return str(overrides[name])
+    if name in formula_categories:
+        return formula_categories[name]
+    if is_user:
+        return core_categories.CUSTOM
+    return core_categories.builtin_category(name)
+
+
+def _allowed_operators(config: GPConfig) -> set[str] | None:
+    """The operator names the GP may use, from the config's ``enabled_categories``.
+
+    ``None`` (the default) leaves the GP on its default pool (condition category excluded), so
+    the classic numeric search space is unchanged unless a run opts categories in.
+    """
+    enabled = config.enabled_categories
+    if enabled is None:
+        return None
+    enabled_set = set(enabled)
+    cats = _formula_categories()
+    return {
+        prim.name
+        for prim in OPERATORS.values()
+        if _resolve_category(
+            prim.name, is_user=prim.macro_body is not None, formula_categories=cats
+        )
+        in enabled_set
+    }
+
+
+def _primitive_info(
+    prim: Primitive, formula_categories: dict[str, str] | None = None
+) -> dict[str, Any]:
+    is_user = prim.macro_body is not None
+    cats = formula_categories if formula_categories is not None else _formula_categories()
     return {
         "name": prim.name,
         "kind": prim.kind.value,
         "arg_types": [t.value for t in prim.arg_types],
         "out_type": prim.out_type.value,
-        "user": prim.macro_body is not None,
+        "user": is_user,
+        "category": _resolve_category(prim.name, is_user=is_user, formula_categories=cats),
     }
 
 
@@ -319,11 +374,40 @@ def _formula_operator_spec(spec: FormulaSpec) -> OperatorSpec:
     )
 
 
+def _topo_sort_formulas(specs: list[FormulaSpec]) -> list[FormulaSpec]:
+    """Order formulas so a dependency is registered before the formula that references it.
+
+    Composed formulas (e.g. MACD -> DIF/DEA -> EMA) otherwise fail to reload when their
+    dependency happens to sit later in the file. On a cycle (which the type gate makes
+    impossible to create through the API), the original order is preserved as a fallback.
+    """
+    by_name = {spec.name: spec for spec in specs}
+    ordered: list[FormulaSpec] = []
+    visiting: set[str] = set()
+    placed: set[str] = set()
+
+    def visit(spec: FormulaSpec) -> None:
+        if spec.name in placed or spec.name in visiting:
+            return
+        visiting.add(spec.name)
+        body = tree_from_dict(spec.body)
+        for other in specs:
+            if other.name != spec.name and _tree_uses(body, other.name):
+                visit(by_name[other.name])
+        visiting.discard(spec.name)
+        if spec.name not in placed:
+            placed.add(spec.name)
+            ordered.append(spec)
+
+    for spec in specs:
+        visit(spec)
+    return ordered
+
+
 def _load_persisted_formulas() -> list[dict[str, Any]]:
-    formulas: list[dict[str, Any]] = []
-    for spec in _read_formula_specs():
-        registered = False
-        error = None
+    specs = _read_formula_specs()
+    status: dict[str, tuple[bool, str | None]] = {}
+    for spec in _topo_sort_formulas(specs):
         try:
             ensure_operator(
                 spec.name,
@@ -331,9 +415,13 @@ def _load_persisted_formulas() -> list[dict[str, Any]]:
                 DType(spec.out_type),
                 spec.body,
             )
-            registered = True
+            status[spec.name] = (True, None)
         except (InvalidOperator, ValueError) as exc:
-            error = str(exc)
+            status[spec.name] = (False, str(exc))
+    # Report in the original file order; registration happened in dependency order above.
+    formulas: list[dict[str, Any]] = []
+    for spec in specs:
+        registered, error = status.get(spec.name, (False, None))
         formulas.append({**_model_dump(spec), "registered": registered, "error": error})
     return formulas
 
@@ -800,7 +888,8 @@ def health() -> dict[str, str]:
 def list_primitives() -> list[dict[str, Any]]:
     """The primitive palette (built-ins + user operators) for the operator composer."""
     _load_persisted_formulas()
-    return [_primitive_info(p) for p in REGISTRY.values()]
+    cats = _formula_categories()
+    return [_primitive_info(p, cats) for p in REGISTRY.values()]
 
 
 @app.post("/operators")
@@ -843,6 +932,76 @@ def add_formula(spec: FormulaSpec) -> dict[str, Any]:
     return {**_model_dump(spec), "registered": True, "error": None}
 
 
+@app.post("/formulas/validate")
+def validate_formula(spec: FormulaSpec) -> dict[str, Any]:
+    """Type-check a formula body without registering it or touching disk (live editor feedback)."""
+    try:
+        name = _normalize_formula_name(spec.name) if spec.name else None
+    except HTTPException as exc:
+        return {"ok": False, "error": str(exc.detail), "name": None}
+    try:
+        out = infer_macro_type(tree_from_dict(spec.body), [DType(t) for t in spec.arg_types])
+    except (InvalidOperator, ValueError, KeyError) as exc:
+        return {"ok": False, "error": str(exc), "name": name}
+    declared = DType(spec.out_type)
+    if not is_subtype(out, declared):
+        return {
+            "ok": False,
+            "error": f"body produces {out.value}, not the declared output {declared.value}",
+            "name": name,
+        }
+    return {"ok": True, "out_type": out.value, "name": name, "error": None}
+
+
+@app.put("/formulas/{name}")
+def update_formula(name: str, spec: FormulaSpec) -> dict[str, Any]:
+    normalized = _normalize_formula_name(name)
+    saved = _read_formula_specs()
+    existing = next((item for item in saved if item.name == normalized), None)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="unknown formula")
+
+    updated = FormulaSpec(
+        **{
+            **_model_dump(spec),
+            "name": normalized,
+            "display_name": spec.display_name or normalized.replace("_", " "),
+        }
+    )
+    signature_changed = (
+        updated.arg_types != existing.arg_types or updated.out_type != existing.out_type
+    )
+    if signature_changed:
+        for other in saved:
+            if other.name == normalized:
+                continue
+            if _tree_uses(tree_from_dict(other.body), normalized):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"cannot change the signature of {normalized!r}; "
+                        f"it is used by {other.name!r}"
+                    ),
+                )
+
+    # Validate the new body BEFORE mutating the registry so a bad update leaves the old intact.
+    try:
+        out = infer_macro_type(tree_from_dict(updated.body), [DType(t) for t in updated.arg_types])
+        if not is_subtype(out, DType(updated.out_type)):
+            raise InvalidOperator(
+                f"body produces {out.value}, not the declared output {updated.out_type}"
+            )
+    except (InvalidOperator, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    unregister_operator(normalized)
+    _register(_formula_operator_spec(updated))
+    _write_formula_specs([updated if item.name == normalized else item for item in saved])
+    # Re-resolve the whole set so dependents pick up the new body (dependency-ordered).
+    _load_persisted_formulas()
+    return {**_model_dump(updated), "registered": True, "error": None}
+
+
 @app.delete("/formulas/{name}")
 def delete_formula(name: str) -> dict[str, str]:
     normalized = _normalize_formula_name(name)
@@ -858,6 +1017,51 @@ def delete_formula(name: str) -> dict[str, str]:
     unregister_operator(normalized)
     _write_formula_specs([spec for spec in saved if spec.name != normalized])
     return {"removed": normalized}
+
+
+def _category_settings() -> dict[str, Any]:
+    """The persisted category list + overrides, seeded with defaults when absent."""
+    stored = paths.read_categories()
+    order = stored.get("order")
+    if not isinstance(order, list) or not order:
+        order = list(core_categories.DEFAULT_CATEGORY_ORDER)
+    overrides = stored.get("overrides")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    return {"order": order, "overrides": overrides}
+
+
+@app.get("/categories")
+def get_categories() -> dict[str, Any]:
+    return _category_settings()
+
+
+@app.put("/categories")
+def put_categories(update: CategoryUpdate) -> dict[str, Any]:
+    settings = _category_settings()
+    if update.order is not None:
+        settings["order"] = update.order
+    if update.overrides is not None:
+        settings["overrides"] = {**settings["overrides"], **update.overrides}
+    # Any category referenced by an override but missing from the order is appended.
+    for category in settings["overrides"].values():
+        if category not in settings["order"]:
+            settings["order"].append(category)
+    paths.write_categories(settings)
+    return settings
+
+
+@app.put("/categories/{primitive}")
+def set_primitive_category(primitive: str, update: PrimitiveCategoryUpdate) -> dict[str, Any]:
+    _load_persisted_formulas()
+    if primitive not in REGISTRY:
+        raise HTTPException(status_code=404, detail="unknown primitive")
+    settings = _category_settings()
+    settings["overrides"][primitive] = update.category
+    if update.category not in settings["order"]:
+        settings["order"].append(update.category)
+    paths.write_categories(settings)
+    return settings
 
 
 @app.get("/universes")
@@ -973,11 +1177,14 @@ def submit_run(req: RunRequest, panel: Panel = Depends(get_panel)) -> JobRespons
         _register(spec)
     panel = _panel_for_universe(req.universe, _DEFAULT_AS_OF, panel)
     config = GPConfig.from_dict(req.config)
+    allowed = _allowed_operators(config)
     progress = RunProgress(target_generations=config.generations)
     cancel = threading.Event()
 
     def _task() -> dict[str, Any]:
-        return run_search(config, panel, progress=progress, stop=cancel.is_set)
+        return run_search(
+            config, panel, progress=progress, stop=cancel.is_set, allowed_operators=allowed
+        )
 
     job_id = _jobs.submit(_task, progress=progress, cancel=cancel, on_success=_save_run_workspace)
     return JobResponse(job_id=job_id, status="queued")
@@ -1242,6 +1449,7 @@ def create_session(
         created_at=_now_iso(),
     )
     session_id = session["id"]
+    allowed = _allowed_operators(config)
     progress = RunProgress(target_generations=config.generations)
     cancel = threading.Event()
     job_id = uuid.uuid4().hex
@@ -1256,6 +1464,7 @@ def create_session(
             seeds=seeds,
             progress=progress,
             stop=cancel.is_set,
+            allowed_operators=allowed,
         )
 
     _jobs.submit(_task, job_id=job_id, progress=progress, cancel=cancel)
@@ -1320,6 +1529,7 @@ def continue_session(
         session["config"] = merged
         sessions.save_session(session)
 
+    allowed = _allowed_operators(config)
     progress = RunProgress(target_generations=config.generations)
     cancel = threading.Event()
     job_id = uuid.uuid4().hex
@@ -1335,6 +1545,7 @@ def continue_session(
             rescore=rescore,
             progress=progress,
             stop=cancel.is_set,
+            allowed_operators=allowed,
         )
 
     _jobs.submit(_task, job_id=job_id, progress=progress, cancel=cancel)

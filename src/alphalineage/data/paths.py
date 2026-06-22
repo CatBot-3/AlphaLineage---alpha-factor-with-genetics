@@ -63,6 +63,26 @@ def formulas_path() -> Path:
     return meta_dir() / "formulas.json"
 
 
+def categories_path() -> Path:
+    return meta_dir() / "categories.json"
+
+
+def read_categories() -> dict[str, Any]:
+    path = categories_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_categories(categories: dict[str, Any]) -> None:
+    meta_dir().mkdir(parents=True, exist_ok=True)
+    categories_path().write_text(json.dumps(categories, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def read_settings() -> dict[str, Any]:
     path = settings_path()
     if not path.exists():

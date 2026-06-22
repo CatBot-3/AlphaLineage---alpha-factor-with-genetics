@@ -5,11 +5,15 @@ import {
   createSession,
   getMembershipSync,
   getSession,
+  putCategories,
   putSettings,
   saveFactor,
   searchSymbols,
+  setPrimitiveCategory,
   shutdown,
   startMembershipSync,
+  updateFormula,
+  validateFormula,
 } from "./client";
 
 function mockFetch(payload: unknown, ok = true) {
@@ -138,5 +142,48 @@ describe("symbol search + membership sync client", () => {
     const job = await getMembershipSync("m1");
     expect(job.status).toBe("done");
     expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/universes\/sync-dates\/m1$/);
+  });
+});
+
+describe("formula editor + category client", () => {
+  const spec = {
+    name: "macd",
+    display_name: "macd",
+    description: "",
+    arg_types: ["series"],
+    out_type: "series",
+    body: { name: "rank", children: [{ name: "$arg", value: 0 }] },
+  };
+
+  it("PUTs a formula update to /formulas/{name}", async () => {
+    const fetchSpy = mockFetch({ ...spec, registered: true });
+    await updateFormula("macd", spec);
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/formulas\/macd$/);
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string).name).toBe("macd");
+  });
+
+  it("POSTs a dry-run validate to /formulas/validate", async () => {
+    const fetchSpy = mockFetch({ ok: true, out_type: "series" });
+    const res = await validateFormula(spec);
+    expect(res.ok).toBe(true);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/formulas\/validate$/);
+  });
+
+  it("PUTs a single primitive recategorization", async () => {
+    const fetchSpy = mockFetch({ order: ["data"], overrides: { close: "fields" } });
+    await setPrimitiveCategory("close", "fields");
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/categories\/close$/);
+    expect(JSON.parse(init.body as string)).toEqual({ category: "fields" });
+  });
+
+  it("PUTs a category order/overrides update", async () => {
+    const fetchSpy = mockFetch({ order: ["a", "b"], overrides: {} });
+    await putCategories({ order: ["a", "b"] });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/categories$/);
+    expect(init.method).toBe("PUT");
   });
 });

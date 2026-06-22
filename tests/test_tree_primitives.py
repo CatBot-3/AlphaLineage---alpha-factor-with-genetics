@@ -18,6 +18,8 @@ def _arg_node(dtype: DType) -> Node:
         return Node("const", value=2.0)
     if dtype is DType.WINDOW:
         return Node("window", value=3)
+    if dtype is DType.BOOL:
+        return Node("gt", (Node("close"), Node("open")))
     raise AssertionError(dtype)
 
 
@@ -25,7 +27,7 @@ def test_operator_signatures_consistent():
     for prim in OPERATORS.values():
         assert prim.arity == len(prim.arg_types)
         assert prim.fn is not None
-        assert prim.out_type in (DType.SERIES, DType.SIGNAL)
+        assert prim.out_type in (DType.SERIES, DType.SIGNAL, DType.BOOL)
 
 
 def test_operands_and_ephemerals_consistent():

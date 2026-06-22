@@ -1,11 +1,13 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
 import type {
+  CategorySettings,
   DataCoverage,
   DataSyncJob,
   DataSyncRequest,
   DataUsageRow,
   FormulaSpec,
+  FormulaValidation,
   Lineage,
   MembershipSyncJob,
   MembershipSyncRequest,
@@ -132,9 +134,47 @@ export async function addFormula(spec: FormulaSpec): Promise<FormulaSpec> {
   return jsonOrThrow(await POST("/formulas", spec), "save formula");
 }
 
+export async function updateFormula(name: string, spec: FormulaSpec): Promise<FormulaSpec> {
+  const res = await fetch(`${BASE}/formulas/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec),
+  });
+  return jsonOrThrow(res, "update formula");
+}
+
+export async function validateFormula(spec: FormulaSpec): Promise<FormulaValidation> {
+  return jsonOrThrow(await POST("/formulas/validate", spec), "validate formula");
+}
+
 export async function deleteFormula(name: string): Promise<void> {
   const res = await fetch(`${BASE}/formulas/${encodeURIComponent(name)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`delete formula failed: ${res.status}`);
+}
+
+export async function getCategories(): Promise<CategorySettings> {
+  return jsonOrThrow(await fetch(`${BASE}/categories`), "load categories");
+}
+
+export async function putCategories(update: Partial<CategorySettings>): Promise<CategorySettings> {
+  const res = await fetch(`${BASE}/categories`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  return jsonOrThrow(res, "update categories");
+}
+
+export async function setPrimitiveCategory(
+  primitive: string,
+  category: string,
+): Promise<CategorySettings> {
+  const res = await fetch(`${BASE}/categories/${encodeURIComponent(primitive)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ category }),
+  });
+  return jsonOrThrow(res, "set category");
 }
 
 export async function defineUniverse(

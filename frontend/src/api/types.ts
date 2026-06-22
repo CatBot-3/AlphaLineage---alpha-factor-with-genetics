@@ -71,6 +71,7 @@ export interface GpConfig {
   min_depth: number;
   seed: number;
   time_budget_s: number | null;
+  enabled_categories?: string[] | null;
 }
 
 export interface ProgressSnapshot {
@@ -207,6 +208,7 @@ export interface PrimitiveInfo {
   arg_types: string[];
   out_type: string;
   user: boolean;
+  category?: string;
 }
 
 export interface OperatorSpec {
@@ -223,8 +225,21 @@ export interface FormulaSpec {
   arg_types: string[];
   out_type: string;
   body: FactorNode;
+  category?: string;
   registered?: boolean;
   error?: string | null;
+}
+
+export interface FormulaValidation {
+  ok: boolean;
+  out_type?: string;
+  name?: string | null;
+  error?: string | null;
+}
+
+export interface CategorySettings {
+  order: string[];
+  overrides: Record<string, string>;
 }
 
 export interface UniverseMembership {
