@@ -15,7 +15,7 @@ from typing import Any
 
 import pandas as pd
 
-from alphalineage.core.primitives import REGISTRY, Kind, Primitive
+from alphalineage.core.primitives import REGISTRY, Kind, Primitive, checked_scalar, checked_window
 from alphalineage.core.types import DType, is_subtype
 
 #: What evaluating a node yields: a panel frame (SERIES/SIGNAL) or a leaf constant.
@@ -73,21 +73,32 @@ def validate(node: Node) -> Node:
             raise InvalidTree(f"ephemeral {node.name!r} must have no children")
         if node.value is None:
             raise InvalidTree(f"ephemeral {node.name!r} must carry a value")
+        try:
+            if node.name == "window":
+                checked_window(node.value)
+            elif node.name == "const":
+                checked_scalar(node.value)
+        except ValueError as exc:
+            raise InvalidTree(str(exc)) from exc
         return node
     if prim.kind is Kind.OPERAND:
         if node.children:
             raise InvalidTree(f"operand {node.name!r} must have no children")
+        if node.value is not None:
+            raise InvalidTree(f"operand {node.name!r} must not carry a value")
         return node
 
     # operator
+    if node.value is not None:
+        raise InvalidTree(f"operator {node.name!r} must not carry a value")
     if len(node.children) != prim.arity:
         raise InvalidTree(f"{node.name!r} expects {prim.arity} args, got {len(node.children)}")
     for child, expected in zip(node.children, prim.arg_types, strict=True):
+        validate(child)
         if not is_subtype(child.out_type, expected):
             raise InvalidTree(
                 f"{node.name!r} arg expected {expected}, got {child.out_type} ({child.name!r})"
             )
-        validate(child)
     return node
 
 

@@ -1,0 +1,47 @@
+{
+  "bindings": {},
+  "commission_bps": null,
+  "configuration": {},
+  "data_coverage": {},
+  "data_revision": "",
+  "dependency_fingerprint": "",
+  "dependency_revisions": [],
+  "disclaimer": "Not investment advice. Research output only.",
+  "end": null,
+  "expanded_tree": {
+    "children": [
+      {
+        "name": "volume"
+      }
+    ],
+    "name": "rank"
+  },
+  "expression_fingerprint": "",
+  "horizon": null,
+  "id": "vol-3b5d81c4",
+  "kind": "training",
+  "metrics": {},
+  "name": "vol",
+  "normalized_equity": [],
+  "notes": "",
+  "out_type": "signal",
+  "provenance": {},
+  "quantile": null,
+  "required_operators": [],
+  "returns": [],
+  "saved_at": "2026-07-15T07:02:45+00:00",
+  "slippage_bps": null,
+  "source": {},
+  "source_formula": null,
+  "start": null,
+  "tree": {
+    "children": [
+      {
+        "name": "volume"
+      }
+    ],
+    "name": "rank"
+  },
+  "universe": null,
+  "weighting_scheme": null
+}

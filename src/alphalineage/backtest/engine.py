@@ -121,9 +121,19 @@ def net_return_fn(
         factor = evaluate(tree, panel)
         if not isinstance(factor, pd.DataFrame):
             return pd.Series(dtype="float64")
-        weights = scheme.weights(factor)
-        weights, returns = weights.align(fwd, join="inner")
-        gross = (weights * returns).sum(axis=1, min_count=1)
-        return gross - costs.cost(weights)
+        return net_returns_for_factor(factor, fwd, scheme, costs)
 
     return fn
+
+
+def net_returns_for_factor(
+    factor: pd.DataFrame,
+    fwd: pd.DataFrame,
+    scheme: WeightingScheme,
+    costs: TransactionCostModel,
+) -> pd.Series:
+    """Net returns for an already-evaluated factor, avoiding duplicate best-tree evaluation."""
+    weights = scheme.weights(factor)
+    weights, returns = weights.align(fwd, join="inner")
+    gross = (weights * returns).sum(axis=1, min_count=1)
+    return gross - costs.cost(weights)

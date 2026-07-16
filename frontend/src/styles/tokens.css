@@ -33,8 +33,6 @@
   --edge-padding: clamp(18px, 4vw, 48px);
   --header-height: 58px;
   --footer-height: 42px;
-  --max-content: 1160px;
-
   --z-header: 50;
   --z-popover: 100;
   --transition-fast: 90ms linear;

@@ -169,9 +169,9 @@ export function SettingsMenu({
                 </label>
 
                 <label className="field">
-                  <span className="field-label">Factors directory</span>
+                  <span className="field-label">Formula Results directory</span>
                   <input
-                    aria-label="Factors directory"
+                    aria-label="Formula Results directory"
                     value={factorsDir}
                     onChange={(e) => setFactorsDir(e.target.value)}
                   />

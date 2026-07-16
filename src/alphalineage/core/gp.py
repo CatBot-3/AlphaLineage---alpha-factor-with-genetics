@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import random
 import time
 from collections.abc import Callable, Sequence
@@ -20,7 +21,8 @@ from typing import Any
 
 import pandas as pd
 
-from alphalineage.core.fitness import forward_returns, score_tree
+from alphalineage.core.extensions import InvalidOperator, expand_all
+from alphalineage.core.fitness import forward_returns, score_trees
 from alphalineage.core.generate import GenerationError, RandomTreeGenerator, operator_allowed
 from alphalineage.core.panel import Panel
 from alphalineage.core.primitives import OPERANDS, OPERATORS, Kind
@@ -30,6 +32,34 @@ from alphalineage.core.types import DType, is_subtype
 
 Path_ = str | Path
 Position = tuple[tuple[int, ...], DType, Node]
+
+# Hard ceilings keep malformed API/config input from creating an effectively unbounded local job.
+# The defaults (200 x 25, depth 6, 40 nodes) remain far below these desktop-oriented limits.
+MAX_POPULATION_SIZE = 5_000
+MAX_GENERATIONS = 1_000
+MAX_SEARCH_EVALUATIONS = 1_000_000
+MAX_TREE_DEPTH = 32
+MAX_TREE_NODES = 2_000
+MAX_MIN_NAMES = 10_000
+MAX_HORIZON = 252
+MAX_TIME_BUDGET_S = 7 * 24 * 60 * 60
+MAX_TRAINING_WORKERS = 32
+
+# Checkpoints carry the scorer version separately from the scientific GP configuration.  A
+# worker-count change never invalidates a checkpoint, while an algorithm change does: continuing
+# an older checkpoint first re-scores its current population so one run cannot mix score kernels.
+SCORER_VERSION = 4
+
+
+def active_scorer_backend(method: str) -> str:
+    """Return the numerical kernel identity persisted beside ``SCORER_VERSION``."""
+    from alphalineage.core import cpp
+
+    return "native_spearman" if cpp.supports_native_scoring(method) else "python"
+
+
+class TrainingCancelled(RuntimeError):
+    """Raised when cancellation arrives before an initial population can be committed."""
 
 
 @dataclass
@@ -53,13 +83,114 @@ class GPConfig:
     # Operator categories the GP may draw from. ``None`` => the default pool (condition excluded).
     enabled_categories: list[str] | None = None
 
+    def __post_init__(self) -> None:
+        positive_ints = (
+            "population_size",
+            "generations",
+            "tournament_size",
+            "max_depth",
+            "max_nodes",
+            "min_names",
+            "horizon",
+            "min_depth",
+        )
+        for name in positive_ints:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+        upper_bounds = {
+            "population_size": MAX_POPULATION_SIZE,
+            "generations": MAX_GENERATIONS,
+            "max_depth": MAX_TREE_DEPTH,
+            "max_nodes": MAX_TREE_NODES,
+            "min_names": MAX_MIN_NAMES,
+            "horizon": MAX_HORIZON,
+            "min_depth": MAX_TREE_DEPTH,
+        }
+        for name, upper in upper_bounds.items():
+            value = getattr(self, name)
+            if value > upper:
+                raise ValueError(f"{name} must be at most {upper}, got {value!r}")
+        if self.population_size * self.generations > MAX_SEARCH_EVALUATIONS:
+            raise ValueError(
+                "population_size * generations must not exceed "
+                f"{MAX_SEARCH_EVALUATIONS:,} evaluations"
+            )
+
+        if isinstance(self.elitism, bool) or not isinstance(self.elitism, int):
+            raise ValueError(f"elitism must be an integer, got {self.elitism!r}")
+        if not 0 <= self.elitism < self.population_size:
+            raise ValueError("elitism must be in [0, population_size)")
+        if self.tournament_size > self.population_size:
+            raise ValueError("tournament_size must not exceed population_size")
+        if self.min_depth > self.max_depth:
+            raise ValueError("min_depth must not exceed max_depth")
+        if self.max_nodes < self.min_depth:
+            raise ValueError("max_nodes must be at least min_depth")
+
+        for name in ("crossover_rate", "subtree_mutation_rate", "point_mutation_rate"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise ValueError(f"{name} must be a finite number in [0, 1], got {value!r}")
+
+        if (
+            isinstance(self.parsimony, bool)
+            or not isinstance(self.parsimony, (int, float))
+            or not math.isfinite(float(self.parsimony))
+            or self.parsimony < 0
+        ):
+            raise ValueError(
+                f"parsimony must be a finite non-negative number, got {self.parsimony!r}"
+            )
+        if self.ic_method not in {"pearson", "spearman"}:
+            raise ValueError("ic_method must be 'pearson' or 'spearman'")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise ValueError(f"seed must be an integer, got {self.seed!r}")
+        if not -(2**63) <= self.seed < 2**63:
+            raise ValueError("seed must fit in a signed 64-bit integer")
+        if self.time_budget_s is not None and (
+            isinstance(self.time_budget_s, bool)
+            or not isinstance(self.time_budget_s, (int, float))
+            or not math.isfinite(float(self.time_budget_s))
+            or self.time_budget_s < 0
+        ):
+            raise ValueError(
+                f"time_budget_s must be a finite non-negative number or None, "
+                f"got {self.time_budget_s!r}"
+            )
+        if self.time_budget_s is not None and self.time_budget_s > MAX_TIME_BUDGET_S:
+            raise ValueError(f"time_budget_s must be at most {MAX_TIME_BUDGET_S}")
+        if self.enabled_categories is not None:
+            if not isinstance(self.enabled_categories, list) or any(
+                not isinstance(category, str) or not category.strip()
+                for category in self.enabled_categories
+            ):
+                raise ValueError("enabled_categories must be a list of non-empty strings or None")
+            if len(self.enabled_categories) > 64 or any(
+                len(category) > 64 for category in self.enabled_categories
+            ):
+                raise ValueError("enabled_categories may contain at most 64 names of 64 characters")
+            if len(set(self.enabled_categories)) != len(self.enabled_categories):
+                raise ValueError("enabled_categories must not contain duplicates")
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GPConfig:
+        if not isinstance(data, dict):
+            raise ValueError("GP config must be an object")
         names = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in names})
+        unknown = sorted(set(data) - names)
+        if unknown:
+            raise ValueError(f"unknown GP config field(s): {', '.join(unknown)}")
+        return cls(**data)
 
 
 @dataclass
@@ -107,10 +238,9 @@ def validate_seed(
         raise ValueError(
             f"seed root must produce {root_type.name}, got {tree.out_type.name} ({tree.name!r})"
         )
-    if tree.depth() > max_depth:
-        raise ValueError(f"seed depth {tree.depth()} exceeds max_depth {max_depth}")
-    if tree.size() > max_nodes:
-        raise ValueError(f"seed size {tree.size()} exceeds max_nodes {max_nodes}")
+    # Limits apply after formula expansion. Otherwise a one-node saved formula could smuggle an
+    # arbitrarily deep/large built-in expression into a tightly bounded GP run.
+    expand_all(tree, max_depth=max_depth, max_nodes=max_nodes)
     return tree
 
 
@@ -126,7 +256,21 @@ class GP:
         root_type: DType = DType.SIGNAL,
         recorder: Any | None = None,
         allowed_operators: set[str] | None = None,
+        workers: int = 1,
+        memory_budget_bytes: int | None = None,
     ) -> None:
+        if (
+            isinstance(workers, bool)
+            or not isinstance(workers, int)
+            or not 1 <= workers <= MAX_TRAINING_WORKERS
+        ):
+            raise ValueError(f"workers must be an integer in [1, {MAX_TRAINING_WORKERS}]")
+        if memory_budget_bytes is not None and (
+            isinstance(memory_budget_bytes, bool)
+            or not isinstance(memory_budget_bytes, int)
+            or memory_budget_bytes <= 0
+        ):
+            raise ValueError("memory_budget_bytes must be a positive integer or None")
         self.config = config
         self.panel = panel
         self.fwd = fwd if fwd is not None else forward_returns(panel, config.horizon)
@@ -135,6 +279,9 @@ class GP:
         self.recorder = recorder
         # Operator name allow-set (None => default pool, condition category excluded).
         self.allowed_operators = allowed_operators
+        self.workers = workers
+        self.memory_budget_bytes = memory_budget_bytes
+        self.scorer_backend = active_scorer_backend(config.ic_method)
         self.rng = random.Random(config.seed)
         self.generator = RandomTreeGenerator(
             self.rng,
@@ -150,6 +297,8 @@ class GP:
         # Trials counted before this object's cache existed (resumes, invalidated caches).
         # Monotone by construction: it only ever grows, so deflation never softens.
         self._prior_trials = 0
+        self._requires_rescore = False
+        self.termination_reason = "completed"
 
     @property
     def trial_count(self) -> int:
@@ -162,20 +311,96 @@ class GP:
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        result = score_tree(
-            tree,
+        self._ensure_scorer_backend()
+        result = score_trees(
+            [tree],
             self.panel,
             self.fwd,
             method=self.config.ic_method,
             parsimony=self.config.parsimony,
             min_names=self.config.min_names,
-        )
+            workers=1,
+            memory_budget_bytes=self.memory_budget_bytes,
+        )[0]
         self._cache[key] = result
         return result
 
     def _individual(self, tree: Node) -> Individual:
         fitness, metrics = self._score(tree)
         return Individual(tree, fitness, metrics)
+
+    def _notify_scoring(self, phase: str, done: int, total: int, started: float) -> None:
+        callback = getattr(self.recorder, "on_scoring", None)
+        if callback is not None:
+            elapsed = max(time.monotonic() - started, 1e-9)
+            callback(
+                phase=phase,
+                generation=self.generation,
+                done=done,
+                total=total,
+                factors_per_second=done / elapsed,
+            )
+
+    def _individuals(
+        self,
+        trees: Sequence[Node],
+        *,
+        phase: str,
+        stop: Callable[[], bool] | None = None,
+    ) -> list[Individual]:
+        """Score ``trees`` as one deterministic transaction.
+
+        Cache hits and duplicates retain input order.  Unique misses are evaluated in bounded
+        chunks, but only committed to the coordinator-owned cache after every chunk succeeds.
+        Thus cancellation cannot leave a half-generation counted as searched.
+        """
+        keys = [to_json(tree) for tree in trees]
+        missing: dict[str, Node] = {}
+        for key, tree in zip(keys, trees, strict=True):
+            if key not in self._cache and key not in missing:
+                missing[key] = tree
+
+        pending = list(missing.items())
+        if pending:
+            self._ensure_scorer_backend()
+        staged: dict[str, tuple[float, dict[str, float]]] = {}
+        started = time.monotonic()
+        total = len(pending)
+        self._notify_scoring(phase, 0, total, started)
+        # More than two waves gives cancellation/progress useful granularity while keeping native
+        # call overhead negligible on the small default population.
+        chunk_size = max(1, min(64, self.workers * 2))
+        for offset in range(0, total, chunk_size):
+            if stop is not None and stop():
+                raise TrainingCancelled("training cancelled before scoring completed")
+            chunk = pending[offset : offset + chunk_size]
+            scored = score_trees(
+                [tree for _, tree in chunk],
+                self.panel,
+                self.fwd,
+                method=self.config.ic_method,
+                parsimony=self.config.parsimony,
+                min_names=self.config.min_names,
+                workers=min(self.workers, len(chunk)),
+                memory_budget_bytes=self.memory_budget_bytes,
+            )
+            for (key, _), result in zip(chunk, scored, strict=True):
+                staged[key] = result
+            self._notify_scoring(phase, min(offset + len(chunk), total), total, started)
+            if stop is not None and stop():
+                raise TrainingCancelled("training cancelled before scoring completed")
+
+        self._cache.update(staged)
+        return [Individual(tree, *self._cache[key]) for tree, key in zip(trees, keys, strict=True)]
+
+    def _ensure_scorer_backend(self) -> None:
+        """Refuse a mid-run evaluator switch instead of mixing numerical kernels."""
+        current = active_scorer_backend(self.config.ic_method)
+        if current != self.scorer_backend:
+            raise RuntimeError(
+                "training evaluator changed during the run; restart or continue from the last "
+                "checkpoint so the population can be rescored consistently"
+            )
 
     # --- selection & variation ---------------------------------------------------
     def _tournament(self) -> tuple[Individual, int]:
@@ -184,6 +409,17 @@ class GP:
         idxs = [self.rng.choice(range(n)) for _ in range(self.config.tournament_size)]
         best = max(idxs, key=lambda i: self.population[i].fitness)
         return self.population[best], best
+
+    def _fits_complexity(self, tree: Node) -> bool:
+        try:
+            expand_all(
+                tree,
+                max_depth=self.config.max_depth,
+                max_nodes=self.config.max_nodes,
+            )
+        except InvalidOperator:
+            return False
+        return True
 
     def _crossover(self, a: Node, b: Node) -> Node:
         path, required, _ = self.rng.choice(iter_positions(a, self.root_type))
@@ -196,7 +432,7 @@ class GP:
             return a
         for _ in range(8):
             child = replace_at(a, path, self.rng.choice(donors))
-            if child.depth() <= self.config.max_depth and child.size() <= self.config.max_nodes:
+            if self._fits_complexity(child):
                 return child
         return a
 
@@ -212,17 +448,20 @@ class GP:
             )
         except GenerationError:  # budget too small to close this typed hole; leave the tree as-is
             return tree
-        return replace_at(tree, path, fresh)
+        candidate = replace_at(tree, path, fresh)
+        return candidate if self._fits_complexity(candidate) else tree
 
     def _point_mutation(self, tree: Node) -> Node:
         path, _, node = self.rng.choice(iter_positions(tree, self.root_type))
         prim = node.primitive
         if prim.kind is Kind.EPHEMERAL:
             assert prim.sampler is not None
-            return replace_at(tree, path, Node(node.name, value=prim.sampler(self.rng)))
+            candidate = replace_at(tree, path, Node(node.name, value=prim.sampler(self.rng)))
+            return candidate if self._fits_complexity(candidate) else tree
         if prim.kind is Kind.OPERAND:
             others = [p.name for p in OPERANDS.values() if p.name != node.name]
-            return replace_at(tree, path, Node(self.rng.choice(others)))
+            candidate = replace_at(tree, path, Node(self.rng.choice(others)))
+            return candidate if self._fits_complexity(candidate) else tree
         # operator -> a different operator with an identical signature (children stay valid)
         same = [
             p
@@ -234,7 +473,12 @@ class GP:
         ]
         if not same:
             return tree
-        return replace_at(tree, path, Node(self.rng.choice(same).name, node.children, node.value))
+        candidate = replace_at(
+            tree,
+            path,
+            Node(self.rng.choice(same).name, node.children, node.value),
+        )
+        return candidate if self._fits_complexity(candidate) else tree
 
     def _offspring(self) -> tuple[Node, list[int], str]:
         ops: list[str] = []
@@ -276,18 +520,53 @@ class GP:
             root_type=self.root_type,
         )
 
-    def initialize(self, seeds: Sequence[Node] = ()) -> None:
+    def initialize(
+        self,
+        seeds: Sequence[Node] = (),
+        *,
+        stop: Callable[[], bool] | None = None,
+    ) -> None:
+        rng_state = self.rng.getstate()
         seed_trees = [self._validate_seed(s) for s in seeds]
         if len(seed_trees) > self.config.population_size:
             raise ValueError(
                 f"{len(seed_trees)} seeds exceed population_size {self.config.population_size}"
             )
-        trees = seed_trees + self.generator.ramped_half_and_half(
-            self.config.population_size - len(seed_trees),
+        generated_count = self.config.population_size - len(seed_trees)
+        generated = self.generator.ramped_half_and_half(
+            generated_count,
             min_depth=self.config.min_depth,
             max_depth=self.config.max_depth,
         )
-        self.population = [self._individual(t) for t in trees]
+        generated = [tree for tree in generated if self._fits_complexity(tree)]
+        attempts = 0
+        attempt_limit = max(1_000, generated_count * 200)
+        depths = list(range(self.config.min_depth, self.config.max_depth + 1)) or [
+            self.config.max_depth
+        ]
+        while len(generated) < generated_count and attempts < attempt_limit:
+            if stop is not None and stop():
+                self.rng.setstate(rng_state)
+                raise TrainingCancelled("training cancelled during initialization")
+            candidate = self.generator.generate(
+                grow=(attempts % 2 == 0),
+                max_depth=depths[attempts % len(depths)],
+            )
+            attempts += 1
+            if self._fits_complexity(candidate):
+                generated.append(candidate)
+        if len(generated) < generated_count:
+            self.rng.setstate(rng_state)
+            raise GenerationError(
+                "could not generate a population within the expanded formula complexity limits"
+            )
+        trees = [*seed_trees, *generated]
+        try:
+            population = self._individuals(trees, phase="initializing", stop=stop)
+        except TrainingCancelled:
+            self.rng.setstate(rng_state)
+            raise
+        self.population = population
         self.generation = 0
         if self.recorder is not None:
             ops = ["seed"] * len(seed_trees) + ["init"] * (len(trees) - len(seed_trees))
@@ -298,7 +577,8 @@ class GP:
             )
         self._record()
 
-    def _step(self) -> None:
+    def _step(self, *, stop: Callable[[], bool] | None = None) -> None:
+        rng_state = self.rng.getstate()
         n = len(self.population)
         order = sorted(range(n), key=lambda i: self.population[i].fitness, reverse=True)
         entries: list[tuple[Node, list[int], str, float]] = []
@@ -307,9 +587,21 @@ class GP:
             elite = self.population[i]
             next_pop.append(elite)
             entries.append((elite.tree, [i], "elite", elite.fitness))
-        while len(next_pop) < self.config.population_size:
+        offspring: list[tuple[Node, list[int], str]] = []
+        while len(next_pop) + len(offspring) < self.config.population_size:
             tree, parents, op = self._offspring()
-            child = self._individual(tree)
+            offspring.append((tree, parents, op))
+
+        # Variation uses the RNG serially above.  Only pure scoring is parallel, and none of the
+        # staged state below becomes visible until the full generation has completed.
+        try:
+            children = self._individuals(
+                [tree for tree, _, _ in offspring], phase="training", stop=stop
+            )
+        except TrainingCancelled:
+            self.rng.setstate(rng_state)
+            raise
+        for (tree, parents, op), child in zip(offspring, children, strict=True):
             next_pop.append(child)
             entries.append((tree, parents, op, child.fitness))
         self.population = next_pop
@@ -327,23 +619,74 @@ class GP:
         stop: Callable[[], bool] | None = None,
     ) -> Individual:
         target = generations if generations is not None else self.config.generations
+        self.termination_reason = "completed"
+        if self._requires_rescore and self.population:
+            self._rescore_after_scorer_upgrade(stop=stop)
         if not self.population:
-            self.initialize(seeds)
+            try:
+                self.initialize(seeds, stop=stop)
+            except TrainingCancelled:
+                self.termination_reason = "user_stopped"
+                raise
             if checkpoint_path is not None:
                 self.save_checkpoint(checkpoint_path)
         start = time.monotonic()
-        while self.generation < target:
+
+        def should_stop() -> bool:
             if stop is not None and stop():
-                break
-            self._step()
-            if checkpoint_path is not None:
-                self.save_checkpoint(checkpoint_path)
+                self.termination_reason = "user_stopped"
+                return True
             if (
                 self.config.time_budget_s is not None
                 and time.monotonic() - start >= self.config.time_budget_s
             ):
+                self.termination_reason = "time_budget"
+                return True
+            return False
+
+        while self.generation < target:
+            if should_stop():
+                break
+            try:
+                self._step(stop=should_stop)
+            except TrainingCancelled:
+                # The staged generation and its score-cache additions were not committed.
+                break
+            if checkpoint_path is not None:
+                self.save_checkpoint(checkpoint_path)
+            if should_stop():
                 break
         return self.best()
+
+    def _rescore_after_scorer_upgrade(
+        self, *, stop: Callable[[], bool] | None = None
+    ) -> None:
+        """Re-score a legacy checkpoint once without inflating its historical trial count."""
+        previous_trials = self.trial_count
+        old_cache, old_prior = self._cache, self._prior_trials
+        self._cache = {}
+        self._prior_trials = 0
+        try:
+            population = self._individuals(
+                [self._validate_seed(individual.tree) for individual in self.population],
+                phase="initializing",
+                stop=stop,
+            )
+        except Exception:
+            self._cache, self._prior_trials = old_cache, old_prior
+            raise
+        self.population = population
+        self._prior_trials = max(0, previous_trials - len(self._cache))
+        self._requires_rescore = False
+        if self.history and int(self.history[-1].get("generation", -1)) == self.generation:
+            fits = [individual.fitness for individual in self.population]
+            best = max(self.population, key=lambda individual: individual.fitness)
+            self.history[-1] = {
+                "generation": self.generation,
+                "best_fitness": float(best.fitness),
+                "mean_fitness": float(sum(fits) / len(fits)),
+                "best_ic": float(best.metrics.get("ic", 0.0)),
+            }
 
     def rescore_population(self, fwd: pd.DataFrame | None = None) -> None:
         """Re-score the current population against the current panel/config.
@@ -355,7 +698,10 @@ class GP:
         self._prior_trials += len(self._cache)
         self._cache.clear()
         self.fwd = fwd if fwd is not None else forward_returns(self.panel, self.config.horizon)
-        self.population = [self._individual(ind.tree) for ind in self.population]
+        self.population = self._individuals(
+            [self._validate_seed(individual.tree) for individual in self.population],
+            phase="initializing",
+        )
 
     def best(self, *, simplified: bool = True) -> Individual:
         top = max(self.population, key=lambda ind: ind.fitness)
@@ -367,6 +713,8 @@ class GP:
     def save_checkpoint(self, path: Path_) -> None:
         version, internal, gauss = self.rng.getstate()
         state = {
+            "scorer_version": SCORER_VERSION,
+            "scorer_backend": self.scorer_backend,
             "generation": self.generation,
             "rng_state": [version, list(internal), gauss],
             "config": self.config.to_dict(),
@@ -388,6 +736,8 @@ class GP:
         *,
         recorder: Any | None = None,
         allowed_operators: set[str] | None = None,
+        workers: int = 1,
+        memory_budget_bytes: int | None = None,
     ) -> GP:
         state = json.loads(Path(path).read_text(encoding="utf-8"))
         gp = cls(
@@ -396,8 +746,9 @@ class GP:
             fwd,
             recorder=recorder,
             allowed_operators=allowed_operators,
+            workers=workers,
+            memory_budget_bytes=memory_budget_bytes,
         )
-        gp._prior_trials = int(state.get("trials", 0))
         version, internal, gauss = state["rng_state"]
         gp.rng.setstate((version, tuple(internal), gauss))
         gp.generation = int(state["generation"])
@@ -406,4 +757,18 @@ class GP:
             Individual(from_dict(p["tree"]), float(p["fitness"]), dict(p["metrics"]))
             for p in state["population"]
         ]
+        saved_trials = int(state.get("trials", 0))
+        saved_scorer = int(state.get("scorer_version", 1))
+        saved_backend = state.get("scorer_backend")
+        if saved_scorer == SCORER_VERSION and saved_backend == gp.scorer_backend:
+            # Restore the current population into the memoization cache.  Older code retained
+            # their scores on Individuals but threw away these free resume-time cache hits.
+            for individual in gp.population:
+                gp._cache.setdefault(
+                    to_json(individual.tree), (individual.fitness, individual.metrics)
+                )
+            gp._prior_trials = max(0, saved_trials - len(gp._cache))
+        else:
+            gp._prior_trials = saved_trials
+            gp._requires_rescore = True
         return gp

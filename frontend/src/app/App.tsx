@@ -35,6 +35,7 @@ import { ErrorBoundary } from "./ErrorBoundary";
 import { getAppMode } from "./mode";
 import {
   makeWorkspaceSnapshot,
+  migrateFormulaDrafts,
   readLocalWorkspace,
   writeLocalWorkspace,
 } from "./workspace";
@@ -69,7 +70,10 @@ export function App() {
     initialWorkspace?.operatorDraft,
   );
   const [formulaDraft, setFormulaDraft] = useState<FormulaDraft | undefined>(
-    initialWorkspace?.formulaDraft,
+    () => migrateFormulaDrafts(initialWorkspace?.formulaDraft).active,
+  );
+  const [recoveredFormulaDrafts, setRecoveredFormulaDrafts] = useState(
+    () => migrateFormulaDrafts(initialWorkspace?.formulaDraft).recoveries,
   );
   const [seedIds, setSeedIds] = useState<string[]>([]);
   const [searchRunning, setSearchRunning] = useState(false);
@@ -89,6 +93,7 @@ export function App() {
         run,
         universeDraft,
         formulaDraft,
+        recoveredFormulaDrafts,
         operatorDraft,
         ui: {
           selectedTab: tab,
@@ -99,7 +104,16 @@ export function App() {
           sessionId: run?.session_id ?? null,
         },
       }),
-    [formulaDraft, operatorDraft, run, selectedLineage, selectedNode, tab, universeDraft],
+    [
+      formulaDraft,
+      operatorDraft,
+      recoveredFormulaDrafts,
+      run,
+      selectedLineage,
+      selectedNode,
+      tab,
+      universeDraft,
+    ],
   );
 
   const applyWorkspace = useCallback((snapshot: WorkspaceSnapshot) => {
@@ -108,7 +122,9 @@ export function App() {
     setSelectedNode(applyNode(snapshot.ui.selectedFactorNode));
     setSelectedLineage(snapshot.ui.selectedLineage ?? null);
     setUniverseDraft(snapshot.universeDraft);
-    setFormulaDraft(snapshot.formulaDraft);
+    const migratedDrafts = migrateFormulaDrafts(snapshot.formulaDraft);
+    setFormulaDraft(migratedDrafts.active);
+    setRecoveredFormulaDrafts(migratedDrafts.recoveries);
     setOperatorDraft(snapshot.operatorDraft);
     setStatus(`Loaded ${snapshot.name}`);
   }, []);
@@ -151,7 +167,7 @@ export function App() {
       }
     }
     setRun(full);
-    setBestFactorSaved(false); // a fresh best factor is not yet in the library
+    setBestFactorSaved(false); // a fresh best formula result is not yet in the library
     setTab("dashboard");
     setStatus("Run completed - showing out-of-sample metrics");
   }
@@ -192,7 +208,19 @@ export function App() {
   function startSeededSession(ids: string[]) {
     setSeedIds(ids);
     setTab("train");
-    setStatus(`Seeding a new session from ${ids.length} factor(s)`);
+    setStatus(`Seeding a new session from ${ids.length} Formula Result(s)`);
+  }
+
+  function recoverFormulaDraft(index: number) {
+    const recovered = recoveredFormulaDrafts[index];
+    if (!recovered) return;
+    const remaining = recoveredFormulaDrafts.filter((_, entryIndex) => entryIndex !== index);
+    if (formulaDraft) {
+      remaining.push({ label: "Previous active Formula Builder draft", draft: formulaDraft });
+    }
+    setFormulaDraft(recovered.draft);
+    setRecoveredFormulaDrafts(remaining);
+    setStatus(`Opened ${recovered.label}; the previous draft remains recoverable`);
   }
 
   async function openUniverseEditor(universeName: string) {
@@ -234,7 +262,7 @@ export function App() {
     if (!run) return;
     try {
       await saveFactor({
-        name: "best factor",
+        name: "best formula result",
         tree: parseFactor(run.best_factor),
         metrics: { oos_ic: run.report.oos_ic, deflated_sharpe: run.report.deflated_sharpe },
         provenance: {
@@ -244,7 +272,7 @@ export function App() {
         },
       });
       setBestFactorSaved(true);
-      setStatus("Saved best factor to library");
+      setStatus("Saved Best Formula Result to the library");
     } catch (e) {
       setStatus(String(e));
     }
@@ -305,7 +333,9 @@ export function App() {
 
   const quitWarnings: string[] = [];
   if (searchRunning) quitWarnings.push("A search is still running.");
-  if (run && !bestFactorSaved) quitWarnings.push("The best factor isn't saved to your library.");
+  if (run && !bestFactorSaved) {
+    quitWarnings.push("The Best Formula Result isn't saved to your library.");
+  }
 
   return (
     <AppShell
@@ -331,8 +361,8 @@ export function App() {
             <span className="view-tag__mark" aria-hidden="true" />
             <span>AlphaLineage</span>
           </div>
-          <h1>Honest factor evolution</h1>
-          <p>Trace each generated alpha from metrics to tree structure to genetic lineage.</p>
+          <h1>Honest formula evolution</h1>
+          <p>Trace each generated formula from metrics to tree structure to genetic lineage.</p>
           <div className="view-rule" aria-hidden="true" />
         </header>
 
@@ -342,10 +372,6 @@ export function App() {
         <ErrorBoundary key={tab}>
         {tab === "train" && (
           <section className="view-card" data-view="train">
-            <div className="view-rail">
-              <span>00</span>
-              <span />
-            </div>
             <div className="view-body">
               <TrainPanel
                 seedIds={seedIds}
@@ -354,6 +380,10 @@ export function App() {
                 onRunningChange={onRunningChange}
                 onOpenDashboard={() => setTab("dashboard")}
                 onOpenUniverseEditor={openUniverseEditor}
+                onOpenDataSync={() => {
+                  setExtendPage("sync");
+                  setTab("extend");
+                }}
                 onOpenFormulaEditor={() => {
                   setExtendPage("formula");
                   setTab("extend");
@@ -365,10 +395,6 @@ export function App() {
 
         {run && tab === "dashboard" && (
           <section className="view-card" data-view="dashboard">
-            <div className="view-rail">
-              <span>01</span>
-              <span />
-            </div>
             <div className="view-body">
               <Dashboard report={run.report} history={run.history} extra={run} />
             </div>
@@ -377,10 +403,6 @@ export function App() {
 
         {run && factor && tab === "factor" && (
           <section className="view-card" data-view="factor">
-            <div className="view-rail">
-              <span>02</span>
-              <span />
-            </div>
             <div className="view-body split">
               <FactorTree factor={factor} onSelect={setSelectedNode} />
               <div>
@@ -392,7 +414,7 @@ export function App() {
                     data-testid="save-best-factor"
                     onClick={saveBestFactor}
                   >
-                    Save best factor to library
+                    Save Best Formula Result to library
                   </button>
                 )}
               </div>
@@ -402,10 +424,6 @@ export function App() {
 
         {run && tab === "genealogy" && (
           <section className="view-card" data-view="genealogy">
-            <div className="view-rail">
-              <span>03</span>
-              <span />
-            </div>
             <div className="view-body split">
               <Genealogy lineage={run.lineage} onSelect={setSelectedLineage} />
               <LineageDetail
@@ -420,10 +438,6 @@ export function App() {
 
         {tab === "library" && (
           <section className="view-card" data-view="library">
-            <div className="view-rail">
-              <span>05</span>
-              <span />
-            </div>
             <div className="view-body">
               <LibraryPanel onSeed={startSeededSession} />
             </div>
@@ -432,10 +446,6 @@ export function App() {
 
         {tab === "extend" && (
           <section className="view-card" data-view="extend">
-            <div className="view-rail">
-              <span>04</span>
-              <span />
-            </div>
             <div className="view-body">
               <ExtendPanel
                 page={extendPage}
@@ -443,6 +453,9 @@ export function App() {
                 onUniverseDraftChange={setUniverseDraft}
                 formulaDraft={formulaDraft}
                 onFormulaDraftChange={setFormulaDraft}
+                recoveredFormulaDrafts={recoveredFormulaDrafts}
+                onRecoverFormulaDraft={recoverFormulaDraft}
+                onOpenDataSync={() => setExtendPage("sync")}
                 canSubmit={mode === "app"}
                 onDataPullProgressChange={setDataPullProgress}
               />
@@ -472,7 +485,7 @@ export function App() {
                     data-testid="quit-save-factor"
                     onClick={saveBestFactor}
                   >
-                    Save best factor
+                    Save Best Formula Result
                   </button>
                 )}
                 {searchRunning && (

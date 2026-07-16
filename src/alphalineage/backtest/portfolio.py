@@ -19,7 +19,8 @@ import pandas as pd
 class WeightingScheme(Protocol):
     """Maps a factor (date x symbol) to portfolio weights (date x symbol)."""
 
-    name: str
+    @property
+    def name(self) -> str: ...
 
     def weights(self, factor: pd.DataFrame) -> pd.DataFrame: ...
 

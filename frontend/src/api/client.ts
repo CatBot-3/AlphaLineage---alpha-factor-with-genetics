@@ -9,7 +9,10 @@ import type {
   FormulaSpec,
   FormulaDetail,
   FormulaImpact,
+  FormulaResult,
   FormulaValidation,
+  FormulaTestJob,
+  FormulaTestRequest,
   Lineage,
   MembershipSyncJob,
   MembershipSyncRequest,
@@ -25,7 +28,10 @@ import type {
   SettingsUpdate,
   SymbolCandidate,
   SymbolValidation,
+  TrainingCapabilities,
   UniverseInfo,
+  UniverseCacheCoverage,
+  UniversePreset,
   UniverseSpec,
   WorkspaceSnapshot,
   WorkspaceSummary,
@@ -102,6 +108,10 @@ export async function fetchRun(
   for (let i = 0; i < 600; i++) {
     const status = await getRun(jobId);
     if (status.status === "done" && status.result) return status.result;
+    if (status.status === "stopped") {
+      if (status.result) return status.result;
+      throw new Error("run stopped before a report was completed");
+    }
     if (status.status === "failed") throw new Error(status.error ?? "run failed");
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
@@ -213,14 +223,47 @@ export async function defineUniverse(
   return (await res.json()) as { name: string; symbols: string[] };
 }
 
-export async function listUniverses(): Promise<UniverseInfo[]> {
-  const res = await fetch(`${BASE}/universes`);
+function normalizeUniverseInfo(item: Partial<UniverseInfo> & { name: string }): UniverseInfo {
+  return {
+    ...item,
+    name: item.name,
+    memberships: item.memberships ?? [],
+    symbols: item.symbols ?? [],
+    source: item.source ?? "custom",
+  };
+}
+
+export async function listUniverses(options: { summary?: boolean } = {}): Promise<UniverseInfo[]> {
+  const suffix = options.summary ? "?view=summary" : "";
+  const res = await fetch(`${BASE}/universes${suffix}`);
   if (!res.ok) throw new Error(`universes failed: ${res.status}`);
-  return (await res.json()) as UniverseInfo[];
+  const items = (await res.json()) as Array<Partial<UniverseInfo> & { name: string }>;
+  return items.map(normalizeUniverseInfo);
+}
+
+export async function listUniversePresets(): Promise<UniversePreset[]> {
+  return jsonOrThrow(await fetch(`${BASE}/universe-presets`), "list universe presets");
 }
 
 export async function getUniverse(name: string): Promise<UniverseInfo> {
-  return jsonOrThrow(await fetch(`${BASE}/universes/${encodeURIComponent(name)}`), "load universe");
+  const item = await jsonOrThrow<Partial<UniverseInfo> & { name: string }>(
+    await fetch(`${BASE}/universes/${encodeURIComponent(name)}`),
+    "load universe",
+  );
+  return normalizeUniverseInfo(item);
+}
+
+export async function getUniverseCoverage(
+  name: string,
+  asOf?: string,
+): Promise<UniverseCacheCoverage & { name: string }> {
+  const params = new URLSearchParams();
+  if (asOf) params.set("as_of", asOf);
+  const suffix = params.size ? `?${params}` : "";
+  return jsonOrThrow(
+    await fetch(`${BASE}/universes/${encodeURIComponent(name)}/coverage${suffix}`),
+    "load universe price readiness",
+  );
 }
 
 export async function updateUniverse(
@@ -271,6 +314,20 @@ export async function startDataSync(req: DataSyncRequest): Promise<{ job_id: str
 
 export async function getDataSync(jobId: string): Promise<DataSyncJob> {
   return jsonOrThrow(await fetch(`${BASE}/data/sync/${encodeURIComponent(jobId)}`), "load sync job");
+}
+
+export async function listDataSyncs(
+  options: { activeOnly?: boolean } = {},
+): Promise<DataSyncJob[]> {
+  const suffix = options.activeOnly ? "?active_only=true" : "";
+  return jsonOrThrow(await fetch(`${BASE}/data/sync${suffix}`), "list sync jobs");
+}
+
+export async function stopDataSync(jobId: string): Promise<{ stopping: boolean }> {
+  return jsonOrThrow(
+    await POST(`/data/sync/${encodeURIComponent(jobId)}/stop`, {}),
+    "stop sync job",
+  );
 }
 
 export async function startMembershipSync(
@@ -349,6 +406,10 @@ export async function stopSession(sessionId: string): Promise<{ stopping: boolea
   return jsonOrThrow(await POST(`/sessions/${encodeURIComponent(sessionId)}/stop`, {}), "stop session");
 }
 
+export async function getTrainingCapabilities(): Promise<TrainingCapabilities> {
+  return jsonOrThrow(await fetch(`${BASE}/training/capabilities`), "load training capabilities");
+}
+
 // --- saved factors (A3) --------------------------------------------------------
 export async function listFactors(): Promise<SavedFactor[]> {
   return jsonOrThrow(await fetch(`${BASE}/factors`), "list factors");
@@ -376,6 +437,76 @@ export async function renameFactor(id: string, name: string): Promise<SavedFacto
     body: JSON.stringify({ name }),
   });
   return jsonOrThrow(res, "rename factor");
+}
+
+// --- formula tests and canonical results --------------------------------------
+export async function startFormulaTest(payload: FormulaTestRequest): Promise<FormulaTestJob> {
+  return jsonOrThrow(await POST("/formula-tests", payload), "start formula backtest");
+}
+
+export async function listFormulaTests(): Promise<FormulaTestJob[]> {
+  return jsonOrThrow(await fetch(`${BASE}/formula-tests`), "list formula backtests");
+}
+
+export async function getFormulaTest(jobId: string): Promise<FormulaTestJob> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/formula-tests/${encodeURIComponent(jobId)}`),
+    "load formula backtest",
+  );
+}
+
+export async function stopFormulaTest(jobId: string): Promise<{ stopping: boolean }> {
+  return jsonOrThrow(
+    await POST(`/formula-tests/${encodeURIComponent(jobId)}/stop`, {}),
+    "stop formula backtest",
+  );
+}
+
+export async function clearFormulaTest(jobId: string): Promise<void> {
+  const res = await fetch(`${BASE}/formula-tests/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`clear formula backtest failed: ${res.status}`);
+}
+
+export async function keepFormulaTest(
+  jobId: string,
+  payload: { name: string; notes?: string },
+): Promise<FormulaResult> {
+  return jsonOrThrow(
+    await POST(`/formula-tests/${encodeURIComponent(jobId)}/keep`, payload),
+    "keep formula result",
+  );
+}
+
+export async function listFormulaResults(): Promise<FormulaResult[]> {
+  return jsonOrThrow(await fetch(`${BASE}/formula-results`), "list formula results");
+}
+
+export async function getFormulaResult(id: string): Promise<FormulaResult> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/formula-results/${encodeURIComponent(id)}`),
+    "load formula result",
+  );
+}
+
+export async function updateFormulaResult(
+  id: string,
+  patch: { name?: string; notes?: string },
+): Promise<FormulaResult> {
+  const res = await fetch(`${BASE}/formula-results/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  return jsonOrThrow(res, "update formula result");
+}
+
+export async function deleteFormulaResult(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/formula-results/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`delete formula result failed: ${res.status}`);
 }
 
 // --- settings ------------------------------------------------------------------

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "retrieved_at": "2026-07-15",
+  "snapshots": [
+    {
+      "id": "builtin-sp500-current",
+      "preset_id": "sp500",
+      "display_name": "S&P 500 constituent snapshot (2026-07-15)",
+      "benchmark": "S&P 500",
+      "snapshot_date": "2026-07-15",
+      "asset": "sp500.json",
+      "source_name": "Wikipedia: List of S&P 500 companies",
+      "source_url": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+      "attribution": "Wikipedia contributors",
+      "license": "CC BY-SA 4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "terms_url": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+      "source_symbol_count": 503,
+      "source_checksum": "261049063c2a533072e3833924a652250330996f023eb02344cce8beadd46cf1",
+      "aliases": ["s&p500", "s&p-500", "spx", "^gspc"],
+      "pit_import_name": "sp500",
+      "note": "Offline constituent snapshot. Applying this fixed set to earlier dates is survivorship-biased and is not point-in-time index history."
+    },
+    {
+      "id": "builtin-djia-current",
+      "preset_id": "djia",
+      "display_name": "Dow Jones Industrial Average constituent snapshot (2026-07-15)",
+      "benchmark": "DJIA",
+      "snapshot_date": "2026-07-15",
+      "asset": "djia.json",
+      "source_name": "Wikipedia: Dow Jones Industrial Average components",
+      "source_url": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+      "attribution": "Wikipedia contributors",
+      "license": "CC BY-SA 4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "terms_url": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+      "source_symbol_count": 30,
+      "source_checksum": "8be3d841488307e316c8228bd3ac052829feb4cd5b75a076048a810504f73ac8",
+      "aliases": ["dow30", "dow-jones", "^dji"],
+      "pit_import_name": "djia",
+      "note": "Offline constituent snapshot. Applying this fixed set to earlier dates is survivorship-biased and is not point-in-time index history."
+    },
+    {
+      "id": "builtin-nasdaq100-current",
+      "preset_id": "nasdaq100",
+      "display_name": "Nasdaq-100 constituent snapshot (2026-07-15)",
+      "benchmark": "Nasdaq-100",
+      "snapshot_date": "2026-07-15",
+      "asset": "nasdaq100.json",
+      "source_name": "Wikipedia: List of NASDAQ-100 companies",
+      "source_url": "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies",
+      "attribution": "Wikipedia contributors",
+      "license": "CC BY-SA 4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "terms_url": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+      "source_symbol_count": 103,
+      "source_checksum": "e7408c05729e9cc177f16b990464d7e3c2a66b640f01581140ab77f8a410b145",
+      "aliases": ["nasdaq-100", "ndx", "^ndx"],
+      "pit_import_name": "nasdaq100",
+      "note": "Offline constituent snapshot. Applying this fixed set to earlier dates is survivorship-biased and is not point-in-time index history."
+    }
+  ]
+}

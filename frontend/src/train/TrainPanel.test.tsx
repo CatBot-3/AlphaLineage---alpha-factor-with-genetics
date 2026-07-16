@@ -26,8 +26,58 @@ vi.mock("../api/client", () => ({
   getSession: (id: string) => getSession(id),
   stopSession: (id: string) => stopSession(id),
   listUniverses: () => Promise.resolve([]),
-  listFactors: () => Promise.resolve([]),
+  getUniverseCoverage: () =>
+    Promise.resolve({
+      as_of: "2026-07-15",
+      eligible_symbols: ["AAPL"],
+      cached_symbols: ["AAPL"],
+      missing_symbols: [],
+      incomplete_symbols: [],
+      complete: true,
+    }),
+  listFormulaResults: () => Promise.resolve([]),
   getPrimitives: () => Promise.resolve([]),
+  getTrainingCapabilities: () => Promise.resolve({
+    default_profile: "auto",
+    detected_cpus: 8,
+    worker_capacity: 7,
+    available_memory_bytes: 8_000_000_000,
+    memory_budget_bytes: 2_000_000_000,
+    cpu_budget_percent_min: 10,
+    cpu_budget_percent_max: 100,
+    evaluator: "auto",
+    cpp_available: true,
+    fallback_reason: null,
+    profiles: {
+      light: {
+        profile: "light",
+        percent: 25,
+        requested_workers: 2,
+        effective_workers: 2,
+        workers: 2,
+        worker_capacity: 7,
+        run_memory_budget_bytes: 571_428_570,
+      },
+      auto: {
+        profile: "auto",
+        percent: 50,
+        requested_workers: 4,
+        effective_workers: 4,
+        workers: 4,
+        worker_capacity: 7,
+        run_memory_budget_bytes: 1_142_857_140,
+      },
+      maximum: {
+        profile: "maximum",
+        percent: 100,
+        requested_workers: 7,
+        effective_workers: 7,
+        workers: 7,
+        worker_capacity: 7,
+        run_memory_budget_bytes: 2_000_000_000,
+      },
+    },
+  }),
 }));
 
 import { TrainPanel } from "./TrainPanel";
@@ -67,6 +117,8 @@ describe("TrainPanel (B2)", () => {
     const req = createSession.mock.calls[0][0] as SessionCreateRequest;
     expect(req.config?.population_size).toBe(80); // the form default, supplied explicitly
     expect(req.config?.generations).toBe(12);
+    expect(req.resources).toEqual({ profile: "auto", cpu_budget_percent: null });
+    expect(req.as_of).toMatch(/^\d{4}-\d{2}-\d{2}$/);
 
     await waitFor(() => expect(onComplete).toHaveBeenCalledWith(DONE_SESSION.result));
     expect(await screen.findByTestId("train-continue")).toBeInTheDocument();
@@ -96,6 +148,34 @@ describe("TrainPanel (B2)", () => {
     // instead of a dead error page, the notice + the form come back
     expect(await screen.findByTestId("train-notice")).toHaveTextContent(/no longer exists/i);
     expect(await screen.findByTestId("run-config-form")).toBeInTheDocument();
+  });
+
+  it("keeps a stopped pre-report session resumable without publishing it", async () => {
+    getSession.mockResolvedValue({
+      ...DONE_SESSION,
+      segments: [{ index: 0, status: "stopped", report_cancelled: true }],
+      job: {
+        id: "j1",
+        status: "stopped",
+        termination_reason: "user_stopped",
+        progress: {
+          generation: 1,
+          target_generations: 12,
+          history: [],
+          best: null,
+          phase: "stopped",
+        },
+      },
+      result: null,
+    });
+    const onComplete = vi.fn();
+
+    render(<TrainPanel restoreSessionId="s1" onComplete={onComplete} />);
+
+    expect(await screen.findByTestId("train-continue")).toBeInTheDocument();
+    expect(screen.getByTestId("report-cancelled-note")).toHaveTextContent(/checkpoint is saved/i);
+    expect(screen.queryByRole("button", { name: "Open dashboard" })).not.toBeInTheDocument();
+    expect(onComplete).not.toHaveBeenCalled();
   });
 
   it("lets the user start a new session from a finished one", async () => {

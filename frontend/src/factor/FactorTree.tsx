@@ -1,6 +1,6 @@
 // P6-T1: render a factor's expression tree with React Flow; clicking a node selects it.
 
-import { Background, Controls, ReactFlow } from "@xyflow/react";
+import { Background, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useMemo } from "react";
 import type { FactorNode } from "../api/types";
@@ -24,10 +24,12 @@ export function FactorTree({
         edges={edges}
         nodeTypes={nodeTypes}
         fitView
+        zoomOnScroll
+        zoomOnPinch
+        panOnDrag
         onNodeClick={(_, node) => onSelect?.(node.data as TreeNodeData)}
       >
         <Background />
-        <Controls />
       </ReactFlow>
     </div>
   );

@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 
 from alphalineage.data import paths, schema
+from alphalineage.data.identifiers import child_path, validate_symbol
 
 FetchFn = Callable[[str], pd.DataFrame]
 
@@ -30,7 +31,8 @@ class ParquetCache:
         return self._root if self._root is not None else paths.prices_dir()
 
     def path_for(self, symbol: str) -> Path:
-        return self.root / f"{symbol.upper()}.parquet"
+        clean = validate_symbol(symbol)
+        return child_path(self.root, clean, ".parquet", label="symbol")
 
     def has(self, symbol: str) -> bool:
         return self.path_for(symbol).exists()

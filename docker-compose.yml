@@ -6,7 +6,9 @@ services:
   app:
     build: .
     ports:
-      - "8000:8000"
+      # This is a single-user research application with destructive local-file endpoints.
+      # Keep it on the host loopback interface unless authentication is added explicitly.
+      - "127.0.0.1:8000:8000"
     environment:
       ALPHALINEAGE_DATA_DIR: /data
       TIINGO_API_KEY: ${TIINGO_API_KEY:-}

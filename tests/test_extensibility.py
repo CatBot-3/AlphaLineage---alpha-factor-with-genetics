@@ -135,3 +135,23 @@ def test_expand_and_registration_guards():
 
     extensions.unregister_operator("spread")
     assert "spread" not in REGISTRY and "spread" not in OPERATORS
+
+
+@pytest.mark.parametrize("index", [None, True, 0.5, "0", -1, 1])
+def test_macro_argument_indices_are_strict(index):
+    with pytest.raises(InvalidOperator, match=r"\$arg index"):
+        register_operator(
+            "bad_arg",
+            [DType.SERIES],
+            DType.SERIES,
+            Node(ARG, value=index),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [Node("window", value=0), Node("const", value=float("inf"))],
+)
+def test_macro_literals_receive_normal_tree_validation(literal):
+    with pytest.raises(InvalidOperator):
+        register_operator("bad_literal", [], literal.out_type, literal)

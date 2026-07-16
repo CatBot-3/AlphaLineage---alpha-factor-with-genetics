@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from alphalineage.data.adjust import adjust
 from alphalineage.data.cache import ParquetCache
@@ -72,6 +73,41 @@ def test_universe_point_in_time():
     assert "EARLY" in asof  # active before and after
     assert "LATE" not in asof  # entered after the query date
     assert "GONE" not in asof  # already delisted by the query date
+
+
+@pytest.mark.parametrize(
+    "name",
+    [" spaced ", "../outside", "..\\outside", "nested/universe", "NUL", ""],
+)
+def test_universe_rejects_unsafe_or_noncanonical_names(name):
+    with pytest.raises(ValueError):
+        Universe(name, [Membership("AAA", pd.Timestamp("2020-01-01"))])
+
+
+def test_universe_normalizes_aware_membership_and_query_dates_to_utc_naive():
+    universe = Universe(
+        "timezone-safe",
+        [
+            Membership(
+                "AAA",
+                pd.Timestamp("2020-01-01T23:30:00-05:00"),  # 2020-01-02 UTC
+                pd.Timestamp("2020-01-04T00:30:00+02:00"),  # 2020-01-03 UTC
+            )
+        ],
+    )
+    membership = universe.memberships[0]
+    assert membership.entry == pd.Timestamp("2020-01-02")
+    assert membership.exit == pd.Timestamp("2020-01-03")
+    assert membership.entry.tzinfo is None
+    assert membership.exit is not None and membership.exit.tzinfo is None
+
+    assert universe.members_asof("2020-01-01T20:00:00-05:00") == ["AAA"]
+    assert universe.members_asof("2020-01-02T20:00:00-05:00") == []
+
+    aware_dates = pd.DatetimeIndex(["2020-01-02T00:00:00Z", "2020-01-03T00:00:00Z"])
+    mask = universe.membership_mask(aware_dates, ["AAA"])
+    assert mask.index.equals(aware_dates)
+    assert mask["AAA"].tolist() == [True, False]
 
 
 def test_survivorship_report():

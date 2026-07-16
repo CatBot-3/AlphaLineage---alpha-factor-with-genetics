@@ -26,4 +26,16 @@ describe("ExtendMenu", () => {
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByTestId("extend-menu")).not.toBeInTheDocument();
   });
+
+  it("offers one unified formula workflow", () => {
+    const onSelect = vi.fn();
+    render(<ExtendMenu current={false} onSelect={onSelect} />);
+    fireEvent.click(screen.getByRole("button", { name: "Extend" }));
+    expect(screen.queryByRole("menuitem", { name: "Factor Builder" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitem", { name: "Reusable Formula Builder" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Formula Builder" }));
+    expect(onSelect).toHaveBeenCalledWith("formula");
+  });
 });

@@ -22,6 +22,11 @@ if _SRC.exists() and str(_SRC) not in sys.path:
 
 import yaml  # noqa: E402
 
+from alphalineage.api.resources import (  # noqa: E402
+    TRAINING_SCHEDULER,
+    ResourcePolicy,
+    resolve_resources,
+)
 from alphalineage.backtest.costs import TransactionCostModel  # noqa: E402
 from alphalineage.backtest.engine import (  # noqa: E402
     compare_schemes,
@@ -29,6 +34,7 @@ from alphalineage.backtest.engine import (  # noqa: E402
     net_return_fn,
 )
 from alphalineage.backtest.portfolio import QuantileLongShort, RankProportional  # noqa: E402
+from alphalineage.core import cpp  # noqa: E402
 from alphalineage.core.evaluate import evaluate  # noqa: E402
 from alphalineage.core.fitness import forward_returns  # noqa: E402
 from alphalineage.core.gp import GP, GPConfig  # noqa: E402
@@ -50,12 +56,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--universe", default=None, help="override the config universe")
     parser.add_argument("--checkpoint", default=None, help="checkpoint path (enables resume)")
     parser.add_argument("--resume", action="store_true", help="resume from --checkpoint if present")
+    parser.add_argument(
+        "--resource-profile",
+        choices=("light", "auto", "maximum", "custom"),
+        default=None,
+        help="portable CPU budget (default: config resources.profile or auto)",
+    )
+    parser.add_argument(
+        "--cpu-budget-percent",
+        type=int,
+        default=None,
+        help="10-100; implies --resource-profile custom when supplied alone",
+    )
     args = parser.parse_args(argv)
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     universe = args.universe or cfg.get("universe", "sp500-lite")
     as_of = cfg.get("as_of", "2026-06-01")
     gp_config = GPConfig.from_dict(cfg.get("gp", {}))
+    resource_cfg = cfg.get("resources", {}) or {}
+    profile = args.resource_profile or resource_cfg.get("profile", "auto")
+    custom_percent = (
+        args.cpu_budget_percent
+        if args.cpu_budget_percent is not None
+        else resource_cfg.get("cpu_budget_percent")
+    )
+    if custom_percent is not None and args.resource_profile is None:
+        profile = "custom"
+    policy = ResourcePolicy(
+        profile=profile,
+        custom_percent=custom_percent if profile == "custom" else None,
+    )
+    accelerated = cpp.supports_native_scoring(gp_config.ic_method)
+    if not cpp.backend_enabled():
+        fallback_reason = "native evaluator unavailable or disabled"
+    elif not accelerated:
+        fallback_reason = (
+            f"{gp_config.ic_method} scoring uses the parity-safe Python evaluator"
+        )
+    else:
+        fallback_reason = None
+    resources = resolve_resources(
+        policy,
+        accelerated=accelerated,
+        fallback_reason=fallback_reason,
+    )
 
     symbols = sample_universe(universe).members_asof(as_of)
     try:
@@ -69,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         train=float(cfg.get("train", 0.6)),
         valid=float(cfg.get("valid", 0.2)),
         embargo=int(cfg.get("embargo", 5)),
+        horizon=gp_config.horizon,
     )
     print(f"universe={universe} symbols={list(panel.symbols)}")
     print(
@@ -77,13 +123,30 @@ def main(argv: list[str] | None = None) -> int:
 
     ckpt = args.checkpoint
     train_panel = _train_panel(panel, split)
-    if args.resume and ckpt and Path(ckpt).exists():
-        gp = GP.from_checkpoint(ckpt, train_panel)
-        print(f"resumed from {ckpt} at generation {gp.generation}")
-    else:
-        gp = GP(gp_config, train_panel)
-
-    best = gp.run(checkpoint_path=ckpt)
+    print(
+        f"resources={resources.profile} {resources.percent}% "
+        f"workers={resources.workers}/{resources.detected_cpus} "
+        f"memory={resources.run_memory_budget_bytes / 1024**2:.0f} MiB"
+    )
+    if resources.fallback_reason:
+        print(f"resource fallback: {resources.fallback_reason}")
+    with TRAINING_SCHEDULER.acquire(resources) as lease:
+        if args.resume and ckpt and Path(ckpt).exists():
+            gp = GP.from_checkpoint(
+                ckpt,
+                train_panel,
+                workers=lease.max_workers,
+                memory_budget_bytes=lease.memory_budget_bytes,
+            )
+            print(f"resumed from {ckpt} at generation {gp.generation}")
+        else:
+            gp = GP(
+                gp_config,
+                train_panel,
+                workers=lease.max_workers,
+                memory_budget_bytes=lease.memory_budget_bytes,
+            )
+        best = gp.run(checkpoint_path=ckpt)
     for row in gp.history:
         print(
             f"  gen {int(row['generation']):>3}  best={row['best_fitness']:.4f}  "
@@ -97,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         slippage_bps=float(bt.get("slippage_bps", 5.0)),
     )
     schemes = [QuantileLongShort(float(bt.get("quantile", 0.2))), RankProportional()]
-    fwd = forward_returns(panel)
+    fwd = forward_returns(panel, gp_config.horizon)
     best_factor = evaluate(best.tree, panel)
 
     print("\nbest factor:", best.tree)
@@ -115,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
         n_trials=gp.trial_count,
         n_schemes=len(schemes),
         returns_fn=net_return_fn(panel, fwd, schemes[0], costs),
+        fwd=fwd,
+        horizon=gp_config.horizon,
+        ic_method=gp_config.ic_method,
         min_names=gp_config.min_names,
     )
     print(

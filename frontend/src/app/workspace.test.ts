@@ -4,6 +4,7 @@ import {
   WORKSPACE_KEY,
   clearLocalWorkspace,
   makeWorkspaceSnapshot,
+  migrateFormulaDrafts,
   readLocalWorkspace,
   writeLocalWorkspace,
 } from "./workspace";
@@ -70,5 +71,57 @@ describe("workspace storage", () => {
 
     clearLocalWorkspace();
     expect(readLocalWorkspace()).toBeNull();
+  });
+
+  it("migrates both old builder drafts without losing the secondary draft", () => {
+    const reusable = { name: "reusable", display_name: "Reusable", description: "" };
+    const factor = { name: "factor", display_name: "Factor", description: "" };
+    const oldStoredDraft = {
+      ...reusable,
+      builderDrafts: { reusable, factor },
+    };
+
+    const migrated = migrateFormulaDrafts(oldStoredDraft);
+    expect(migrated.active?.name).toBe("reusable");
+    expect(migrated.recoveries[0].draft.name).toBe("factor");
+
+    const resaved = makeWorkspaceSnapshot({
+      run: null,
+      ui: {},
+      formulaDraft: migrated.active,
+      recoveredFormulaDrafts: migrated.recoveries,
+    });
+    expect(migrateFormulaDrafts(resaved.formulaDraft).recoveries[0].draft.name).toBe("factor");
+    expect(resaved.formulaDraft?.builderDrafts).toBeUndefined();
+    expect(resaved.formulaDraft?.recoveredDrafts?.[0].label).toBe(
+      "Legacy Factor Builder draft",
+    );
+  });
+
+  it("removes only the exact untouched legacy dummy-series starter", () => {
+    const starter = {
+      name: "my_formula",
+      display_name: "My formula",
+      description: "",
+      inputs: [{
+        name: "price",
+        type: "series",
+        description: "Price or derived series to transform.",
+      }],
+      out_type: "signal",
+      graphNodes: [
+        { id: "formula-input-0", type: "formula", x: 40, y: 70, data: { kind: "input", label: "price", outType: "series" } },
+        { id: "formula-output", type: "formula", x: 700, y: 160, data: { kind: "output", label: "Formula output", outType: "signal" } },
+      ],
+      graphEdges: [],
+    };
+    expect(migrateFormulaDrafts(starter).active?.inputs).toEqual([]);
+
+    const realParameterizedFormula = {
+      ...starter,
+      name: "my_parameterized_formula",
+      display_name: "My parameterized formula",
+    };
+    expect(migrateFormulaDrafts(realParameterizedFormula).active?.inputs).toHaveLength(1);
   });
 });

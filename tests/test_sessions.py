@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
+import alphalineage.api.app as api_app
 from alphalineage.api.app import app, get_panel
 from alphalineage.core import extensions
 
@@ -50,7 +51,7 @@ def _poll_job(client: TestClient, job_id: str, *, timeout: float = 60.0) -> dict
     payload: dict = {}
     while time.monotonic() < deadline:
         payload = client.get(f"/runs/{job_id}").json()
-        if payload["status"] in ("done", "failed"):
+        if payload["status"] in ("done", "stopped", "failed"):
             return payload
         time.sleep(0.1)
     return payload
@@ -159,6 +160,60 @@ def test_unknown_session_is_404(client):
     assert client.get("/sessions/nope/lineage").status_code == 404
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"name": "   ", "config": _SMALL},
+        {"name": "s", "config": _SMALL, "train": 0.8, "valid": 0.2},
+        {"name": "s", "config": {"generatons": 2}},
+    ],
+)
+def test_session_create_rejects_invalid_fields_synchronously(client, body):
+    response = client.post("/sessions", json=body)
+    assert response.status_code == 400
+
+
+def test_session_request_model_rejects_nonpositive_continue_and_embargo(client):
+    assert client.post("/sessions/nope/continue", json={"generations": 0}).status_code == 422
+    response = client.post("/sessions", json={"name": "s", "config": _SMALL, "embargo": 0})
+    assert response.status_code == 422
+
+
+def test_session_persists_requested_resources_and_continue_inherits_them(client):
+    session_id, _ = _create(
+        client,
+        resources={"profile": "custom", "cpu_budget_percent": 70},
+    )
+    state = client.get(f"/sessions/{session_id}").json()
+    assert state["resources"] == {"profile": "custom", "cpu_budget_percent": 70}
+
+    continued = client.post(f"/sessions/{session_id}/continue", json={"generations": 1})
+    assert continued.status_code == 200, continued.text
+    final = _poll_job(client, continued.json()["job_id"])
+    assert final["status"] == "done", final
+    state = client.get(f"/sessions/{session_id}").json()
+    assert state["resources"] == {"profile": "custom", "cpu_budget_percent": 70}
+    assert state["segments"][-1]["resources"]["profile"] == "custom"
+    assert state["segments"][-1]["resources"]["percent"] == 70
+
+
+def test_continue_translates_invalid_gp_override_to_client_error(client):
+    session_id, _ = _create(client)
+    response = client.post(
+        f"/sessions/{session_id}/continue",
+        json={"generations": 1, "config": {"generatons": 3}},
+    )
+    assert response.status_code == 400
+    assert "unknown GP config" in response.json()["detail"]
+
+    oversized = client.post(
+        f"/sessions/{session_id}/continue",
+        json={"generations": 1_000, "config": {"population_size": 5_000}},
+    )
+    assert oversized.status_code == 400
+    assert "additional generations" in oversized.json()["detail"]
+
+
 # --- A5: continue ----------------------------------------------------------------
 def test_continue_warm_start_carries_population(client):
     session_id, first = _create(client)
@@ -234,5 +289,71 @@ def test_continue_while_running_is_409(client):
     _poll_job(client, created["job_id"])
 
 
+def test_active_job_is_persisted_blocks_continue_and_can_stop(client, monkeypatch):
+    import threading
+
+    started = threading.Event()
+
+    def slow_segment(*args, stop=None, **kwargs):
+        started.set()
+        deadline = time.monotonic() + 5
+        while stop is not None and not stop() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return {"stopped": True}
+
+    monkeypatch.setattr(api_app.sessions, "run_segment", slow_segment)
+    created = client.post(
+        "/sessions",
+        json={
+            "name": "persistent-job",
+            "universe": "sp500-lite",
+            "as_of": "2019-12-31T15:30:00Z",
+            "config": _SMALL,
+        },
+    ).json()
+    assert started.wait(2)
+    session_id, job_id = created["session_id"], created["job_id"]
+    stored = api_app.sessions.load_session(session_id)
+    assert stored["as_of"] == "2019-12-31"
+    assert stored["active_job_id"] == job_id
+    assert stored["last_job"]["status"] in {"queued", "running"}
+
+    conflict = client.post(f"/sessions/{session_id}/continue", json={"generations": 1})
+    assert conflict.status_code == 409
+    assert client.post(f"/sessions/{session_id}/stop").json() == {"stopping": True}
+    assert _poll_job(client, job_id)["status"] == "done"
+    finished = api_app.sessions.load_session(session_id)
+    assert finished["active_job_id"] is None
+    assert finished["last_job"]["status"] == "done"
+
+
 def test_continue_unknown_session_is_404(client):
     assert client.post("/sessions/nope/continue", json={"generations": 1}).status_code == 404
+
+
+def test_report_summary_cache_roundtrip_and_context_invalidation(signal_panel, tmp_path):
+    from alphalineage.api import sessions
+    from alphalineage.core.gp import GPConfig
+    from alphalineage.validation.pbo import summarize_report_returns
+
+    panel, _ = signal_panel
+    boundaries = sessions.derive_boundaries(panel.dates, embargo=3, horizon=1)
+    session = {"universe": "cache-test", "as_of": "2019-12-31"}
+    config = GPConfig(population_size=10, generations=1, horizon=1)
+    context = sessions._report_cache_context(session, panel, boundaries, config)
+    summary = summarize_report_returns(
+        pd.Series(0.001, index=panel.dates), panel.dates, n_blocks=4
+    )
+    path = tmp_path / "report_stats.json"
+
+    sessions._save_report_cache(path, context, {"factor": summary})
+    assert sessions._load_report_cache(path, context) == {"factor": summary}
+
+    changed = sessions._report_cache_context(
+        session,
+        panel,
+        boundaries,
+        GPConfig(population_size=10, generations=1, horizon=2),
+    )
+    assert changed != context
+    assert sessions._load_report_cache(path, changed) == {}

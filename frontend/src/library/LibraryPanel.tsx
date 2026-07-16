@@ -1,22 +1,22 @@
-// The Library tab: the user's kept factors. List, rename, delete, relocate the storage
-// folder, and seed a new training session from one or more saved factors.
+// The Library tab: the user's kept formula results. List, rename, delete, relocate the
+// storage folder, and seed a new training session from one or more formula results.
 
 import { useEffect, useState } from "react";
-import { deleteFactor, listFactors, renameFactor } from "../api/client";
-import type { SavedFactor } from "../api/types";
+import { deleteFormulaResult, listFormulaResults, updateFormulaResult } from "../api/client";
+import type { FormulaResult } from "../api/types";
 
-function researchIc(factor: SavedFactor): string {
+function researchIc(factor: FormulaResult): string {
   const ic = factor.metrics?.oos_ic;
   return typeof ic === "number" ? ic.toFixed(3) : "-";
 }
 
 export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
-  const [factors, setFactors] = useState<SavedFactor[]>([]);
+  const [factors, setFactors] = useState<FormulaResult[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [status, setStatus] = useState<string | null>(null);
 
   function refresh() {
-    listFactors().then(setFactors).catch((e) => setStatus(String(e)));
+    listFormulaResults().then(setFactors).catch((e) => setStatus(String(e)));
   }
 
   useEffect(() => {
@@ -27,15 +27,15 @@ export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
     setSelected((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]));
   }
 
-  async function handleRename(factor: SavedFactor) {
-    const next = window.prompt("Rename factor", factor.name);
+  async function handleRename(factor: FormulaResult) {
+    const next = window.prompt("Rename formula result", factor.name);
     if (!next || next === factor.name) return;
-    await renameFactor(factor.id, next);
+    await updateFormulaResult(factor.id, { name: next });
     refresh();
   }
 
   async function handleDelete(id: string) {
-    await deleteFactor(id);
+    await deleteFormulaResult(id);
     setSelected((prev) => prev.filter((s) => s !== id));
     refresh();
   }
@@ -44,7 +44,7 @@ export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
     <div className="library-panel" data-testid="library-panel">
       <section className="library-list">
         <header className="library-head">
-          <h3>Saved factors</h3>
+          <h3>Formula Results</h3>
           <button
             type="button"
             className="primary-action"
@@ -52,11 +52,16 @@ export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
             disabled={selected.length === 0}
             onClick={() => onSeed(selected)}
           >
-            Start seeded session ({selected.length})
+            Seed training from Formula Results ({selected.length})
           </button>
         </header>
 
-        {factors.length === 0 && <p className="hint">No saved factors yet. Save one from the Best factor or Genealogy view.</p>}
+        {factors.length === 0 && (
+          <p className="hint">
+            No formula results yet. Keep one from a formula backtest or save one from the Best
+            Formula Result or Genealogy view.
+          </p>
+        )}
 
         <ul className="factor-rows">
           {factors.map((factor) => (
@@ -85,7 +90,7 @@ export function LibraryPanel({ onSeed }: { onSeed: (ids: string[]) => void }) {
         </ul>
       </section>
 
-      <p className="hint">Change where factors are stored in the ⚙ settings menu.</p>
+      <p className="hint">Change where formula results are stored in the settings menu.</p>
 
       {status && <p className="surface-message">{status}</p>}
       <p className="disclaimer">Not investment advice. Research output only.</p>

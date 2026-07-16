@@ -1,13 +1,13 @@
-// The "Extend" nav item as a dropdown: clicking it drops a menu of the three Extend pages.
+// The "Extend" nav item as a dropdown: clicking it drops a menu of the Extend pages.
 // Mirrors the SettingsMenu popover pattern (open state, outside-click / Escape close, aria).
 
 import { useEffect, useRef, useState } from "react";
 import type { ExtendPage } from "../extend/ExtendPanel";
 
 const PAGES: Array<{ id: ExtendPage; label: string }> = [
+  { id: "formula", label: "Formula Builder" },
   { id: "universe", label: "Universe Editor" },
   { id: "sync", label: "Sync Data" },
-  { id: "formula", label: "Formula Editor" },
 ];
 
 export function ExtendMenu({

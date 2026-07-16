@@ -2,7 +2,7 @@
 // DAG. The closure is tens of nodes at most, so a graph genuinely beats a list here - it answers
 // "where did this factor come from?" spatially.
 
-import { Background, Controls, ReactFlow } from "@xyflow/react";
+import { Background, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useMemo } from "react";
 import type { Lineage } from "../api/types";
@@ -30,10 +30,12 @@ export function AncestryView({
         nodes={nodes}
         edges={edges}
         fitView
+        zoomOnScroll
+        zoomOnPinch
+        panOnDrag
         onNodeClick={(_, node) => onSelect?.(Number(node.id))}
       >
         <Background />
-        <Controls />
       </ReactFlow>
     </div>
   );

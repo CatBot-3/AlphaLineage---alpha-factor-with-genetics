@@ -53,7 +53,16 @@ vi.mock("../api/client", () => ({
   startDataSync: vi.fn(),
   getDataSync: vi.fn(),
   listUniverses: () => Promise.resolve([]),
-  listFactors: () => Promise.resolve([]),
+  getUniverseCoverage: () =>
+    Promise.resolve({
+      as_of: "2026-07-15",
+      eligible_symbols: ["AAPL"],
+      cached_symbols: ["AAPL"],
+      missing_symbols: [],
+      incomplete_symbols: [],
+      complete: true,
+    }),
+  listFormulaResults: () => Promise.resolve([]),
   getSettings: () => Promise.resolve({ factors_dir: "/d", tiingo_api_key_set: false, evaluator: "auto", cpp_available: false }),
   getDataUsage: () => Promise.resolve([]),
   putSettings: vi.fn(),

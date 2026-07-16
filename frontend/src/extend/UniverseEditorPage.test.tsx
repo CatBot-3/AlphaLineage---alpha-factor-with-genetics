@@ -6,6 +6,7 @@ const deleteUniverse = vi.fn();
 const getDataSync = vi.fn();
 const getMembershipSync = vi.fn();
 const getUniverse = vi.fn();
+const listUniversePresets = vi.fn();
 const listUniverses = vi.fn();
 const searchSymbols = vi.fn();
 const startDataSync = vi.fn();
@@ -19,6 +20,7 @@ vi.mock("../api/client", () => ({
   getDataSync: (jobId: string) => getDataSync(jobId),
   getMembershipSync: (jobId: string) => getMembershipSync(jobId),
   getUniverse: (name: string) => getUniverse(name),
+  listUniversePresets: () => listUniversePresets(),
   listUniverses: () => listUniverses(),
   searchSymbols: (...args: unknown[]) => searchSymbols(...args),
   startDataSync: (payload: unknown) => startDataSync(payload),
@@ -41,15 +43,123 @@ function candidate(symbol: string) {
 }
 
 function setupMocks() {
+  listUniversePresets.mockResolvedValue([
+    {
+      id: "sp500-lite",
+      display_name: "S&P 500 illustrative sample",
+      benchmark: "S&P 500",
+      status: "bundled_sample",
+      available: true,
+      membership_history: "illustrative",
+      coverage: "Nine hand-curated symbols",
+      research_ready: false,
+      provenance: "Bundled demonstration data",
+      warning: "Not authoritative S&P 500 constituent history.",
+    },
+    {
+      id: "sp500",
+      display_name: "S&P 500",
+      benchmark: "S&P 500",
+      status: "bundled_static",
+      available: true,
+      snapshot_universe: "builtin-sp500-current",
+      pit_import_name: "sp500",
+      mode: "static_snapshot",
+      membership_history: "static_snapshot",
+      coverage: "Bundled current constituent snapshot",
+      research_ready: false,
+      provenance: "Bundled index snapshot",
+      warning: "A current snapshot is not valid historical membership data.",
+      definition: {
+        id: "builtin-sp500-current",
+        display_name: "S&P 500 static snapshot",
+        snapshot_date: "2026-07-14",
+        interval_semantics: "All members active from the snapshot date",
+        member_count: 2,
+      },
+      fingerprint: "sha256:sp500",
+      provenance_detail: {
+        provider: "Wikipedia",
+        retrieved_at: "2026-07-14",
+        attribution: "Wikipedia contributors",
+        license: "CC BY-SA 4.0",
+        license_url: "https://creativecommons.org/licenses/by-sa/4.0/",
+        terms_url: "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+      },
+      readiness: {
+        membership_ready: true,
+        price_ready: false,
+        research_ready: false,
+        issues: ["Static membership only"],
+      },
+    },
+  ]);
   listUniverses.mockResolvedValue([
     {
       name: "sp500-lite",
       symbols: ["AAPL"],
       source: "sample",
       memberships: [{ symbol: "AAPL", entry: "2020-01-01", exit: null }],
+      cache_coverage: {
+        as_of: "2026-07-14",
+        eligible_symbols: ["AAPL"],
+        cached_symbols: [],
+        missing_symbols: ["AAPL"],
+        incomplete_symbols: ["AAPL"],
+        complete: false,
+      },
+    },
+    {
+      name: "builtin-sp500-current",
+      display_name: "S&P 500 static snapshot",
+      symbols: [],
+      source: "bundled",
+      mode: "static_snapshot",
+      memberships: [],
+      definition: {
+        id: "builtin-sp500-current",
+        display_name: "S&P 500 static snapshot",
+        snapshot_date: "2026-07-14",
+        interval_semantics: "Static membership",
+        member_count: 2,
+      },
+      fingerprint: "sha256:sp500",
     },
   ]);
-  getUniverse.mockResolvedValue({
+  getUniverse.mockImplementation(async (name: string) => name === "builtin-sp500-current" ? {
+    name,
+    display_name: "S&P 500 static snapshot",
+    symbols: ["AAPL", "BRK.B"],
+    source: "bundled",
+    mode: "static_snapshot",
+    memberships: [
+      { symbol: "AAPL", entry: "2026-07-14", exit: null },
+      { symbol: "BRK.B", entry: "2026-07-14", exit: null },
+    ],
+    definition: {
+      id: name,
+      display_name: "S&P 500 static snapshot",
+      snapshot_date: "2026-07-14",
+      interval_semantics: "Static membership",
+      member_count: 2,
+    },
+    fingerprint: "sha256:sp500",
+    provenance: {
+      provider: "Wikipedia",
+      retrieved_at: "2026-07-14",
+      attribution: "Wikipedia contributors",
+      license: "CC BY-SA 4.0",
+      license_url: "https://creativecommons.org/licenses/by-sa/4.0/",
+      terms_url: "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+    },
+    readiness: {
+      membership_ready: true,
+      price_ready: false,
+      research_ready: false,
+      issues: ["Static membership only"],
+    },
+    aliases: { "BRK.B": "BRK-B" },
+  } : {
     name: "sp500-lite",
     symbols: ["AAPL"],
     source: "sample",
@@ -295,5 +405,97 @@ describe("UniverseEditorPage", () => {
     expect(within(delisted).getByText("LEH")).toBeInTheDocument();
     fireEvent.click(within(delisted).getByText("Remove"));
     expect(screen.queryByTestId("delisted-list")).not.toBeInTheDocument();
+  });
+
+  it("prepares an empty import-required index without inventing constituents", async () => {
+    setupMocks();
+    render(<UniverseEditorPage />);
+    const presets = await screen.findByTestId("universe-presets");
+    const sp500 = within(presets).getByText("S&P 500", { selector: "strong" }).closest("article")!;
+    expect(within(sp500).getByText(/current snapshot is not valid/i)).toBeInTheDocument();
+
+    fireEvent.click(within(sp500).getByRole("button", { name: "Import point-in-time history" }));
+
+    expect(screen.getByLabelText("Universe name")).toHaveValue("sp500");
+    expect(screen.getByLabelText("symbol-0")).toHaveValue("");
+    expect(screen.getByTestId("universe-result")).toHaveTextContent(/No memberships were generated/i);
+    expect(screen.getByTestId("universe-result")).toHaveTextContent(/separate/i);
+    expect(screen.getByRole("button", { name: /Import membership history/ })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("loads a bundled static snapshot separately and shows its definition metadata", async () => {
+    setupMocks();
+    render(<UniverseEditorPage />);
+    const presets = await screen.findByTestId("universe-presets");
+    const sp500 = within(presets).getByText("S&P 500", { selector: "strong" }).closest("article")!;
+
+    fireEvent.click(within(sp500).getByRole("button", { name: "Load current snapshot" }));
+
+    await waitFor(() => expect(getUniverse).toHaveBeenCalledWith("builtin-sp500-current"));
+    const metadata = await screen.findByTestId("universe-integrity");
+    expect(metadata).toHaveTextContent("Mode: static snapshot");
+    expect(metadata).toHaveTextContent("Source: bundled");
+    expect(metadata).toHaveTextContent("Fingerprint: sha256:sp500");
+    expect(metadata).toHaveTextContent("Attribution: Wikipedia contributors · CC BY-SA 4.0");
+    expect(within(metadata).getByRole("link", { name: "License terms" })).toHaveAttribute(
+      "href",
+      "https://creativecommons.org/licenses/by-sa/4.0/",
+    );
+    expect(within(metadata).getByRole("link", { name: "Wikimedia terms" })).toHaveAttribute(
+      "href",
+      "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+    );
+    expect(metadata).toHaveTextContent("BRK.B → BRK-B");
+  });
+
+  it("previews and imports pasted point-in-time membership CSV", async () => {
+    setupMocks();
+    render(<UniverseEditorPage />);
+    await screen.findByTestId("universe-presets");
+    fireEvent.click(screen.getByRole("button", { name: /Import membership history/ }));
+    fireEvent.change(screen.getByLabelText("Point-in-time membership CSV or TSV"), {
+      target: { value: "symbol,entry,exit\naapl,2000-01-03,\nLEH,2000-01-03,2008-09-15" },
+    });
+    expect(screen.getByTestId("membership-import-summary")).toHaveTextContent("2 valid interval(s); 0 error(s)");
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace draft with valid rows" }));
+    expect(screen.getByLabelText("symbol-0")).toHaveValue("AAPL");
+    expect(screen.getByLabelText("exit-1")).toHaveValue("2008-09-15");
+    fireEvent.click(screen.getByTestId("save-universe"));
+    await waitFor(() => expect(defineUniverse).toHaveBeenCalledWith({
+      name: "my-universe",
+      memberships: [
+        { symbol: "AAPL", entry: "2000-01-03", exit: null },
+        { symbol: "LEH", entry: "2000-01-03", exit: "2008-09-15" },
+      ],
+    }));
+  });
+
+  it("surfaces paste errors and only imports rows explicitly marked valid", async () => {
+    setupMocks();
+    render(<UniverseEditorPage />);
+    await screen.findByTestId("universe-presets");
+    fireEvent.click(screen.getByRole("button", { name: /Import membership history/ }));
+    fireEvent.change(screen.getByLabelText("Point-in-time membership CSV or TSV"), {
+      target: { value: "BAD,not-a-date,\nMSFT,2020-01-01," },
+    });
+    expect(screen.getByTestId("membership-import-summary")).toHaveTextContent("1 valid interval(s); 1 error(s)");
+    expect(screen.getByTestId("membership-import-errors")).toHaveTextContent("Line 1");
+    fireEvent.click(screen.getByRole("button", { name: "Replace draft with valid rows" }));
+    expect(screen.getByLabelText("symbol-0")).toHaveValue("MSFT");
+    expect(screen.getByTestId("universe-result")).toHaveTextContent(/skipped 1 invalid line/i);
+  });
+
+  it("surfaces incomplete price-cache history before training", async () => {
+    setupMocks();
+    render(<UniverseEditorPage />);
+    await screen.findByTestId("universe-presets");
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: "sp500-lite" },
+    });
+
+    const coverage = await screen.findByTestId("universe-cache-coverage");
+    expect(coverage).toHaveTextContent("Price history: needs attention");
+    expect(coverage).toHaveTextContent("AAPL");
   });
 });

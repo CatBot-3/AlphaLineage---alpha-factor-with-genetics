@@ -40,7 +40,16 @@ vi.mock("../api/client", () => ({
   startDataSync: vi.fn(),
   getDataSync: vi.fn(),
   listUniverses: () => Promise.resolve([]),
-  listFactors: () => Promise.resolve([]),
+  getUniverseCoverage: () =>
+    Promise.resolve({
+      as_of: "2026-07-15",
+      eligible_symbols: ["AAPL"],
+      cached_symbols: ["AAPL"],
+      missing_symbols: [],
+      incomplete_symbols: [],
+      complete: true,
+    }),
+  listFormulaResults: () => Promise.resolve([]),
   createSession: vi.fn(),
   continueSession: vi.fn(),
   getSession: vi.fn(),

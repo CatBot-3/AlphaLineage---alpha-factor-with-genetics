@@ -9,6 +9,7 @@ generator's 10k-tree validity sweep pass).
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from alphalineage.core.types import DType, is_subtype
 # Ephemeral-constant sample spaces (point mutation tweaks these in Phase 2).
 DEFAULT_WINDOWS: tuple[int, ...] = (2, 3, 5, 10, 20, 30, 60)
 DEFAULT_SCALARS: tuple[float, ...] = (-2.0, -1.0, -0.5, 0.5, 1.0, 2.0)
+# Generous enough for research, bounded so malformed JSON cannot request abusive rolling work.
+MAX_WINDOW = 100_000
 
 
 class Kind(Enum):
@@ -56,9 +59,38 @@ def _finite(df: pd.DataFrame) -> pd.DataFrame:
     return df.replace([np.inf, -np.inf], np.nan)
 
 
+def _safe_repr(value: object) -> str:
+    try:
+        return repr(value)
+    except (OverflowError, ValueError):
+        return f"<{type(value).__name__} outside printable numeric range>"
+
+
+def checked_window(value: object) -> int:
+    """Return a valid lookback or raise instead of silently coercing bad input."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"window must be a positive integer, got {_safe_repr(value)}")
+    if value > MAX_WINDOW:
+        raise ValueError(f"window must be at most {MAX_WINDOW}, got {_safe_repr(value)}")
+    return value
+
+
+def checked_scalar(value: object) -> float:
+    """Return a finite numeric scalar or raise with a stable validation error."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"scalar must be a finite number, got {_safe_repr(value)}")
+    try:
+        scalar = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"scalar must be a finite number, got {_safe_repr(value)}") from exc
+    if not math.isfinite(scalar):
+        raise ValueError(f"scalar must be a finite number, got {_safe_repr(value)}")
+    return scalar
+
+
 def _roll(a: pd.DataFrame, w: int) -> Any:
-    w = max(1, int(w))
-    return a.rolling(window=w, min_periods=w)
+    window = checked_window(w)
+    return a.rolling(window=window, min_periods=window)
 
 
 def _add(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
@@ -78,15 +110,15 @@ def _div(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
 
 
 def _mul_scalar(a: pd.DataFrame, s: float) -> pd.DataFrame:
-    return a * s
+    return a * checked_scalar(s)
 
 
 def _add_scalar(a: pd.DataFrame, s: float) -> pd.DataFrame:
-    return a + s
+    return a + checked_scalar(s)
 
 
 def _signed_power(a: pd.DataFrame, s: float) -> pd.DataFrame:
-    return _finite(np.sign(a) * np.power(a.abs(), s))
+    return _finite(np.sign(a) * np.power(a.abs(), checked_scalar(s)))
 
 
 def _log(a: pd.DataFrame) -> pd.DataFrame:
@@ -110,8 +142,75 @@ def _ts_mean(a: pd.DataFrame, w: int) -> pd.DataFrame:
     return _roll(a, w).mean()
 
 
+def _ts_ema(a: pd.DataFrame, w: int) -> pd.DataFrame:
+    window = checked_window(w)
+    return a.ewm(span=window, adjust=False, min_periods=window).mean()
+
+
 def _ts_std(a: pd.DataFrame, w: int) -> pd.DataFrame:
     return _roll(a, w).std()
+
+
+def _ts_std_pop(a: pd.DataFrame, w: int) -> pd.DataFrame:
+    """Population rolling deviation (``ddof=0``), used by chart-style Bollinger bands."""
+    return _roll(a, w).std(ddof=0)
+
+
+def _ts_rma(a: pd.DataFrame, w: int) -> pd.DataFrame:
+    """Wilder's moving average, seeded by the first complete arithmetic-mean window.
+
+    A non-finite observation breaks the sequence.  Output resumes only after another complete
+    finite seed window, matching the strict warm-up behavior of the other rolling primitives.
+    """
+    window = checked_window(w)
+    values = a.to_numpy(dtype=float, copy=False)
+    result = np.full(values.shape, np.nan, dtype=float)
+    for column in range(values.shape[1]):
+        state = math.nan
+        seed: list[float] = []
+        for row in range(values.shape[0]):
+            value = float(values[row, column])
+            if not math.isfinite(value):
+                state = math.nan
+                seed.clear()
+                continue
+            if math.isnan(state):
+                seed.append(value)
+                if len(seed) < window:
+                    continue
+                # Spell out sequential accumulation: Python 3.12's built-in ``sum`` uses a
+                # compensated algorithm, while the native evaluator intentionally mirrors the
+                # same deterministic double operation order on every supported Python version.
+                seed_sum = 0.0
+                for observation in seed:
+                    seed_sum += observation
+                state = seed_sum / window
+                seed.clear()
+            else:
+                state = (state * (window - 1) + value) / window
+            result[row, column] = state
+    return pd.DataFrame(result, index=a.index, columns=a.columns)
+
+
+def _ts_recursive_smooth(a: pd.DataFrame, w: int, initial: float) -> pd.DataFrame:
+    """Wilder-style recursive smoothing with an explicit initial state.
+
+    Finite observations update ``state = ((w - 1) * state + value) / w`` immediately. Missing
+    observations emit NaN without discarding the state, which is the conventional KDJ behavior.
+    """
+    window = checked_window(w)
+    start = checked_scalar(initial)
+    values = a.to_numpy(dtype=float, copy=False)
+    result = np.full(values.shape, np.nan, dtype=float)
+    for column in range(values.shape[1]):
+        state = start
+        for row in range(values.shape[0]):
+            value = float(values[row, column])
+            if not math.isfinite(value):
+                continue
+            state = (state * (window - 1) + value) / window
+            result[row, column] = state
+    return pd.DataFrame(result, index=a.index, columns=a.columns)
 
 
 def _ts_sum(a: pd.DataFrame, w: int) -> pd.DataFrame:
@@ -127,16 +226,15 @@ def _ts_max(a: pd.DataFrame, w: int) -> pd.DataFrame:
 
 
 def _ts_rank(a: pd.DataFrame, w: int) -> pd.DataFrame:
-    # Percentile rank of the current value within its trailing window.
-    def f(x: np.ndarray) -> float:
-        return float(np.mean(x <= x[-1]))
-
-    return _roll(a, w).apply(f, raw=True)
+    # Percentile rank of the current value within its trailing window. ``method='max'`` is
+    # exactly the historical ``mean(window <= current)`` tie policy, but pandas executes the
+    # rolling rank in compiled code instead of calling Python once per date/symbol/window.
+    return _roll(a, w).rank(method="max", pct=True)
 
 
 def _decay_linear(a: pd.DataFrame, w: int) -> pd.DataFrame:
-    ww = max(1, int(w))
-    weights = np.arange(1, ww + 1, dtype=float)
+    window = checked_window(w)
+    weights = np.arange(1, window + 1, dtype=float)
     weights /= weights.sum()
 
     def f(x: np.ndarray) -> float:
@@ -146,11 +244,11 @@ def _decay_linear(a: pd.DataFrame, w: int) -> pd.DataFrame:
 
 
 def _delta(a: pd.DataFrame, w: int) -> pd.DataFrame:
-    return a - a.shift(int(w))
+    return a - a.shift(checked_window(w))
 
 
 def _delay(a: pd.DataFrame, w: int) -> pd.DataFrame:
-    return a.shift(int(w))
+    return a.shift(checked_window(w))
 
 
 def _ts_cov(a: pd.DataFrame, b: pd.DataFrame, w: int) -> pd.DataFrame:
@@ -232,7 +330,11 @@ _OPERATOR_SPECS: list[tuple[str, tuple[DType, ...], DType, Callable[..., pd.Data
     ("neg", (_SE,), _SE, _neg),
     # unary time-series
     ("ts_mean", (_SE, _WI), _SE, _ts_mean),
+    ("ts_ema", (_SE, _WI), _SE, _ts_ema),
     ("ts_std", (_SE, _WI), _SE, _ts_std),
+    ("ts_std_pop", (_SE, _WI), _SE, _ts_std_pop),
+    ("ts_rma", (_SE, _WI), _SE, _ts_rma),
+    ("ts_recursive_smooth", (_SE, _WI, _SC), _SE, _ts_recursive_smooth),
     ("ts_sum", (_SE, _WI), _SE, _ts_sum),
     ("ts_min", (_SE, _WI), _SE, _ts_min),
     ("ts_max", (_SE, _WI), _SE, _ts_max),

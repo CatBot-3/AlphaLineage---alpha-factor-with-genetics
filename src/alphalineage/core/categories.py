@@ -17,6 +17,7 @@ TIME_SERIES = "time_series"
 CROSS_SECTIONAL = "cross_sectional"
 CONSTANT = "constant"
 CONDITION = "condition"
+TECHNICAL_INDICATORS = "technical_indicators"
 CUSTOM = "custom"
 UNCATEGORIZED = "uncategorized"
 
@@ -30,6 +31,7 @@ DEFAULT_CATEGORY_ORDER: list[str] = [
     CROSS_SECTIONAL,
     CONDITION,
     CONSTANT,
+    TECHNICAL_INDICATORS,
     CUSTOM,
 ]
 
@@ -73,7 +75,11 @@ BUILTIN_CATEGORIES: dict[str, str] = {
     "neg": UNARY_MATH,
     # time-series
     "ts_mean": TIME_SERIES,
+    "ts_ema": TIME_SERIES,
     "ts_std": TIME_SERIES,
+    "ts_std_pop": TIME_SERIES,
+    "ts_rma": TIME_SERIES,
+    "ts_recursive_smooth": TIME_SERIES,
     "ts_sum": TIME_SERIES,
     "ts_min": TIME_SERIES,
     "ts_max": TIME_SERIES,

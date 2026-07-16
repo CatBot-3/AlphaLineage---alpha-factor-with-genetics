@@ -6,6 +6,11 @@ train: 0.6
 valid: 0.2
 embargo: 5               # gap (trading days) between adjacent segments to prevent leakage
 
+# Runtime-only compute policy. It changes speed/resource use, never the scientific search.
+resources:
+  profile: auto          # light=25%, auto=50%, maximum=100%, custom=cpu_budget_percent
+  cpu_budget_percent: null
+
 gp:
   population_size: 200
   generations: 25

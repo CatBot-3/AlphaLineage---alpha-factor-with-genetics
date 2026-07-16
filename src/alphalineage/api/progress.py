@@ -21,7 +21,12 @@ from alphalineage.core.tree import Node, to_json
 class RunProgress:
     """A recorder wrapper that exposes a thread-safe snapshot of a running search."""
 
-    def __init__(self, *, target_generations: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        target_generations: int = 0,
+        resources: dict[str, Any] | None = None,
+    ) -> None:
         self._inner: Any = None
         self._lock = threading.Lock()
         self._phase = "queued"
@@ -29,6 +34,13 @@ class RunProgress:
         self._target = target_generations
         self._history: list[dict[str, float]] = []
         self._best: tuple[Node, float] | None = None
+        self._resources = dict(resources) if resources is not None else None
+        self._candidate_done = 0
+        self._candidate_total = 0
+        self._report_done = 0
+        self._report_total = 0
+        self._factors_per_second: float | None = None
+        self._termination_reason: str | None = None
 
     def attach(self, inner: Any) -> None:
         """Set the inner recorder (the persisting LineageStore) calls are forwarded to."""
@@ -37,6 +49,57 @@ class RunProgress:
     def set_target(self, target_generations: int) -> None:
         with self._lock:
             self._target = target_generations
+
+    def set_phase(self, phase: str) -> None:
+        """Expose a coarse job phase without coupling the scorer to the API."""
+        with self._lock:
+            self._phase = phase
+
+    def set_candidate_progress(
+        self,
+        done: int,
+        total: int,
+        *,
+        factors_per_second: float | None = None,
+    ) -> None:
+        """Update the active population's completed-factor count."""
+        with self._lock:
+            self._candidate_done = max(0, int(done))
+            self._candidate_total = max(0, int(total))
+            self._factors_per_second = (
+                max(0.0, float(factors_per_second)) if factors_per_second is not None else None
+            )
+
+    def set_report_progress(self, done: int, total: int) -> None:
+        """Update final trial-report progress, which follows the generation loop."""
+        with self._lock:
+            self._phase = "reporting"
+            self._report_done = max(0, int(done))
+            self._report_total = max(0, int(total))
+
+    def on_scoring(
+        self,
+        *,
+        phase: str,
+        generation: int,
+        done: int,
+        total: int,
+        factors_per_second: float | None = None,
+    ) -> None:
+        """Recorder hook used by deterministic population batches for live progress."""
+        with self._lock:
+            self._phase = "initializing" if phase == "initializing" else "training"
+            self._generation = max(self._generation, int(generation))
+            self._candidate_done = max(0, int(done))
+            self._candidate_total = max(0, int(total))
+            self._factors_per_second = (
+                max(0.0, float(factors_per_second)) if factors_per_second is not None else None
+            )
+
+    def finish(self, termination_reason: str = "completed") -> None:
+        with self._lock:
+            self._phase = "stopped" if termination_reason == "user_stopped" else "done"
+            self._termination_reason = termination_reason
 
     # --- recorder protocol (called by GP) ----------------------------------------
     def on_init(
@@ -63,8 +126,10 @@ class RunProgress:
         self, generation: int, trees: Sequence[Node], fits: Sequence[float] | None
     ) -> None:
         with self._lock:
-            self._phase = "running"
+            self._phase = "training"
             self._generation = max(self._generation, generation)
+            self._candidate_done = 0
+            self._candidate_total = 0
             if fits:
                 best_i = max(range(len(fits)), key=lambda i: fits[i])
                 best_tree, best_fit = trees[best_i], float(fits[best_i])
@@ -92,6 +157,13 @@ class RunProgress:
                 "target_generations": self._target,
                 "history": list(self._history),
                 "best": best,
+                "resources": dict(self._resources) if self._resources is not None else None,
+                "candidate_done": self._candidate_done,
+                "candidate_total": self._candidate_total,
+                "report_done": self._report_done,
+                "report_total": self._report_total,
+                "factors_per_second": self._factors_per_second,
+                "termination_reason": self._termination_reason,
             }
 
 

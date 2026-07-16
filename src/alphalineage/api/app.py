@@ -10,15 +10,19 @@ Not investment advice. Research output only.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import math
 import os
 import re
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,32 +32,78 @@ from pydantic import BaseModel, Field
 from alphalineage.api import sessions
 from alphalineage.api.jobs import JobStore
 from alphalineage.api.progress import RunProgress, SyncProgress
+from alphalineage.api.resources import (
+    TRAINING_SCHEDULER,
+    ResolvedResources,
+    ResourcePolicy,
+    TrainingLeaseCancelled,
+    resolve_resources,
+    training_capabilities,
+)
 from alphalineage.api.service import run_search
+from alphalineage.backtest.costs import TransactionCostModel
+from alphalineage.backtest.portfolio import QuantileLongShort, RankProportional, WeightingScheme
+from alphalineage.backtest.reporting import backtest_report
 from alphalineage.core import categories as core_categories
 from alphalineage.core import cpp
+from alphalineage.core.evaluate import evaluate
 from alphalineage.core.extensions import (
     USER_OPERATORS,
     InvalidOperator,
     ensure_operator,
+    expand_all,
     infer_macro_type,
     register_operator,
     unregister_operator,
 )
-from alphalineage.core.gp import GPConfig, validate_seed
+from alphalineage.core.fitness import forward_returns
+from alphalineage.core.gp import (
+    MAX_GENERATIONS,
+    MAX_HORIZON,
+    MAX_SEARCH_EVALUATIONS,
+    GPConfig,
+    TrainingCancelled,
+    validate_seed,
+)
 from alphalineage.core.panel import Panel
 from alphalineage.core.primitive_docs import primitive_doc
 from alphalineage.core.primitives import OPERATORS, REGISTRY, Primitive
 from alphalineage.core.tree import Node
 from alphalineage.core.tree import from_dict as tree_from_dict
+from alphalineage.core.tree import to_dict as tree_to_dict
+from alphalineage.core.tree import to_json as tree_to_json
 from alphalineage.core.tree import validate as validate_tree
 from alphalineage.core.types import DType, is_subtype
 from alphalineage.data import paths, schema, usage
 from alphalineage.data.cache import ParquetCache
+from alphalineage.data.identifiers import (
+    atomic_write_text,
+    child_path,
+)
+from alphalineage.data.identifiers import (
+    validate_symbol as validate_market_symbol,
+)
 from alphalineage.data.provider import FallbackProvider, PriceProvider
 from alphalineage.data.tiingo_client import TiingoProvider
-from alphalineage.data.universe import Membership, Universe, sample_universe
+from alphalineage.data.universe import (
+    Membership,
+    Universe,
+    bundled_snapshot_name,
+    bundled_snapshot_specs,
+    bundled_universe,
+    normalize_market_symbol,
+    sample_universe,
+    universe_integrity,
+    universe_presets,
+)
 from alphalineage.data.yfinance_provider import YFinanceProvider
-from alphalineage.library.factors import FactorStore
+from alphalineage.library.factors import DISCLAIMER, FactorStore
+from alphalineage.library.indicator_catalog import (
+    CATALOG_NAMES,
+    CATALOG_ORIGIN,
+    INDICATOR_CATALOG,
+)
+from alphalineage.validation.splits import time_split
 
 app = FastAPI(title="AlphaLineage", version="0.1.0")
 # Allow the browser `app` build (Vite dev server) to call the local backend.
@@ -66,9 +116,13 @@ app.add_middleware(
 _jobs = JobStore()
 _universes: dict[str, Universe] = {}
 _data_jobs = JobStore()
+_formula_test_jobs = JobStore()
+# Formula registration is process-global.  Serialize deletion with one-shot run submission so a
+# run is visible as a revision holder before its pinned primitives can be unregistered.
+_formula_lifecycle_lock = threading.RLock()
 
 _DEFAULT_UNIVERSE = "sp500-lite"
-_DEFAULT_AS_OF = "2026-06-01"
+_DEFAULT_AS_OF = datetime.now(UTC).date().isoformat()
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _FORMULA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _FORMULA_INPUT_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -86,6 +140,7 @@ class FormulaInputSpec(BaseModel):
     name: str
     type: str
     description: str = ""
+    default: float | int | None = None
 
 
 class FormulaSpec(BaseModel):
@@ -101,6 +156,11 @@ class FormulaSpec(BaseModel):
     runtime_name: str = ""
     created_at: str = ""
     updated_at: str = ""
+    origin: str = "user_formula"
+    editable: bool = True
+    family: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    catalog_revision: int | None = None
 
 
 class CategoryUpdate(BaseModel):
@@ -123,10 +183,19 @@ class UniverseSpec(BaseModel):
     memberships: list[MembershipSpec]
 
 
+class TrainingResourcesRequest(BaseModel):
+    """Visible, device-relative CPU policy; execution settings never alter GP semantics."""
+
+    profile: Literal["light", "auto", "maximum", "custom"] = "auto"
+    cpu_budget_percent: int | None = Field(default=None, ge=10, le=100)
+
+
 class RunRequest(BaseModel):
-    universe: str = _DEFAULT_UNIVERSE
-    config: dict[str, Any] = Field(default_factory=dict)
-    operators: list[OperatorSpec] = Field(default_factory=list)
+    universe: str = Field(default=_DEFAULT_UNIVERSE, min_length=1, max_length=80)
+    as_of: str = Field(default=_DEFAULT_AS_OF, min_length=1, max_length=64)
+    config: dict[str, Any] = Field(default_factory=dict, max_length=64)
+    operators: list[OperatorSpec] = Field(default_factory=list, max_length=100)
+    resources: TrainingResourcesRequest = Field(default_factory=TrainingResourcesRequest)
 
 
 class JobResponse(BaseModel):
@@ -166,6 +235,40 @@ class FactorSaveRequest(BaseModel):
 class FactorPatch(BaseModel):
     name: str | None = None
     notes: str | None = None
+
+
+class FormulaTestSource(BaseModel):
+    kind: Literal["draft", "saved"]
+    body: dict[str, Any] | None = None
+    inputs: list[FormulaInputSpec] = Field(default_factory=list, max_length=64)
+    out_type: str | None = None
+    runtime_name: str | None = None
+
+
+class FormulaBinding(BaseModel):
+    kind: Literal["field", "formula", "result", "literal"]
+    field: str | None = None
+    runtime_name: str | None = None
+    result_id: str | None = None
+    value: float | int | None = None
+
+
+class FormulaTestRequest(BaseModel):
+    source: FormulaTestSource
+    bindings: dict[str, FormulaBinding] = Field(default_factory=dict, max_length=64)
+    universe: str = Field(default=_DEFAULT_UNIVERSE, min_length=1, max_length=80)
+    start: str | None = Field(default=None, max_length=64)
+    end: str | None = Field(default=None, max_length=64)
+    horizon: int = Field(default=1, ge=1, le=MAX_HORIZON)
+    weighting_scheme: Literal["quantile_ls", "rank_proportional"] = "quantile_ls"
+    quantile: float = Field(default=0.2, ge=0.01, le=0.49)
+    commission_bps: float = Field(default=1.0, ge=0.0, le=10_000.0)
+    slippage_bps: float = Field(default=5.0, ge=0.0, le=10_000.0)
+
+
+class FormulaTestKeepRequest(BaseModel):
+    name: str = Field(default="Formula backtest", min_length=1, max_length=120)
+    notes: str = Field(default="", max_length=10_000)
 
 
 class SettingsUpdate(BaseModel):
@@ -217,7 +320,8 @@ class DataCoverage(BaseModel):
 
 
 class DataSyncRequest(BaseModel):
-    symbols: list[str]
+    symbols: list[str] = Field(default_factory=list, max_length=10_000)
+    universe: str | None = Field(default=None, min_length=1, max_length=80)
     start: str
     end: str | None = None
     mode: str = "incremental"
@@ -225,6 +329,7 @@ class DataSyncRequest(BaseModel):
 
 class DataSyncResult(BaseModel):
     symbol: str
+    provider_symbol: str | None = None
     status: str
     rows_fetched: int = 0
     rows_cached: int = 0
@@ -254,24 +359,67 @@ _EVALUATORS = {"auto", "python", "cpp"}
 _SYNC_MODES = {"incremental", "refresh"}
 
 
+def _market_symbols(values: list[str]) -> list[str]:
+    """Normalize an untrusted symbol list or expose a stable client error."""
+    try:
+        return sorted({normalize_market_symbol(value) for value in values if value.strip()})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 class SessionCreateRequest(BaseModel):
-    name: str = "Session"
-    universe: str = _DEFAULT_UNIVERSE
-    as_of: str = _DEFAULT_AS_OF
-    config: dict[str, Any] = Field(default_factory=dict)
-    operators: list[OperatorSpec] = Field(default_factory=list)
-    seed_factor_ids: list[str] = Field(default_factory=list)
-    train: float = 0.6
-    valid: float = 0.2
-    embargo: int = 5
+    name: str = Field(default="Session", min_length=1, max_length=80)
+    universe: str = Field(default=_DEFAULT_UNIVERSE, min_length=1, max_length=80)
+    as_of: str = Field(default=_DEFAULT_AS_OF, min_length=1, max_length=64)
+    config: dict[str, Any] = Field(default_factory=dict, max_length=64)
+    operators: list[OperatorSpec] = Field(default_factory=list, max_length=100)
+    seed_factor_ids: list[str] = Field(default_factory=list, max_length=100)
+    train: float = Field(default=0.6, gt=0.0, lt=1.0)
+    valid: float = Field(default=0.2, gt=0.0, lt=1.0)
+    embargo: int = Field(default=5, ge=1, le=MAX_HORIZON)
+    resources: TrainingResourcesRequest = Field(default_factory=TrainingResourcesRequest)
 
 
 class SessionContinueRequest(BaseModel):
-    generations: int = 5
-    config: dict[str, Any] = Field(default_factory=dict)
-    universe: str | None = None
-    operators: list[OperatorSpec] = Field(default_factory=list)
-    seed_factor_ids: list[str] = Field(default_factory=list)
+    generations: int = Field(default=5, ge=1, le=MAX_GENERATIONS)
+    config: dict[str, Any] = Field(default_factory=dict, max_length=64)
+    universe: str | None = Field(default=None, min_length=1, max_length=80)
+    operators: list[OperatorSpec] = Field(default_factory=list, max_length=100)
+    seed_factor_ids: list[str] = Field(default_factory=list, max_length=100)
+    resources: TrainingResourcesRequest | None = None
+
+
+def _acceleration_status() -> tuple[bool, str | None]:
+    selected = cpp.selected_backend()
+    if selected == "python":
+        return False, "Python evaluator selected; parallel acceleration is disabled."
+    if not cpp.available():
+        return False, "C++ accelerator is unavailable; training uses one Python worker."
+    return True, None
+
+
+def _requested_resources(request: TrainingResourcesRequest) -> ResourcePolicy:
+    try:
+        return ResourcePolicy(request.profile, request.cpu_budget_percent)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _resolve_training_resources(
+    request: TrainingResourcesRequest, *, ic_method: str = "spearman"
+) -> ResolvedResources:
+    accelerated, reason = _acceleration_status()
+    if accelerated and not cpp.supports_native_scoring(ic_method):
+        accelerated = False
+        reason = (
+            f"{ic_method.title()} scoring uses the parity-safe Python evaluator; "
+            "training is limited to one worker."
+        )
+    return resolve_resources(
+        _requested_resources(request),
+        accelerated=accelerated,
+        fallback_reason=reason,
+    )
 
 
 def _formula_categories() -> dict[str, str]:
@@ -296,7 +444,9 @@ def _resolve_category(name: str, *, is_user: bool, formula_categories: dict[str,
 
 
 def _allowed_operators(
-    config: GPConfig, formula_runtime_names: set[str] | None = None
+    config: GPConfig,
+    formula_runtime_names: set[str] | None = None,
+    explicit_operator_names: set[str] | None = None,
 ) -> set[str] | None:
     """The operator names the GP may use, from the config's ``enabled_categories``.
 
@@ -305,7 +455,12 @@ def _allowed_operators(
     """
     enabled_set = set(config.enabled_categories or core_categories.DEFAULT_ENABLED_CATEGORIES)
     cats = _formula_categories()
-    current = formula_runtime_names or {spec.runtime_name for spec in _read_formula_specs()}
+    current = (
+        set(formula_runtime_names)
+        if formula_runtime_names is not None
+        else {spec.runtime_name for spec in _read_formula_specs()}
+    )
+    current.update(explicit_operator_names or set())
     return {
         prim.name
         for prim in OPERATORS.values()
@@ -328,7 +483,12 @@ def _primitive_info(
             "display_name": formula.display_name or formula.name.replace("_", " ").title(),
             "description": formula.description or "User-defined typed formula.",
             "inputs": [
-                {"name": item.name, "description": item.description} for item in formula.inputs
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "default": item.default,
+                }
+                for item in formula.inputs
             ],
         }
         if formula is not None
@@ -337,19 +497,20 @@ def _primitive_info(
     inputs = []
     for index, arg_type in enumerate(prim.arg_types):
         meta = doc["inputs"][index] if index < len(doc["inputs"]) else {}
-        inputs.append(
-            {
-                "name": str(meta.get("name") or f"input_{index + 1}"),
-                "type": arg_type.value,
-                "description": str(meta.get("description") or "Function input."),
-            }
-        )
+        item = {
+            "name": str(meta.get("name") or f"input_{index + 1}"),
+            "type": arg_type.value,
+            "description": str(meta.get("description") or "Function input."),
+        }
+        if meta.get("default") is not None:
+            item["default"] = meta["default"]
+        inputs.append(item)
     if prim.kind.value == "operand":
         origin = "data"
     elif prim.kind.value == "ephemeral":
         origin = "value"
     elif is_user:
-        origin = "user_formula"
+        origin = formula.origin if formula is not None else "user_formula"
     else:
         origin = "builtin"
     return {
@@ -363,10 +524,13 @@ def _primitive_info(
         "out_type": prim.out_type.value,
         "user": is_user,
         "origin": origin,
-        "editable": is_user,
+        "editable": formula.editable if formula is not None else is_user,
         "category": _resolve_category(prim.name, is_user=is_user, formula_categories=cats),
         "revision": formula.revision if formula is not None else None,
         "runtime_name": prim.name,
+        "family": formula.family if formula is not None else "",
+        "aliases": formula.aliases if formula is not None else [],
+        "catalog_revision": formula.catalog_revision if formula is not None else None,
     }
 
 
@@ -415,9 +579,41 @@ def _formula_inputs(
                 status_code=400,
                 detail=f"input {name!r} type does not match argument {index + 1}",
             )
+        default = item.default
+        if default is not None:
+            if item.type == DType.WINDOW.value:
+                if isinstance(default, bool) or not isinstance(default, int):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"default for window input {name!r} must be an integer",
+                    )
+                try:
+                    validate_tree(Node("window", value=default))
+                except Exception as exc:  # noqa: BLE001 - normalize as a client contract error
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            elif item.type == DType.SCALAR.value:
+                if (
+                    isinstance(default, bool)
+                    or not isinstance(default, (int, float))
+                    or not math.isfinite(float(default))
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"default for scalar input {name!r} must be finite",
+                    )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"only scalar and window inputs may define defaults ({name!r})",
+                )
         seen.add(name)
         normalized.append(
-            FormulaInputSpec(name=name, type=item.type, description=item.description.strip())
+            FormulaInputSpec(
+                name=name,
+                type=item.type,
+                description=item.description.strip(),
+                default=default,
+            )
         )
     return normalized
 
@@ -457,6 +653,11 @@ def _normalize_formula_spec(
         runtime_name=runtime_name or spec.runtime_name or (name if rev == 1 else f"{name}__r{rev}"),
         created_at=created_at or spec.created_at or now,
         updated_at=now,
+        origin=spec.origin.strip() or "user_formula",
+        editable=bool(spec.editable),
+        family=spec.family.strip(),
+        aliases=list(dict.fromkeys(alias.strip() for alias in spec.aliases if alias.strip())),
+        catalog_revision=spec.catalog_revision,
     )
 
 
@@ -468,42 +669,152 @@ def _legacy_formula_store(items: list[Any]) -> dict[str, Any]:
     return {"schema_version": 2, "families": families}
 
 
+def _catalog_signature(spec: FormulaSpec) -> dict[str, Any]:
+    """Stable managed-content signature; storage timestamps/runtime revision are excluded."""
+    payload = _model_dump(spec)
+    for key in ("revision", "runtime_name", "created_at", "updated_at"):
+        payload.pop(key, None)
+    return payload
+
+
+def _pin_catalog_body(
+    body: dict[str, Any], runtime_names: dict[str, str]
+) -> dict[str, Any]:
+    name = str(body["name"])
+    result: dict[str, Any] = {"name": runtime_names.get(name, name)}
+    if "value" in body:
+        result["value"] = body["value"]
+    if body.get("children"):
+        result["children"] = [
+            _pin_catalog_body(child, runtime_names) for child in body["children"]
+        ]
+    return result
+
+
+def _merge_indicator_catalog(store: dict[str, Any]) -> bool:
+    """Idempotently add/update the packaged catalog while preserving every published revision."""
+    changed = False
+    pinned: dict[str, str] = {}
+    families = {str(item.get("name")): item for item in store["families"]}
+    for definition in INDICATOR_CATALOG:
+        name = str(definition["name"])
+        dependencies = _tree_names(definition["body"]) & CATALOG_NAMES
+        # A legacy user formula occupying a reserved ta_* name is never overwritten. Catalog
+        # dependents are skipped instead of silently binding to user-controlled calculations.
+        if not dependencies <= pinned.keys():
+            continue
+        family = families.get(name)
+        if family is not None:
+            latest = _family_latest(family)
+            if latest.origin != CATALOG_ORIGIN:
+                continue
+            revision = latest.revision
+            runtime_name = latest.runtime_name
+            created_at = latest.created_at
+        else:
+            latest = None
+            revision = 1
+            runtime_name = name
+            created_at = None
+
+        candidate = _normalize_formula_spec(
+            FormulaSpec(
+                **{
+                    **definition,
+                    "body": _pin_catalog_body(definition["body"], pinned),
+                }
+            ),
+            revision=revision,
+            runtime_name=runtime_name,
+            created_at=created_at,
+        )
+        if latest is None:
+            family = {
+                "name": name,
+                "latest_revision": 1,
+                "revisions": [_model_dump(candidate)],
+            }
+            store["families"].append(family)
+            families[name] = family
+            changed = True
+        elif _catalog_signature(candidate) != _catalog_signature(latest):
+            calculation_changed = (
+                candidate.body != latest.body
+                or candidate.arg_types != latest.arg_types
+                or candidate.out_type != latest.out_type
+                or candidate.catalog_revision != latest.catalog_revision
+            )
+            if calculation_changed:
+                next_revision = latest.revision + 1
+                candidate = _normalize_formula_spec(
+                    candidate,
+                    revision=next_revision,
+                    runtime_name=f"{name}__r{next_revision}",
+                    created_at=latest.created_at,
+                )
+                family["revisions"].append(_model_dump(candidate))
+                family["latest_revision"] = next_revision
+            else:
+                candidate = _normalize_formula_spec(
+                    candidate,
+                    revision=latest.revision,
+                    runtime_name=latest.runtime_name,
+                    created_at=latest.created_at,
+                )
+                family["revisions"] = [
+                    _model_dump(candidate)
+                    if int(item.get("revision", 1)) == latest.revision
+                    else item
+                    for item in family["revisions"]
+                ]
+            changed = True
+        pinned[name] = candidate.runtime_name
+    return changed
+
+
 def _read_formula_store() -> dict[str, Any]:
     path = paths.formulas_path()
     if not path.exists():
-        return {"schema_version": 2, "families": []}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=500, detail="invalid formula store") from exc
-    if isinstance(payload, list):
-        return _legacy_formula_store(payload)
-    if not isinstance(payload, dict) or not isinstance(payload.get("families"), list):
-        raise HTTPException(status_code=500, detail="invalid formula store")
-    families: list[dict[str, Any]] = []
-    for raw in payload["families"]:
-        revisions = [
-            _model_dump(_normalize_formula_spec(FormulaSpec(**item)))
-            for item in raw.get("revisions", [])
-        ]
-        if not revisions:
-            continue
-        latest = int(raw.get("latest_revision") or max(item["revision"] for item in revisions))
-        families.append(
-            {
-                "name": str(raw.get("name") or revisions[-1]["name"]),
-                "latest_revision": latest,
-                "revisions": revisions,
-            }
-        )
-    return {"schema_version": 2, "families": families}
+        store = {"schema_version": 2, "families": []}
+    else:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=500, detail="invalid formula store") from exc
+        if isinstance(payload, list):
+            store = _legacy_formula_store(payload)
+        else:
+            if not isinstance(payload, dict) or not isinstance(payload.get("families"), list):
+                raise HTTPException(status_code=500, detail="invalid formula store")
+            families: list[dict[str, Any]] = []
+            for raw in payload["families"]:
+                revisions = [
+                    _model_dump(_normalize_formula_spec(FormulaSpec(**item)))
+                    for item in raw.get("revisions", [])
+                ]
+                if not revisions:
+                    continue
+                latest = int(
+                    raw.get("latest_revision") or max(item["revision"] for item in revisions)
+                )
+                families.append(
+                    {
+                        "name": str(raw.get("name") or revisions[-1]["name"]),
+                        "latest_revision": latest,
+                        "revisions": revisions,
+                    }
+                )
+            store = {"schema_version": 2, "families": families}
+    if _merge_indicator_catalog(store):
+        _write_formula_store(store)
+    return store
 
 
 def _write_formula_store(store: dict[str, Any]) -> None:
     paths.meta_dir().mkdir(parents=True, exist_ok=True)
-    paths.formulas_path().write_text(
+    atomic_write_text(
+        paths.formulas_path(),
         json.dumps(store, indent=2, sort_keys=True),
-        encoding="utf-8",
     )
 
 
@@ -568,43 +879,143 @@ def _formula_operator_spec(spec: FormulaSpec) -> OperatorSpec:
     )
 
 
-def _topo_sort_formulas(specs: list[FormulaSpec]) -> list[FormulaSpec]:
-    """Order formulas so a dependency is registered before the formula that references it.
-
-    Composed formulas (e.g. MACD -> DIF/DEA -> EMA) otherwise fail to reload when their
-    dependency happens to sit later in the file. On a cycle (which the type gate makes
-    impossible to create through the API), the original order is preserved as a fallback.
-    """
+def _formula_sort(
+    specs: list[FormulaSpec],
+) -> tuple[list[FormulaSpec], dict[str, str]]:
+    """Topologically order runtime revisions and report persisted cycles/dependents."""
     by_name = {spec.runtime_name: spec for spec in specs}
-    ordered: list[FormulaSpec] = []
-    visiting: set[str] = set()
-    placed: set[str] = set()
+    dependencies = {
+        spec.runtime_name: sorted(_tree_names(spec.body) & by_name.keys()) for spec in specs
+    }
+    state: dict[str, int] = {}
+    stack: list[str] = []
+    errors: dict[str, str] = {}
 
-    def visit(spec: FormulaSpec) -> None:
-        if spec.runtime_name in placed or spec.runtime_name in visiting:
+    def scan(runtime_name: str) -> None:
+        current = state.get(runtime_name, 0)
+        if current == 2:
             return
-        visiting.add(spec.runtime_name)
-        body = tree_from_dict(spec.body)
-        for other in specs:
-            if other.runtime_name != spec.runtime_name and _tree_uses(body, other.runtime_name):
-                visit(by_name[other.runtime_name])
-        visiting.discard(spec.runtime_name)
-        if spec.runtime_name not in placed:
-            placed.add(spec.runtime_name)
-            ordered.append(spec)
+        if current == 1:
+            start = stack.index(runtime_name)
+            cycle = [*stack[start:], runtime_name]
+            message = f"formula dependency cycle: {' -> '.join(cycle)}"
+            for item in cycle[:-1]:
+                errors[item] = message
+            return
+        state[runtime_name] = 1
+        stack.append(runtime_name)
+        for dependency in dependencies[runtime_name]:
+            scan(dependency)
+        stack.pop()
+        state[runtime_name] = 2
 
     for spec in specs:
-        visit(spec)
+        scan(spec.runtime_name)
+
+    # Acyclic callers of a corrupt cycle cannot be safely registered either.  Propagate a
+    # concise dependency error so every affected formula remains visible but unusable.
+    changed = True
+    while changed:
+        changed = False
+        for runtime_name, items in dependencies.items():
+            if runtime_name in errors:
+                continue
+            broken = next((item for item in items if item in errors), None)
+            if broken is not None:
+                errors[runtime_name] = f"formula dependency {broken!r} is invalid: {errors[broken]}"
+                changed = True
+
+    ordered: list[FormulaSpec] = []
+    placed: set[str] = set()
+
+    def place(runtime_name: str) -> None:
+        if runtime_name in placed or runtime_name in errors:
+            return
+        for dependency in dependencies[runtime_name]:
+            place(dependency)
+        placed.add(runtime_name)
+        ordered.append(by_name[runtime_name])
+
+    for spec in specs:
+        place(spec.runtime_name)
+    return ordered, errors
+
+
+def _topo_sort_formulas(specs: list[FormulaSpec]) -> list[FormulaSpec]:
+    ordered, errors = _formula_sort(specs)
+    if errors:
+        first = next(iter(errors.values()))
+        raise InvalidOperator(first)
     return ordered
+
+
+def _assert_latest_formula_dag(store: dict[str, Any]) -> None:
+    """Reject logical family cycles, even when their runtime revisions remain individually DAGs."""
+    latest = [_family_latest(family) for family in store["families"]]
+    runtime_to_family = {
+        spec.runtime_name: spec.name for spec in _all_formula_specs(store)
+    }
+    graph = {
+        spec.name: sorted(
+            {
+                runtime_to_family[name]
+                for name in _tree_names(spec.body)
+                if name in runtime_to_family
+            }
+        )
+        for spec in latest
+    }
+    state: dict[str, int] = {}
+    stack: list[str] = []
+
+    def visit(name: str) -> None:
+        current = state.get(name, 0)
+        if current == 2:
+            return
+        if current == 1:
+            start = stack.index(name)
+            cycle = [*stack[start:], name]
+            raise InvalidOperator(f"formula dependency cycle: {' -> '.join(cycle)}")
+        state[name] = 1
+        stack.append(name)
+        for dependency in graph.get(name, []):
+            visit(dependency)
+        stack.pop()
+        state[name] = 2
+
+    for name in graph:
+        visit(name)
 
 
 def _load_persisted_formulas() -> list[dict[str, Any]]:
     specs = _all_formula_specs()
+    expected_runtime_names = {spec.runtime_name for spec in specs}
+    # Runtime registries are process-global while tests and embedded callers may switch the data
+    # directory. Reserved managed names absent from the active store must not leak across stores.
+    for runtime_name in list(USER_OPERATORS):
+        if runtime_name.startswith("ta_") and runtime_name not in expected_runtime_names:
+            unregister_operator(runtime_name)
     status: dict[str, tuple[bool, str | None]] = {}
-    for spec in _topo_sort_formulas(specs):
+    ordered, dependency_errors = _formula_sort(specs)
+    for runtime_name, dependency_error in dependency_errors.items():
+        unregister_operator(runtime_name)
+        status[runtime_name] = (False, dependency_error)
+    for spec in ordered:
         try:
+            existing = USER_OPERATORS.get(spec.runtime_name)
+            expected_body = tree_from_dict(spec.body)
+            if (
+                spec.origin == CATALOG_ORIGIN
+                and existing is not None
+                and (
+                    existing.arg_types != tuple(DType(t) for t in spec.arg_types)
+                    or existing.out_type != DType(spec.out_type)
+                    or existing.macro_body != expected_body
+                )
+            ):
+                unregister_operator(spec.runtime_name)
             ensure_operator(
-                spec.name,
+                spec.runtime_name,
                 [DType(t) for t in spec.arg_types],
                 DType(spec.out_type),
                 spec.body,
@@ -615,8 +1026,14 @@ def _load_persisted_formulas() -> list[dict[str, Any]]:
     latest = _read_formula_specs()
     formulas: list[dict[str, Any]] = []
     for spec in latest:
-        registered, error = status.get(spec.runtime_name, (False, None))
-        formulas.append({**_model_dump(spec), "registered": registered, "error": error})
+        registered, registration_error = status.get(spec.runtime_name, (False, None))
+        formulas.append(
+            {
+                **_model_dump(spec),
+                "registered": registered,
+                "error": registration_error,
+            }
+        )
     return formulas
 
 
@@ -648,15 +1065,20 @@ def _formula_impact(name: str, proposed: FormulaSpec | None = None) -> dict[str,
     if family is None:
         raise HTTPException(status_code=404, detail="unknown formula")
     current = _family_latest(family)
+    target_runtime_names = {
+        str(item.get("runtime_name") or item.get("name")) for item in family["revisions"]
+    }
     direct: list[str] = []
     reverse: dict[str, set[str]] = {}
-    latest = _read_formula_specs()
-    for spec in latest:
+    all_specs = _all_formula_specs(store)
+    runtime_to_family = {spec.runtime_name: spec.name for spec in all_specs}
+    for spec in all_specs:
         used = _tree_names(spec.body)
-        for candidate in latest:
-            if candidate.runtime_name in used:
-                reverse.setdefault(candidate.name, set()).add(spec.name)
-        if spec.name != name and current.runtime_name in used:
+        for runtime_name in used:
+            dependency_family = runtime_to_family.get(runtime_name)
+            if dependency_family is not None and dependency_family != spec.name:
+                reverse.setdefault(dependency_family, set()).add(spec.name)
+        if spec.name != name and used & target_runtime_names:
             direct.append(spec.name)
 
     transitive: set[str] = set(direct)
@@ -672,7 +1094,7 @@ def _formula_impact(name: str, proposed: FormulaSpec | None = None) -> dict[str,
     try:
         for factor in _factor_store().list():
             required = {item.get("name") for item in factor.required_operators}
-            if current.runtime_name in required or current.runtime_name in {
+            if target_runtime_names & required or target_runtime_names & {
                 node.name for node in factor.tree.iter_nodes()
             }:
                 factor_refs.append(factor.id)
@@ -694,8 +1116,20 @@ def _formula_impact(name: str, proposed: FormulaSpec | None = None) -> dict[str,
                 item.get("runtime_name") or item.get("name")
                 for item in session.get("formula_revisions", [])
             }
-            if current.runtime_name in pinned:
+            if target_runtime_names & pinned:
                 session_refs.append(str(session.get("id") or directory.name))
+
+    active_run_refs: list[str] = []
+    for job in _jobs.list():
+        if job.status not in {"queued", "running"}:
+            continue
+        pinned = {
+            item.get("runtime_name") or item.get("name")
+            for item in job.metadata.get("formula_revisions", [])
+            if isinstance(item, dict)
+        }
+        if target_runtime_names & pinned:
+            active_run_refs.append(job.id)
 
     change = "none"
     if proposed is not None:
@@ -726,7 +1160,8 @@ def _formula_impact(name: str, proposed: FormulaSpec | None = None) -> dict[str,
         "transitive_formulas": sorted(transitive),
         "factors": sorted(set(factor_refs)),
         "sessions": sorted(set(session_refs)),
-        "has_references": bool(transitive or factor_refs or session_refs),
+        "runs": sorted(set(active_run_refs)),
+        "has_references": bool(transitive or factor_refs or session_refs or active_run_refs),
     }
 
 
@@ -758,6 +1193,32 @@ def _date_iso(value: Any) -> str:
     return pd.Timestamp(value).date().isoformat()
 
 
+def _request_timestamp(value: str, *, label: str) -> pd.Timestamp:
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid {label} date {value!r}") from exc
+    if pd.isna(timestamp):
+        raise HTTPException(status_code=400, detail=f"invalid {label} date {value!r}")
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    return timestamp.normalize()
+
+
+def _request_date_range(
+    start: str | None,
+    end: str | None,
+) -> tuple[str | None, str | None]:
+    start_ts = _request_timestamp(start, label="start") if start is not None else None
+    end_ts = _request_timestamp(end, label="end") if end is not None else None
+    if start_ts is not None and end_ts is not None and end_ts < start_ts:
+        raise HTTPException(status_code=400, detail="end date must not precede start date")
+    return (
+        start_ts.date().isoformat() if start_ts is not None else None,
+        end_ts.date().isoformat() if end_ts is not None else None,
+    )
+
+
 def _today_iso() -> str:
     return datetime.now(UTC).date().isoformat()
 
@@ -787,8 +1248,11 @@ def _search_symbol_candidates(query: str, limit: int = 8) -> list[SymbolCandidat
     for raw in raw_quotes:
         if not isinstance(raw, dict):
             continue
-        symbol = str(raw.get("symbol") or raw.get("ticker") or "").strip().upper()
-        if not symbol or symbol in seen:
+        try:
+            symbol = validate_market_symbol(str(raw.get("symbol") or raw.get("ticker") or ""))
+        except ValueError:
+            continue
+        if symbol in seen:
             continue
         seen.add(symbol)
         candidates.append(
@@ -813,7 +1277,14 @@ def _validate_symbol(
     *,
     force: bool = False,
 ) -> SymbolValidation:
-    clean = symbol.strip().upper()
+    try:
+        clean = validate_market_symbol(symbol)
+    except ValueError as exc:
+        return SymbolValidation(
+            symbol=symbol.strip().upper(),
+            valid=False,
+            error=str(exc),
+        )
     cache_key = f"{clean}|{start}|{end}"
     if not force and cache_key in _verified_symbols:
         return SymbolValidation(**{**_model_dump(_verified_symbols[cache_key]), "cached": True})
@@ -848,7 +1319,7 @@ def _coverage_for_symbol(
     end: str | None = None,
     cache: ParquetCache | None = None,
 ) -> DataCoverage:
-    clean = symbol.strip().upper()
+    clean = validate_market_symbol(symbol)
     requested_end = end or _today_iso()
     store = cache or ParquetCache()
     if not store.has(clean):
@@ -899,7 +1370,7 @@ def _sync_one_symbol(
     provider: PriceProvider,
     cache: ParquetCache,
 ) -> DataSyncResult:
-    clean = symbol.strip().upper()
+    clean = validate_market_symbol(symbol)
     requested_end = end or _today_iso()
     try:
         existing = cache.load(clean) if cache.has(clean) else None
@@ -918,6 +1389,7 @@ def _sync_one_symbol(
         if not fetch_ranges and existing is not None:
             return DataSyncResult(
                 symbol=clean,
+                provider_symbol=clean,
                 status="skipped",
                 rows_cached=len(existing),
                 first_date=_date_iso(existing.index.min()),
@@ -933,6 +1405,7 @@ def _sync_one_symbol(
         if not fetched and existing is None:
             return DataSyncResult(
                 symbol=clean,
+                provider_symbol=clean,
                 status="failed",
                 provider=_provider_source(provider, clean),
                 error="provider returned no rows",
@@ -944,6 +1417,7 @@ def _sync_one_symbol(
         stored = cache.load(clean)
         return DataSyncResult(
             symbol=clean,
+            provider_symbol=clean,
             status="fetched" if fetched else "skipped",
             rows_fetched=sum(len(frame) for frame in fetched),
             rows_cached=len(stored),
@@ -952,14 +1426,28 @@ def _sync_one_symbol(
             provider=_provider_source(provider, clean),
         )
     except Exception as exc:  # noqa: BLE001 - one failed symbol should not abort the batch
-        return DataSyncResult(symbol=clean, status="failed", provider=provider.name, error=str(exc))
+        return DataSyncResult(
+            symbol=clean,
+            provider_symbol=clean,
+            status="failed",
+            provider=provider.name,
+            error=str(exc),
+        )
 
 
-def _run_data_sync(req: DataSyncRequest, progress: SyncProgress | None = None) -> dict[str, Any]:
+def _run_data_sync(
+    req: DataSyncRequest,
+    progress: SyncProgress | None = None,
+    stop: Any = None,
+) -> dict[str, Any]:
     provider = _price_provider()
     cache = ParquetCache()
     results = []
+    stopped = False
     for symbol in req.symbols:
+        if stop is not None and stop():
+            stopped = True
+            break
         if not symbol.strip():
             continue
         results.append(
@@ -976,9 +1464,11 @@ def _run_data_sync(req: DataSyncRequest, progress: SyncProgress | None = None) -
             progress.advance(symbol)
     return {
         "mode": req.mode,
+        "universe": req.universe,
         "start": req.start,
         "end": req.end,
         "results": [_model_dump(result) for result in results],
+        "termination_reason": "user_stopped" if stopped else "completed",
     }
 
 
@@ -990,7 +1480,10 @@ _EARLIEST_HISTORY_START = "1900-01-01"
 def _resolve_membership_dates(
     symbol: str, expected_start: str, provider: PriceProvider
 ) -> MembershipSyncResult:
-    clean = symbol.strip().upper()
+    try:
+        clean = validate_market_symbol(symbol)
+    except ValueError as exc:
+        return MembershipSyncResult(symbol=symbol.strip().upper(), status="failed", error=str(exc))
     try:
         frame = provider.get_prices(clean, _EARLIEST_HISTORY_START, _today_iso())
     except Exception as exc:  # noqa: BLE001 - one symbol's failure must not abort the batch
@@ -1009,7 +1502,9 @@ def _resolve_membership_dates(
         symbol=clean,
         status="resolved",
         entry=_date_iso(entry),
-        exit=_date_iso(last_date) if delisted else None,
+        # Membership intervals are half-open [entry, exit), so the day after the final
+        # observation is the earliest exit that retains the symbol's last trading date.
+        exit=_next_day_iso(last_date) if delisted else None,
         delisted=delisted,
         list_date=_date_iso(list_date),
         last_date=_date_iso(last_date),
@@ -1069,8 +1564,7 @@ def _save_workspace_snapshot(snapshot: WorkspaceSnapshot) -> WorkspaceSnapshot:
     payload = _model_dump(snapshot)
     payload["id"] = workspace_id
     target = _workspace_path(workspace_id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    atomic_write_text(target, json.dumps(payload, indent=2, sort_keys=True))
     return WorkspaceSnapshot(**payload)
 
 
@@ -1101,9 +1595,17 @@ def _universe_to_spec(universe: Universe) -> dict[str, Any]:
 
 
 def _persist_universe(spec: UniverseSpec) -> Universe:
-    universe = _universe_from_spec(spec)
+    if bundled_snapshot_name(spec.name) == spec.name:
+        raise HTTPException(
+            status_code=400,
+            detail="bundled snapshot universe ids are reserved and immutable",
+        )
+    try:
+        universe = _universe_from_spec(spec)
+        universe.save()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     _universes[spec.name] = universe
-    universe.save()
     return universe
 
 
@@ -1118,6 +1620,358 @@ def _load_persisted_universes() -> None:
             _universes[source.stem] = Universe.load(source.stem, source)
         except Exception:
             continue
+
+
+def _resolve_universe(name: str, *, status_code: int = 400) -> Universe:
+    """Resolve bundled and custom universes through one non-fallback path."""
+    _load_persisted_universes()
+    universe = _universes.get(name)
+    if universe is not None:  # exact user ids take precedence over stable bundled aliases
+        return universe
+    if name == _DEFAULT_UNIVERSE:
+        return sample_universe(name)
+    canonical = bundled_snapshot_name(name)
+    if canonical is not None:
+        return _universes.get(canonical) or bundled_universe(canonical)
+    raise HTTPException(status_code=status_code, detail=f"unknown universe {name!r}")
+
+
+def _universe_source(universe: Universe) -> str:
+    if universe.name == _DEFAULT_UNIVERSE:
+        return "sample"
+    if _universes.get(universe.name) is universe:
+        return "custom"
+    return "bundled"
+
+
+def _universe_definition_pin(name: str) -> dict[str, Any]:
+    """Immutable definition metadata captured when work is submitted."""
+    universe = _resolve_universe(name)
+    return {
+        "name": universe.name,
+        "requested_name": name,
+        "source": _universe_source(universe),
+        "mode": universe.mode,
+        "definition": dict(universe.definition),
+        "fingerprint": universe.fingerprint,
+        "provenance": dict(universe.provenance),
+        "aliases": dict(universe.aliases),
+    }
+
+
+def _as_of_timestamp(value: str) -> pd.Timestamp:
+    timestamp = _request_timestamp(value, label="as_of")
+    if timestamp > pd.Timestamp(_today_iso()):
+        raise HTTPException(status_code=400, detail="as_of date must not be in the future")
+    return timestamp
+
+
+_CACHE_EDGE_TOLERANCE = pd.Timedelta(days=10)
+
+
+def _cache_coverage_for(
+    universe: Universe,
+    cutoff: pd.Timestamp,
+    *,
+    cache: ParquetCache | None = None,
+) -> dict[str, Any]:
+    """Describe whether cached prices span every declared membership interval.
+
+    A Parquet file by itself is not sufficient evidence of coverage: a late-starting file can
+    silently erase early constituents, while a stale active file shrinks the current
+    cross-section. A small calendar tolerance accounts for weekends, holidays, and provider lag.
+    """
+    store = cache or ParquetCache()
+    memberships = (
+        list(universe.memberships)
+        if universe.mode == "static_snapshot"
+        else [membership for membership in universe.memberships if membership.entry <= cutoff]
+    )
+    by_symbol: dict[str, list[Membership]] = {}
+    for membership in memberships:
+        by_symbol.setdefault(membership.symbol, []).append(membership)
+
+    eligible = sorted(by_symbol)
+    cached: list[str] = []
+    missing: list[str] = []
+    invalid: list[str] = []
+    uncovered: set[str] = set()
+    late_start: set[str] = set()
+    stale: set[str] = set()
+    symbol_coverage: dict[str, dict[str, Any]] = {}
+
+    for symbol in eligible:
+        if not store.has(symbol):
+            missing.append(symbol)
+            symbol_coverage[symbol] = {
+                "first_date": None,
+                "last_date": None,
+                "issues": ["missing cache file"],
+            }
+            continue
+        cached.append(symbol)
+        try:
+            frame = store.load(symbol)
+        except Exception:  # noqa: BLE001 - corrupt/unsupported Parquet is a coverage result
+            invalid.append(symbol)
+            symbol_coverage[symbol] = {
+                "first_date": None,
+                "last_date": None,
+                "issues": ["invalid cache file"],
+            }
+            continue
+
+        dates = pd.DatetimeIndex(frame.index)
+        dates = dates[dates <= cutoff]
+        issues: set[str] = set()
+        for membership in by_symbol[symbol]:
+            interval_end = cutoff
+            if universe.mode == "static_snapshot":
+                observed = dates[dates <= interval_end]
+                if len(observed) == 0:
+                    uncovered.add(symbol)
+                    issues.add("no observations on or before the requested date")
+                elif observed.max() < interval_end - _CACHE_EDGE_TOLERANCE:
+                    stale.add(symbol)
+                    issues.add("history ends before the requested date")
+                continue
+            if membership.exit is not None:
+                interval_end = min(interval_end, membership.exit - pd.Timedelta(days=1))
+            if interval_end < membership.entry:
+                continue
+            observed = dates[(dates >= membership.entry) & (dates <= interval_end)]
+            if len(observed) == 0:
+                uncovered.add(symbol)
+                issues.add("no observations during a membership interval")
+                continue
+            if observed.min() > membership.entry + _CACHE_EDGE_TOLERANCE:
+                late_start.add(symbol)
+                issues.add("history starts after the membership entry")
+            if observed.max() < interval_end - _CACHE_EDGE_TOLERANCE:
+                stale.add(symbol)
+                issues.add("history ends before the membership interval")
+
+        symbol_coverage[symbol] = {
+            "first_date": dates.min().date().isoformat() if len(dates) else None,
+            "last_date": dates.max().date().isoformat() if len(dates) else None,
+            "issues": sorted(issues),
+        }
+
+    incomplete = sorted(set(missing) | set(invalid) | uncovered | late_start | stale)
+    return {
+        "as_of": cutoff.date().isoformat(),
+        "eligible_symbols": eligible,
+        "cached_symbols": sorted(cached),
+        "missing_symbols": sorted(missing),
+        "invalid_symbols": sorted(invalid),
+        "uncovered_symbols": sorted(uncovered),
+        "late_start_symbols": sorted(late_start),
+        "stale_symbols": sorted(stale),
+        "incomplete_symbols": incomplete,
+        "symbol_coverage": symbol_coverage,
+        "complete": bool(eligible) and not incomplete,
+    }
+
+
+def _cache_coverage(universe: Universe, as_of: str) -> dict[str, Any]:
+    cutoff = _as_of_timestamp(as_of)
+    return _cache_coverage_for(universe, cutoff)
+
+
+def _universe_api_payload(
+    universe: Universe,
+    *,
+    source: str,
+    summary: bool = False,
+) -> dict[str, Any]:
+    preset = next(
+        (
+            item
+            for item in universe_presets()
+            if item["id"] == universe.name or item.get("snapshot_universe") == universe.name
+        ),
+        None,
+    )
+    display_name = (
+        str(preset["display_name"])
+        if preset is not None and source in {"sample", "bundled"}
+        else universe.name
+    )
+    integrity = universe_integrity(universe.name, source=source)
+    provenance = universe.provenance or {
+        "provider": "User-supplied",
+        "source_url": None,
+        "retrieved_at": None,
+        "note": "Saved local point-in-time membership intervals.",
+    }
+    base = {
+        "name": universe.name,
+        "display_name": display_name,
+        "source": source,
+        "mode": universe.mode,
+        "definition": dict(universe.definition),
+        "fingerprint": universe.fingerprint,
+        "provenance": provenance,
+        "aliases": dict(universe.aliases),
+        "membership_count": len(universe.memberships),
+        "symbol_count": len(universe.all_symbols()),
+        "integrity": integrity,
+    }
+    if summary:
+        issues = []
+        if universe.mode == "static_snapshot":
+            issues.append("Static snapshot is survivorship-biased outside its snapshot date.")
+        issues.append("Open universe details to validate price-date coverage.")
+        return {
+            **base,
+            "readiness": {
+                "membership_ready": True,
+                "price_ready": None,
+                "training_ready": None,
+                "research_ready": False,
+                "coverage_checked": False,
+                "issues": issues,
+            },
+        }
+
+    coverage = _cache_coverage(universe, _DEFAULT_AS_OF)
+    issues = []
+    if universe.mode == "static_snapshot":
+        issues.append("Static snapshot is survivorship-biased outside its snapshot date.")
+    if not coverage["complete"]:
+        issues.append("Price cache is missing or incomplete for one or more symbols.")
+    research_ready = bool(integrity.get("research_ready")) and coverage["complete"]
+    return {
+        **_universe_to_spec(universe),
+        **base,
+        "symbols": universe.all_symbols(),
+        "cache_coverage": coverage,
+        "readiness": {
+            "membership_ready": True,
+            "price_ready": coverage["complete"],
+            "training_ready": coverage["complete"],
+            "research_ready": research_ready,
+            "coverage_checked": True,
+            "issues": issues,
+        },
+    }
+
+
+def _panel_from_universe_cache(universe: Universe, as_of: pd.Timestamp) -> Panel:
+    """Load every cached historical member and reject silent constituent omissions."""
+    candidates = universe.members_through(as_of)
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"universe {universe.name!r} has no memberships on or before "
+                f"{as_of.date().isoformat()}"
+            ),
+        )
+    cache = ParquetCache()
+    coverage = _cache_coverage_for(universe, as_of, cache=cache)
+    cached = coverage["cached_symbols"]
+    missing_candidates = coverage["missing_symbols"]
+    if missing_candidates:
+        preview = ", ".join(missing_candidates[:8])
+        suffix = "..." if len(missing_candidates) > 8 else ""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"universe {universe.name!r} is missing cached price history for {preview}{suffix}"
+            ),
+        )
+    incomplete = coverage["incomplete_symbols"]
+    if incomplete:
+        preview = ", ".join(incomplete[:8])
+        suffix = "..." if len(incomplete) > 8 else ""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"universe {universe.name!r} has incomplete membership-period price coverage "
+                f"for {preview}{suffix}; sync full history or correct its entry/exit dates"
+            ),
+        )
+    try:
+        panel = Panel.from_cache(cached, cache=cache, end=as_of.date().isoformat())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(panel.dates) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"universe {universe.name!r} has no cached dates through {as_of.date()}",
+        )
+    start = pd.Timestamp(panel.dates.min()).normalize()
+    required = set(universe.members_overlapping(start, as_of))
+    missing = sorted(required - set(cached))
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = "..." if len(missing) > 8 else ""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"universe {universe.name!r} is missing cached price history for {preview}{suffix}"
+            ),
+        )
+    return panel
+
+
+def _mask_universe_panel(
+    universe: Universe, panel: Panel, as_of: pd.Timestamp, *, validate_coverage: bool = True
+) -> Panel:
+    """Cap dates and mask every field outside each symbol's membership intervals."""
+    dates = pd.DatetimeIndex(panel.dates)
+    keep_dates = dates <= as_of
+    if not keep_dates.any():
+        raise HTTPException(
+            status_code=400,
+            detail=f"panel has no dates on or before {as_of.date().isoformat()}",
+        )
+    capped = {name: frame.loc[keep_dates] for name, frame in panel.fields.items()}
+    dates = pd.DatetimeIndex(capped["close"].index)
+    required = universe.members_overlapping(dates.min(), as_of)
+    columns = [symbol for symbol in required if symbol in capped["close"].columns]
+
+    # Tests and embedders may override ``get_panel`` with an abstract synthetic panel. The
+    # production dependency is validated against cache before reaching this branch.
+    if not columns and not validate_coverage:
+        return Panel(capped)
+    if not columns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"universe {universe.name!r} has no cached members in the research range",
+        )
+
+    missing = sorted(set(required) - set(columns))
+    if validate_coverage and missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"universe {universe.name!r} is missing panel columns: {', '.join(missing)}",
+        )
+    membership = universe.membership_mask(dates, columns)
+    masked = {name: frame.loc[:, columns].where(membership) for name, frame in capped.items()}
+    # ``Panel.from_cache`` derives returns before masking. Recompute so the first active date
+    # cannot use a pre-membership close (and likewise after a re-entry).
+    masked["returns"] = masked["close"].pct_change(fill_method=None)
+
+    usable = [symbol for symbol in columns if masked["close"][symbol].notna().any()]
+    uncovered = sorted(set(required) - set(usable))
+    if validate_coverage and uncovered:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"universe {universe.name!r} has no in-membership price observations for "
+                f"{', '.join(uncovered)}"
+            ),
+        )
+    masked = {name: frame.loc[:, usable] for name, frame in masked.items()}
+    active_dates = masked["close"].notna().any(axis=1)
+    if not usable or not active_dates.any():
+        raise HTTPException(
+            status_code=400,
+            detail=f"universe {universe.name!r} produced an empty point-in-time panel",
+        )
+    return Panel({name: frame.loc[active_dates] for name, frame in masked.items()})
 
 
 def _save_run_workspace(job_id: str, result: Any) -> None:
@@ -1135,10 +1989,9 @@ def _save_run_workspace(job_id: str, result: Any) -> None:
     )
 
 
-def get_panel() -> Panel:
-    """Build the working panel from the cached universe (overridden in tests)."""
-    symbols = sample_universe(_DEFAULT_UNIVERSE).members_asof(_DEFAULT_AS_OF)
-    return Panel.from_cache(symbols)
+def get_panel() -> None:
+    """Lazy dependency marker; the request's selected universe determines what is loaded."""
+    return None
 
 
 def _factor_store() -> FactorStore:
@@ -1146,13 +1999,29 @@ def _factor_store() -> FactorStore:
     return FactorStore(paths.factors_dir())
 
 
-def _panel_for_universe(universe: str, as_of: str, default_panel: Panel) -> Panel:
-    """The working panel for ``universe``: a custom point-in-time one, else the default."""
-    _load_persisted_universes()
-    if universe in _universes:
-        symbols = _universes[universe].members_asof(as_of)
-        return Panel.from_cache(symbols)
-    return default_panel
+def _panel_for_universe(universe: str, as_of: str, default_panel: Panel | None) -> Panel:
+    """Resolve, cap, and date-mask a universe without a silent unknown-name fallback."""
+    resolved = _resolve_universe(universe)
+    cutoff = _as_of_timestamp(as_of)
+    if default_panel is not None and universe == _DEFAULT_UNIVERSE:
+        # A no-overlap dependency panel is an intentional test/embed override. Production's
+        # ``get_panel`` loads and validates this universe's actual cache first.
+        overlap = set(resolved.members_through(cutoff)) & set(default_panel.symbols)
+        return _mask_universe_panel(
+            resolved, default_panel, cutoff, validate_coverage=bool(overlap)
+        )
+
+    # An injected panel can also stand in for a custom universe when it contains all members;
+    # otherwise use the real cache and enforce complete historical-member coverage.
+    if default_panel is not None:
+        capped_dates = pd.DatetimeIndex(default_panel.dates)
+        capped_dates = capped_dates[capped_dates <= cutoff]
+        if len(capped_dates):
+            required = set(resolved.members_overlapping(capped_dates.min(), cutoff))
+            if required and required <= set(default_panel.symbols):
+                return _mask_universe_panel(resolved, default_panel, cutoff)
+    source = _panel_from_universe_cache(resolved, cutoff)
+    return _mask_universe_panel(resolved, source, cutoff)
 
 
 def _load_seed_factors(
@@ -1192,6 +2061,493 @@ def _load_seed_factors(
     return seeds, trial_baseline, test_reads_baseline
 
 
+def _gp_config_from_request(data: dict[str, Any]) -> GPConfig:
+    """Parse untrusted config data and consistently expose mistakes as client errors."""
+    try:
+        return GPConfig.from_dict(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid GP config: {exc}") from exc
+
+
+def _validate_panel_config(config: GPConfig, panel: Panel) -> None:
+    if config.min_names > len(panel.symbols):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"min_names ({config.min_names}) exceeds the panel's symbol count "
+                f"({len(panel.symbols)})"
+            ),
+        )
+
+
+def _preflight_split(
+    config: GPConfig,
+    panel: Panel,
+    *,
+    train: float = 0.6,
+    valid: float = 0.2,
+    embargo: int = 5,
+) -> None:
+    _validate_panel_config(config, panel)
+    try:
+        time_split(
+            panel.dates,
+            train=train,
+            valid=valid,
+            embargo=embargo,
+            horizon=config.horizon,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid time split: {exc}") from exc
+
+
+def _session_name(req: SessionCreateRequest) -> str:
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="session name must not be blank")
+    if req.train + req.valid >= 1.0:
+        raise HTTPException(status_code=400, detail="train + valid must be less than 1")
+    if any(not factor_id.strip() for factor_id in req.seed_factor_ids):
+        raise HTTPException(status_code=400, detail="seed factor ids must not be blank")
+    if len(set(req.seed_factor_ids)) != len(req.seed_factor_ids):
+        raise HTTPException(status_code=400, detail="seed factor ids must not contain duplicates")
+    return name
+
+
+class FormulaTestProgress:
+    """Small thread-safe phase tracker used by exploratory formula-test jobs."""
+
+    def __init__(self) -> None:
+        self._phase = "queued"
+        self._lock = threading.Lock()
+
+    def set_phase(self, phase: str) -> None:
+        with self._lock:
+            self._phase = phase
+
+    def finish(self, reason: str) -> None:
+        with self._lock:
+            self._phase = "stopped" if reason == "user_stopped" else "done"
+
+    def snapshot(self) -> dict[str, str]:
+        with self._lock:
+            return {"phase": self._phase}
+
+
+def _substitute_formula_args(body: Node, arguments: list[Node]) -> Node:
+    if body.name == "$arg":
+        if isinstance(body.value, bool) or not isinstance(body.value, int):
+            raise HTTPException(status_code=400, detail="$arg index must be an integer")
+        if body.value < 0 or body.value >= len(arguments):
+            raise HTTPException(
+                status_code=400,
+                detail=f"$arg index {body.value} out of range for {len(arguments)} bindings",
+            )
+        if body.children:
+            raise HTTPException(status_code=400, detail="$arg placeholder must have no children")
+        return arguments[body.value]
+    return Node(
+        body.name,
+        tuple(_substitute_formula_args(child, arguments) for child in body.children),
+        body.value,
+    )
+
+
+def _validate_formula_expansion(spec: FormulaSpec) -> None:
+    """Apply the same expanded-expression safety ceiling used by tests and training seeds."""
+    try:
+        expand_all(tree_from_dict(spec.body))
+    except (AttributeError, InvalidOperator, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid formula expansion: {exc}") from exc
+
+
+def _formula_dependency_revisions(tree: Node) -> list[dict[str, Any]]:
+    by_runtime = {spec.runtime_name: spec for spec in _all_formula_specs()}
+    seen: set[str] = set()
+    active: list[str] = []
+    ordered: list[dict[str, Any]] = []
+
+    def scan(node: Node) -> None:
+        for item in node.iter_nodes():
+            spec = by_runtime.get(item.name)
+            if spec is None or spec.runtime_name in seen:
+                continue
+            if spec.runtime_name in active:
+                start = active.index(spec.runtime_name)
+                cycle = [*active[start:], spec.runtime_name]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"formula dependency cycle: {' -> '.join(cycle)}",
+                )
+            active.append(spec.runtime_name)
+            scan(tree_from_dict(spec.body))
+            active.pop()
+            seen.add(spec.runtime_name)
+            ordered.append(
+                {
+                    "name": spec.name,
+                    "revision": spec.revision,
+                    "runtime_name": spec.runtime_name,
+                }
+            )
+
+    scan(tree)
+    return ordered
+
+
+def _result_binding_tree(result_id: str) -> Node:
+    try:
+        result = _factor_store().get(result_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=400, detail=f"unknown formula result {result_id!r}")
+    return result.expanded_tree or result.tree
+
+
+def _formula_binding_node(
+    binding: FormulaBinding,
+    expected: DType,
+    *,
+    input_name: str,
+) -> Node:
+    if binding.kind == "field":
+        field = (binding.field or "").strip()
+        prim = REGISTRY.get(field)
+        if prim is None or prim.kind.value != "operand":
+            raise HTTPException(
+                status_code=400, detail=f"unknown market field {field!r} for {input_name!r}"
+            )
+        node = Node(field)
+    elif binding.kind == "formula":
+        runtime_name = (binding.runtime_name or "").strip()
+        spec = _formula_for_runtime(runtime_name)
+        if spec is None:
+            raise HTTPException(
+                status_code=400, detail=f"unknown formula revision {runtime_name!r}"
+            )
+        if spec.arg_types:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"formula revision {runtime_name!r} still has exposed inputs; "
+                    "bind it in a concrete wrapper first"
+                ),
+            )
+        if runtime_name not in USER_OPERATORS:
+            raise HTTPException(
+                status_code=400, detail=f"formula revision {runtime_name!r} is unavailable"
+            )
+        node = Node(runtime_name)
+    elif binding.kind == "result":
+        result_id = (binding.result_id or "").strip()
+        if not result_id:
+            raise HTTPException(status_code=400, detail=f"result binding {input_name!r} is empty")
+        node = _result_binding_tree(result_id)
+    else:
+        value = binding.value
+        if expected is DType.WINDOW:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"window binding {input_name!r} must be an integer",
+                )
+            node = Node("window", value=value)
+        elif expected is DType.SCALAR:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"scalar binding {input_name!r} must be finite",
+                )
+            node = Node("const", value=float(value))
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"literal binding cannot satisfy {expected.value} input {input_name!r}",
+            )
+
+    try:
+        validate_tree(node)
+        actual = node.out_type
+    except Exception as exc:  # noqa: BLE001 - malformed persisted results are client-visible
+        raise HTTPException(
+            status_code=400, detail=f"invalid binding for {input_name!r}: {exc}"
+        ) from exc
+    if not is_subtype(actual, expected):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"binding {input_name!r} produces {actual.value}, "
+                f"but the input expects {expected.value}"
+            ),
+        )
+    return node
+
+
+def _resolve_formula_test_tree(
+    req: FormulaTestRequest,
+) -> tuple[Node, dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    loaded = _load_persisted_formulas()
+    unavailable = {
+        str(item.get("runtime_name")): str(item.get("error"))
+        for item in loaded
+        if not item.get("registered")
+    }
+    source = req.source
+    if source.kind == "saved":
+        runtime_name = (source.runtime_name or "").strip()
+        spec = _formula_for_runtime(runtime_name)
+        if spec is None:
+            raise HTTPException(
+                status_code=400, detail=f"unknown formula revision {runtime_name!r}"
+            )
+        if runtime_name in unavailable or runtime_name not in USER_OPERATORS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"formula revision {runtime_name!r} is unavailable: "
+                    f"{unavailable.get(runtime_name, '')}"
+                ),
+            )
+        inputs = list(spec.inputs)
+        out_type = DType(spec.out_type)
+        body = None
+        source_payload = {
+            "kind": "saved",
+            "name": spec.name,
+            "revision": spec.revision,
+            "runtime_name": spec.runtime_name,
+        }
+    else:
+        if source.body is None or source.out_type is None:
+            raise HTTPException(
+                status_code=400, detail="draft source requires body, inputs, and out_type"
+            )
+        try:
+            input_types = [DType(item.type) for item in source.inputs]
+            out_type = DType(source.out_type)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"unknown formula type: {exc}") from exc
+        inputs = _formula_inputs([item.value for item in input_types], list(source.inputs))
+        try:
+            body = tree_from_dict(source.body)
+            inferred = infer_macro_type(body, input_types)
+        except (InvalidOperator, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"invalid draft formula: {exc}") from exc
+        if not is_subtype(inferred, out_type):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"draft body produces {inferred.value}, not the declared {out_type.value}"
+                ),
+            )
+        source_payload = {
+            "kind": "draft",
+            "body": source.body,
+            "inputs": [_model_dump(item) for item in inputs],
+            "out_type": out_type.value,
+        }
+
+    if out_type not in {DType.SERIES, DType.SIGNAL}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"formula tests require a series or signal output, got {out_type.value}",
+        )
+    expected_names = {item.name for item in inputs}
+    supplied_names = set(req.bindings)
+    missing = sorted(expected_names - supplied_names)
+    unexpected = sorted(supplied_names - expected_names)
+    if missing or unexpected:
+        detail = []
+        if missing:
+            detail.append(f"missing bindings: {', '.join(missing)}")
+        if unexpected:
+            detail.append(f"unexpected bindings: {', '.join(unexpected)}")
+        raise HTTPException(status_code=400, detail="; ".join(detail))
+
+    arguments = [
+        _formula_binding_node(req.bindings[item.name], DType(item.type), input_name=item.name)
+        for item in inputs
+    ]
+    if source.kind == "saved":
+        assert source_payload.get("runtime_name")
+        bound = Node(str(source_payload["runtime_name"]), tuple(arguments))
+    else:
+        assert body is not None
+        bound = _substitute_formula_args(body, arguments)
+    try:
+        validate_tree(bound)
+        dependencies = _formula_dependency_revisions(bound)
+        expanded = expand_all(bound)
+        validate_tree(expanded)
+    except (InvalidOperator, KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid bound formula: {exc}") from exc
+    binding_payload = {name: _model_dump(binding) for name, binding in req.bindings.items()}
+    return expanded, source_payload, binding_payload, dependencies
+
+
+def _slice_formula_test_panel(
+    req: FormulaTestRequest,
+    default_panel: Panel | None,
+) -> tuple[Panel, pd.DatetimeIndex]:
+    """Return the full warm-up panel through ``end`` plus the requested report dates."""
+    start = _request_timestamp(req.start, label="start") if req.start else None
+    end = _request_timestamp(req.end, label="end") if req.end else None
+    if start is not None and end is not None and start > end:
+        raise HTTPException(status_code=400, detail="start date must not be after end date")
+    cutoff = (end or pd.Timestamp(_DEFAULT_AS_OF)).date().isoformat()
+    panel = _panel_for_universe(req.universe, cutoff, default_panel)
+    dates = pd.DatetimeIndex(panel.dates)
+    warmup_keep = np.ones(len(dates), dtype=bool)
+    if end is not None:
+        warmup_keep &= np.asarray(dates <= end)
+    if not warmup_keep.any():
+        raise HTTPException(status_code=400, detail="formula test date range has no cached data")
+    warmup_panel = Panel(
+        {name: frame.loc[warmup_keep] for name, frame in panel.fields.items()}
+    )
+    report_dates = pd.DatetimeIndex(warmup_panel.dates)
+    report_keep = np.ones(len(report_dates), dtype=bool)
+    if start is not None:
+        report_keep &= np.asarray(report_dates >= start)
+    if end is not None:
+        report_keep &= np.asarray(report_dates <= end)
+    report_dates = report_dates[report_keep]
+    if report_dates.empty:
+        raise HTTPException(status_code=400, detail="formula test date range has no cached data")
+    if len(warmup_panel.dates) <= req.horizon:
+        raise HTTPException(
+            status_code=400,
+            detail="formula test date range is shorter than the forward-return horizon",
+        )
+    return warmup_panel, report_dates
+
+
+def _formula_test_data_metadata(
+    panel: Panel,
+    universe: str,
+    report_dates: pd.DatetimeIndex,
+) -> tuple[dict[str, Any], str]:
+    close = panel["close"]
+    report_close = close.reindex(report_dates)
+    values = report_close.to_numpy(dtype="float64", na_value=np.nan)
+    missing = float(np.isnan(values).mean()) if values.size else 1.0
+    coverage = {
+        "universe": universe,
+        "start": pd.Timestamp(report_dates.min()).date().isoformat(),
+        "end": pd.Timestamp(report_dates.max()).date().isoformat(),
+        "dates": len(report_dates),
+        "symbols": len(panel.symbols),
+        "missing_fraction": missing,
+        "needs_sync": bool(missing > 0.0),
+        "fields": sorted(panel.fields),
+        "warmup_start": pd.Timestamp(panel.dates.min()).date().isoformat(),
+        "warmup_observations": len(panel.dates),
+    }
+    coverage.update(
+        {
+            "first_date": coverage["start"],
+            "last_date": coverage["end"],
+            "observations": coverage["dates"],
+            "warnings": (
+                [f"{missing:.1%} of close observations are missing"] if missing > 0.0 else []
+            ),
+        }
+    )
+    digest = hashlib.sha256(
+        json.dumps(coverage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    digest.update(pd.util.hash_pandas_object(close, index=True).to_numpy().tobytes())
+    digest.update("\x1f".join(map(str, close.columns)).encode("utf-8"))
+    return coverage, digest.hexdigest()
+
+
+def _formula_test_result(
+    *,
+    tree: Node,
+    panel: Panel,
+    req: FormulaTestRequest,
+    source: dict[str, Any],
+    bindings: dict[str, Any],
+    dependencies: list[dict[str, Any]],
+    report_dates: pd.DatetimeIndex,
+    data_coverage: dict[str, Any],
+    data_revision: str,
+    universe_definition: dict[str, Any],
+    progress: FormulaTestProgress,
+    cancel: threading.Event,
+) -> dict[str, Any]:
+    if cancel.is_set():
+        raise TrainingCancelled("formula test stopped")
+    progress.set_phase("evaluating")
+    factor = evaluate(tree, panel)
+    if not isinstance(factor, pd.DataFrame):
+        raise ValueError("formula did not evaluate to a panel")
+    if cancel.is_set():
+        raise TrainingCancelled("formula test stopped")
+    progress.set_phase("backtesting")
+    fwd = forward_returns(panel, req.horizon)
+    scheme: WeightingScheme
+    if req.weighting_scheme == "quantile_ls":
+        scheme = QuantileLongShort(req.quantile)
+    else:
+        scheme = RankProportional()
+    costs = TransactionCostModel(req.commission_bps, req.slippage_bps)
+    reported = backtest_report(factor, panel, fwd, scheme, costs, report_dates)
+    if cancel.is_set():
+        raise TrainingCancelled("formula test stopped")
+    # This is research-only reporting, not a locked holdout read; it remains cancellable.
+    progress.set_phase("reporting")
+    if cancel.is_set():
+        raise TrainingCancelled("formula test stopped")
+    configuration = {
+        "universe": req.universe,
+        "universe_definition": universe_definition,
+        "start": data_coverage["start"],
+        "end": data_coverage["end"],
+        "horizon": req.horizon,
+        "weighting_scheme": req.weighting_scheme,
+        "quantile": req.quantile,
+        "commission_bps": req.commission_bps,
+        "slippage_bps": req.slippage_bps,
+    }
+    return {
+        "kind": "backtest",
+        "tree": tree_to_dict(tree),
+        "expanded_tree": tree_to_dict(tree),
+        "source": source,
+        "bindings": bindings,
+        "dependency_revisions": [str(item["runtime_name"]) for item in dependencies],
+        "expression_fingerprint": hashlib.sha256(tree_to_json(tree).encode("utf-8")).hexdigest(),
+        **configuration,
+        "configuration": configuration,
+        "data_coverage": data_coverage,
+        "data_revision": data_revision,
+        "universe_definition": universe_definition,
+        "metrics": reported["metrics"],
+        "returns": reported["returns"],
+        "normalized_equity": reported["normalized_equity"],
+        "disclaimer": DISCLAIMER,
+        "exploratory": True,
+        "termination_reason": "completed",
+    }
+
+
+def _formula_test_job_payload(job: Any) -> dict[str, Any]:
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "progress": job.progress.snapshot() if job.progress is not None else None,
+        "result": job.result,
+        "error": job.error,
+        "termination_reason": job.termination_reason,
+    }
+
+
 # --- endpoints -------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1218,6 +2574,9 @@ def list_operators() -> list[dict[str, Any]]:
 
 @app.delete("/operators/{name}")
 def remove_operator(name: str) -> dict[str, str]:
+    formula = _formula_for_runtime(name)
+    if formula is not None and not formula.editable:
+        raise HTTPException(status_code=403, detail="catalog formulas cannot be removed")
     unregister_operator(name)
     return {"removed": name}
 
@@ -1229,14 +2588,27 @@ def list_formulas() -> list[dict[str, Any]]:
 
 @app.post("/formulas")
 def add_formula(spec: FormulaSpec) -> dict[str, Any]:
+    spec = FormulaSpec(
+        **{
+            **_model_dump(spec),
+            "origin": "user_formula",
+            "editable": True,
+            "catalog_revision": None,
+        }
+    )
     spec = _normalize_formula_spec(spec, revision=1)
     store = _read_formula_store()
     if _formula_family(store, spec.name) is not None:
         raise HTTPException(status_code=400, detail="formula name already exists")
-    _register(_formula_operator_spec(spec))
     store["families"].append(
         {"name": spec.name, "latest_revision": 1, "revisions": [_model_dump(spec)]}
     )
+    try:
+        _assert_latest_formula_dag(store)
+    except InvalidOperator as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _validate_formula_expansion(spec)
+    _register(_formula_operator_spec(spec))
     _write_formula_store(store)
     return {**_model_dump(spec), "registered": True, "error": None}
 
@@ -1250,10 +2622,38 @@ def validate_formula(spec: FormulaSpec) -> dict[str, Any]:
     except HTTPException as exc:
         return {"ok": False, "error": str(exc.detail), "name": None}
     try:
+        store = _read_formula_store()
+        family = _formula_family(store, normalized.name)
+        planned = copy.deepcopy(store)
+        if family is None:
+            planned["families"].append(
+                {
+                    "name": normalized.name,
+                    "latest_revision": normalized.revision,
+                    "revisions": [_model_dump(normalized)],
+                }
+            )
+        else:
+            current = _family_latest(family)
+            candidate = _normalize_formula_spec(
+                normalized,
+                revision=current.revision + 1,
+                runtime_name=f"{current.name}__r{current.revision + 1}",
+                created_at=current.created_at,
+            )
+            planned_family = _formula_family(planned, normalized.name)
+            assert planned_family is not None
+            planned_family["revisions"].append(_model_dump(candidate))
+            planned_family["latest_revision"] = candidate.revision
+        _assert_latest_formula_dag(planned)
         out = infer_macro_type(
             tree_from_dict(normalized.body), [DType(t) for t in normalized.arg_types]
         )
-    except (InvalidOperator, ValueError, KeyError) as exc:
+        _validate_formula_expansion(normalized)
+    except (HTTPException, InvalidOperator, ValueError, KeyError) as exc:
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        return {"ok": False, "error": str(error), "name": name}
+    except (AttributeError, TypeError) as exc:
         return {"ok": False, "error": str(exc), "name": name}
     declared = DType(normalized.out_type)
     if not is_subtype(out, declared):
@@ -1294,7 +2694,20 @@ def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> di
     if family is None:
         raise HTTPException(status_code=404, detail="unknown formula")
     existing = _family_latest(family)
-    requested = FormulaSpec(**{**_model_dump(spec), "name": normalized})
+    if not existing.editable:
+        raise HTTPException(
+            status_code=403,
+            detail="catalog formulas are immutable; copy one to edit",
+        )
+    requested = FormulaSpec(
+        **{
+            **_model_dump(spec),
+            "name": normalized,
+            "origin": existing.origin,
+            "editable": existing.editable,
+            "catalog_revision": existing.catalog_revision,
+        }
+    )
     updated = _normalize_formula_spec(
         requested,
         revision=existing.revision,
@@ -1310,6 +2723,7 @@ def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> di
             )
     except (InvalidOperator, ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _validate_formula_expansion(updated)
 
     if impact["change"] != "calculation":
         family["revisions"] = [
@@ -1322,19 +2736,29 @@ def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> di
     if impact["has_references"] and strategy != "upgrade_references":
         raise HTTPException(status_code=400, detail={"message": "formula is in use", **impact})
 
+    if strategy not in {"update", "upgrade_references"}:
+        raise HTTPException(status_code=400, detail="unknown formula update strategy")
+
     if not impact["has_references"]:
-        unregister_operator(existing.runtime_name)
+        revision = existing.revision + 1
+        target = _normalize_formula_spec(
+            requested,
+            revision=revision,
+            runtime_name=f"{normalized}__r{revision}",
+            created_at=existing.created_at,
+        )
+        planned = copy.deepcopy(store)
+        planned_family = _formula_family(planned, normalized)
+        assert planned_family is not None
+        planned_family["revisions"].append(_model_dump(target))
+        planned_family["latest_revision"] = target.revision
         try:
-            _register(_formula_operator_spec(updated))
-        except HTTPException:
-            _register(_formula_operator_spec(existing))
-            raise
-        family["revisions"] = [
-            _model_dump(updated) if int(item.get("revision", 1)) == existing.revision else item
-            for item in family["revisions"]
-        ]
-        _write_formula_store(store)
-        return {**_model_dump(updated), "registered": True, "error": None, "upgraded": []}
+            _assert_latest_formula_dag(planned)
+        except InvalidOperator as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _register(_formula_operator_spec(target))
+        _write_formula_store(planned)
+        return {**_model_dump(target), "registered": True, "error": None, "upgraded": []}
 
     if strategy != "upgrade_references":
         raise HTTPException(status_code=400, detail="unknown formula update strategy")
@@ -1346,6 +2770,7 @@ def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> di
         requested,
         revision=target_revision,
         runtime_name=f"{normalized}__r{target_revision}",
+        created_at=existing.created_at,
     )
     replacements[existing.runtime_name] = target.runtime_name
     candidates.append(target)
@@ -1365,9 +2790,22 @@ def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> di
             ),
             revision=revision,
             runtime_name=f"{dependent.name}__r{revision}",
+            created_at=dependent.created_at,
         )
         replacements[dependent.runtime_name] = candidate.runtime_name
         candidates.append(candidate)
+
+    planned = copy.deepcopy(store)
+    for candidate in candidates:
+        candidate_family = _formula_family(planned, candidate.name)
+        if candidate_family is None:
+            continue
+        candidate_family["revisions"].append(_model_dump(candidate))
+        candidate_family["latest_revision"] = candidate.revision
+    try:
+        _assert_latest_formula_dag(planned)
+    except InvalidOperator as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     registered: list[str] = []
     try:
@@ -1379,13 +2817,7 @@ def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> di
             unregister_operator(runtime_name)
         raise
 
-    for candidate in candidates:
-        candidate_family = _formula_family(store, candidate.name)
-        if candidate_family is None:
-            continue
-        candidate_family["revisions"].append(_model_dump(candidate))
-        candidate_family["latest_revision"] = candidate.revision
-    _write_formula_store(store)
+    _write_formula_store(planned)
     return {
         **_model_dump(target),
         "registered": True,
@@ -1396,18 +2828,28 @@ def update_formula(name: str, spec: FormulaSpec, strategy: str = "update") -> di
 
 @app.delete("/formulas/{name}")
 def delete_formula(name: str) -> dict[str, str]:
-    normalized = _normalize_formula_name(name)
-    store = _read_formula_store()
-    family = _formula_family(store, normalized)
-    if family is None:
-        raise HTTPException(status_code=404, detail="unknown formula")
-    impact = _formula_impact(normalized)
-    if impact["has_references"]:
-        raise HTTPException(status_code=400, detail={"message": "formula is in use", **impact})
-    for item in family["revisions"]:
-        unregister_operator(str(item.get("runtime_name") or item.get("name")))
-    store["families"] = [item for item in store["families"] if item["name"] != normalized]
-    _write_formula_store(store)
+    with _formula_lifecycle_lock:
+        normalized = _normalize_formula_name(name)
+        store = _read_formula_store()
+        family = _formula_family(store, normalized)
+        if family is None:
+            raise HTTPException(status_code=404, detail="unknown formula")
+        if not _family_latest(family).editable:
+            raise HTTPException(
+                status_code=403,
+                detail="catalog formulas are immutable; copy one to edit",
+            )
+        impact = _formula_impact(normalized)
+        if impact["has_references"]:
+            raise HTTPException(
+                status_code=400, detail={"message": "formula is in use", **impact}
+            )
+        for item in family["revisions"]:
+            unregister_operator(str(item.get("runtime_name") or item.get("name")))
+        store["families"] = [
+            item for item in store["families"] if item["name"] != normalized
+        ]
+        _write_formula_store(store)
     return {"removed": normalized}
 
 
@@ -1457,17 +2899,74 @@ def set_primitive_category(primitive: str, update: PrimitiveCategoryUpdate) -> d
 
 
 @app.get("/universes")
-def list_universes() -> list[dict[str, Any]]:
+def list_universes(
+    view: str | None = None,
+    summary: bool = False,
+) -> list[dict[str, Any]]:
+    if view not in {None, "detail", "summary"}:
+        raise HTTPException(status_code=400, detail="universe view must be 'detail' or 'summary'")
+    summary_view = summary or view == "summary"
     _load_persisted_universes()
     sample = sample_universe(_DEFAULT_UNIVERSE)
+    custom_names = set(_universes)
+    bundled = [
+        _universe_api_payload(
+            bundled_universe(str(spec["id"])), source="bundled", summary=summary_view
+        )
+        for spec in bundled_snapshot_specs()
+        if spec["id"] not in custom_names
+    ]
     custom = [
-        {**_universe_to_spec(universe), "symbols": universe.all_symbols(), "source": "custom"}
+        _universe_api_payload(universe, source="custom", summary=summary_view)
         for universe in sorted(_universes.values(), key=lambda u: u.name)
     ]
     return [
-        {**_universe_to_spec(sample), "symbols": sample.all_symbols(), "source": "sample"},
+        _universe_api_payload(sample, source="sample", summary=summary_view),
+        *bundled,
         *custom,
     ]
+
+
+@app.get("/universe-presets")
+def list_universe_presets() -> list[dict[str, Any]]:
+    """Common indexes expose a bundled snapshot and a separate PIT-import lifecycle."""
+    _load_persisted_universes()
+    installed = set(_universes)
+    results: list[dict[str, Any]] = []
+    for preset in universe_presets():
+        item = dict(preset)
+        snapshot_name = str(item.get("snapshot_universe") or "")
+        if snapshot_name:
+            if snapshot_name == _DEFAULT_UNIVERSE:
+                snapshot = sample_universe(snapshot_name)
+                snapshot_source = "sample"
+            else:
+                snapshot = bundled_universe(snapshot_name)
+                snapshot_source = "bundled"
+            snapshot_payload = _universe_api_payload(
+                snapshot,
+                source=snapshot_source,
+                summary=True,
+            )
+            item.update(
+                {
+                    "definition": snapshot_payload["definition"],
+                    "fingerprint": snapshot_payload["fingerprint"],
+                    "provenance_detail": snapshot_payload["provenance"],
+                    "readiness": snapshot_payload["readiness"],
+                    "aliases": snapshot_payload["aliases"],
+                }
+            )
+        pit_names = [str(item.get("pit_import_name") or ""), str(item["id"])]
+        pit_universe = next((name for name in pit_names if name and name in installed), None)
+        item.update(
+            {
+                "pit_available": pit_universe is not None,
+                "pit_universe": pit_universe,
+            }
+        )
+        results.append(item)
+    return results
 
 
 @app.post("/universes")
@@ -1480,18 +2979,20 @@ def add_universe(spec: UniverseSpec) -> dict[str, Any]:
 
 @app.get("/universes/{name}")
 def get_universe(name: str) -> dict[str, Any]:
-    _load_persisted_universes()
-    if name == _DEFAULT_UNIVERSE:
-        universe = sample_universe(_DEFAULT_UNIVERSE)
-        return {
-            **_universe_to_spec(universe),
-            "symbols": universe.all_symbols(),
-            "source": "sample",
-        }
-    universe = _universes.get(name)
-    if universe is None:
-        raise HTTPException(status_code=404, detail="unknown universe")
-    return {**_universe_to_spec(universe), "symbols": universe.all_symbols(), "source": "custom"}
+    universe = _resolve_universe(name, status_code=404)
+    if universe.name == _DEFAULT_UNIVERSE:
+        source = "sample"
+    elif _universes.get(universe.name) is universe:
+        source = "custom"
+    else:
+        source = "bundled"
+    return _universe_api_payload(universe, source=source)
+
+
+@app.get("/universes/{name}/coverage")
+def get_universe_coverage(name: str, as_of: str = _DEFAULT_AS_OF) -> dict[str, Any]:
+    universe = _resolve_universe(name, status_code=404)
+    return {"name": name, **_cache_coverage(universe, as_of)}
 
 
 @app.put("/universes/{name}")
@@ -1509,7 +3010,12 @@ def delete_universe(name: str) -> dict[str, str]:
     if name == _DEFAULT_UNIVERSE:
         raise HTTPException(status_code=400, detail="sample universes cannot be deleted")
     _load_persisted_universes()
-    target = paths.universe_dir() / f"{name}.parquet"
+    if name not in _universes and bundled_snapshot_name(name) is not None:
+        raise HTTPException(status_code=400, detail="bundled snapshots cannot be deleted")
+    try:
+        target = child_path(paths.universe_dir(), name, ".parquet", label="universe name")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if name not in _universes and not target.exists():
         raise HTTPException(status_code=404, detail="unknown universe")
     _universes.pop(name, None)
@@ -1562,23 +3068,93 @@ def delete_workspace(workspace_id: str) -> dict[str, str]:
     return {"removed": workspace_id}
 
 
+@app.get("/training/capabilities")
+def get_training_capabilities() -> dict[str, Any]:
+    accelerated, reason = _acceleration_status()
+    return {
+        **training_capabilities(accelerated=accelerated, fallback_reason=reason),
+        "evaluator": cpp.selected_backend(),
+        "cpp_available": cpp.available(),
+        "fallback_reason": reason,
+    }
+
+
 @app.post("/runs", response_model=JobResponse)
-def submit_run(req: RunRequest, panel: Panel = Depends(get_panel)) -> JobResponse:  # noqa: B008
-    _load_persisted_formulas()
-    for spec in req.operators:  # register user operators before the search sees them
-        _register(spec)
-    panel = _panel_for_universe(req.universe, _DEFAULT_AS_OF, panel)
-    config = GPConfig.from_dict(req.config)
-    allowed = _allowed_operators(config)
-    progress = RunProgress(target_generations=config.generations)
+def submit_run(
+    req: RunRequest,
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
+) -> JobResponse:
+    config = _gp_config_from_request(req.config)
+    resources = _resolve_training_resources(req.resources, ic_method=config.ic_method)
+    universe_definition = _universe_definition_pin(req.universe)
+    run_panel = _panel_for_universe(req.universe, req.as_of, panel)
+    _preflight_split(config, run_panel)
+    progress = RunProgress(
+        target_generations=config.generations,
+        resources=resources.to_dict(),
+    )
     cancel = threading.Event()
+    pinned_revisions: list[dict[str, Any]] = []
 
     def _task() -> dict[str, Any]:
-        return run_search(
-            config, panel, progress=progress, stop=cancel.is_set, allowed_operators=allowed
+        progress.set_phase("initializing")
+        result = run_search(
+            config,
+            run_panel,
+            progress=progress,
+            stop=cancel.is_set,
+            allowed_operators=allowed,
+            resources=resources,
+            scheduler=TRAINING_SCHEDULER,
         )
+        result.setdefault("resources", resources.to_dict())
+        result.setdefault("formula_revisions", pinned_revisions)
+        result.setdefault("universe_definition", universe_definition)
+        result.setdefault("context", {}).update(
+            {
+                "universe": universe_definition["name"],
+                "universe_revision": universe_definition["fingerprint"],
+                "requested_universe": req.universe,
+                "universe_definition": universe_definition,
+                "as_of": req.as_of,
+            }
+        )
+        if "termination_reason" not in result:
+            result["termination_reason"] = "user_stopped" if cancel.is_set() else "completed"
+        return result
 
-    job_id = _jobs.submit(_task, progress=progress, cancel=cancel, on_success=_save_run_workspace)
+    with _formula_lifecycle_lock:
+        _load_persisted_formulas()
+        for spec in req.operators:  # register user operators before the search sees them
+            _register(spec)
+        formulas = {spec.runtime_name for spec in _read_formula_specs()}
+        allowed = _allowed_operators(config, formulas, {spec.name for spec in req.operators})
+        pinned_by_runtime: dict[str, dict[str, Any]] = {}
+        allowed_formulas = formulas if allowed is None else formulas & allowed
+        for runtime_name in sorted(allowed_formulas):
+            for revision in _formula_dependency_revisions(Node(runtime_name)):
+                pinned_by_runtime.setdefault(str(revision["runtime_name"]), revision)
+        allowed_explicit = (
+            {spec.name for spec in req.operators}
+            if allowed is None
+            else {spec.name for spec in req.operators} & allowed
+        )
+        for spec in req.operators:
+            if spec.name not in allowed_explicit:
+                continue
+            for revision in _formula_dependency_revisions(tree_from_dict(spec.body)):
+                pinned_by_runtime.setdefault(str(revision["runtime_name"]), revision)
+        pinned_revisions = list(pinned_by_runtime.values())
+        job_id = _jobs.submit(
+            _task,
+            progress=progress,
+            metadata={
+                "formula_revisions": pinned_revisions,
+                "universe_definition": universe_definition,
+            },
+            cancel=cancel,
+            on_success=_save_run_workspace,
+        )
     return JobResponse(job_id=job_id, status="queued")
 
 
@@ -1592,16 +3168,17 @@ def get_run(job_id: str) -> dict[str, Any]:
         "status": job.status,
         "result": job.result,
         "error": job.error,
+        "termination_reason": job.termination_reason,
         "progress": job.progress.snapshot() if job.progress is not None else None,
     }
 
 
 @app.post("/runs/{job_id}/stop")
 def stop_run(job_id: str) -> dict[str, bool]:
-    """Ask a running search to halt after its current generation; it completes normally."""
-    if not _jobs.cancel(job_id):
+    """Cooperatively stop queued, scoring, or research-report work when still safe."""
+    if _jobs.get(job_id) is None:
         raise HTTPException(status_code=404, detail="unknown job")
-    return {"stopping": True}
+    return {"stopping": _jobs.cancel(job_id)}
 
 
 @app.get("/runs/{job_id}/lineage")
@@ -1613,7 +3190,136 @@ def get_lineage(job_id: str) -> dict[str, Any]:
     return lineage
 
 
+# --- exploratory formula tests --------------------------------------------------
+@app.post("/formula-tests", response_model=JobResponse)
+def submit_formula_test(
+    req: FormulaTestRequest,
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
+) -> JobResponse:
+    universe_definition = _universe_definition_pin(req.universe)
+    tree, source, bindings, dependencies = _resolve_formula_test_tree(req)
+    test_panel, report_dates = _slice_formula_test_panel(req, panel)
+    data_coverage, data_revision = _formula_test_data_metadata(
+        test_panel, req.universe, report_dates
+    )
+    progress = FormulaTestProgress()
+    cancel = threading.Event()
+
+    def _task() -> dict[str, Any]:
+        progress.set_phase("initializing")
+        return _formula_test_result(
+            tree=tree,
+            panel=test_panel,
+            req=req,
+            source=source,
+            bindings=bindings,
+            dependencies=dependencies,
+            report_dates=report_dates,
+            data_coverage=data_coverage,
+            data_revision=data_revision,
+            universe_definition=universe_definition,
+            progress=progress,
+            cancel=cancel,
+        )
+
+    job_id = _formula_test_jobs.submit(
+        _task,
+        progress=progress,
+        metadata={"universe_definition": universe_definition},
+        cancel=cancel,
+    )
+    return JobResponse(job_id=job_id, status="queued")
+
+
+@app.get("/formula-tests")
+def list_formula_tests() -> list[dict[str, Any]]:
+    return [_formula_test_job_payload(job) for job in reversed(_formula_test_jobs.list())]
+
+
+@app.get("/formula-tests/{job_id}")
+def get_formula_test(job_id: str) -> dict[str, Any]:
+    job = _formula_test_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown formula test")
+    return _formula_test_job_payload(job)
+
+
+@app.post("/formula-tests/{job_id}/stop")
+def stop_formula_test(job_id: str) -> dict[str, bool]:
+    if _formula_test_jobs.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="unknown formula test")
+    return {"stopping": _formula_test_jobs.cancel(job_id)}
+
+
+@app.delete("/formula-tests/{job_id}")
+def delete_formula_test(job_id: str) -> dict[str, str]:
+    job = _formula_test_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown formula test")
+    if job.status in {"queued", "running"}:
+        raise HTTPException(
+            status_code=409, detail="stop the active formula test before clearing it"
+        )
+    if not _formula_test_jobs.delete(job_id):
+        raise HTTPException(status_code=409, detail="formula test could not be cleared")
+    return {"removed": job_id}
+
+
+@app.post("/formula-tests/{job_id}/keep")
+def keep_formula_test(
+    job_id: str,
+    req: FormulaTestKeepRequest | None = None,
+) -> dict[str, Any]:
+    req = req or FormulaTestKeepRequest()
+    job = _formula_test_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown formula test")
+    if job.status != "done" or not isinstance(job.result, dict):
+        raise HTTPException(status_code=409, detail="formula test has not completed")
+    previous = str(job.result.get("kept_result_id") or "")
+    if previous:
+        saved = _factor_store().get(previous)
+        if saved is not None:
+            return saved.to_dict()
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="formula result name must not be blank")
+    result = job.result
+    saved = _factor_store().save(
+        name=name,
+        tree=validate_tree(tree_from_dict(result["tree"])),
+        metrics=result.get("metrics", {}),
+        provenance={
+            "source": "formula_test",
+            "formula_test_id": job_id,
+            "universe": result.get("universe"),
+            "universe_definition": result.get("universe_definition"),
+            "start": result.get("start"),
+            "end": result.get("end"),
+            "cumulative_trials": 0,
+            "test_reads": 0,
+            "exploratory": True,
+        },
+        notes=req.notes,
+        saved_at=_now_iso(),
+        kind="backtest",
+        source=result.get("source", {}),
+        bindings=result.get("bindings", {}),
+        dependency_revisions=result.get("dependency_revisions", []),
+        expression_fingerprint=str(result.get("expression_fingerprint") or ""),
+        configuration=result.get("configuration", {}),
+        data_coverage=result.get("data_coverage", {}),
+        data_revision=str(result.get("data_revision") or ""),
+        returns=result.get("returns", []),
+        normalized_equity=result.get("normalized_equity", []),
+        out_type=validate_tree(tree_from_dict(result["tree"])).out_type.value,
+    )
+    result["kept_result_id"] = saved.id
+    return saved.to_dict()
+
+
 # --- factor library --------------------------------------------------------------
+@app.get("/formula-results")
 @app.get("/factors")
 def list_factors() -> list[dict[str, Any]]:
     return [factor.to_dict() for factor in _factor_store().list()]
@@ -1636,25 +3342,38 @@ def save_factor(req: FactorSaveRequest) -> dict[str, Any]:
     return factor.to_dict()
 
 
+@app.get("/formula-results/{factor_id}")
 @app.get("/factors/{factor_id}")
 def get_factor(factor_id: str) -> dict[str, Any]:
-    factor = _factor_store().get(factor_id)
+    try:
+        factor = _factor_store().get(factor_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if factor is None:
         raise HTTPException(status_code=404, detail="unknown factor")
     return factor.to_dict()
 
 
+@app.patch("/formula-results/{factor_id}")
 @app.patch("/factors/{factor_id}")
 def patch_factor(factor_id: str, patch: FactorPatch) -> dict[str, Any]:
-    factor = _factor_store().update(factor_id, name=patch.name, notes=patch.notes)
+    try:
+        factor = _factor_store().update(factor_id, name=patch.name, notes=patch.notes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if factor is None:
         raise HTTPException(status_code=404, detail="unknown factor")
     return factor.to_dict()
 
 
+@app.delete("/formula-results/{factor_id}")
 @app.delete("/factors/{factor_id}")
 def delete_factor(factor_id: str) -> dict[str, str]:
-    if not _factor_store().delete(factor_id):
+    try:
+        deleted = _factor_store().delete(factor_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail="unknown factor")
     return {"removed": factor_id}
 
@@ -1710,7 +3429,8 @@ def search_symbols(query: str, limit: int = 8) -> list[SymbolCandidate]:
 
 @app.post("/symbols/validate", response_model=SymbolValidation)
 def validate_symbol(req: SymbolValidationRequest) -> SymbolValidation:
-    return _validate_symbol(req.symbol, req.start, req.end, force=req.force)
+    start, end = _request_date_range(req.start, req.end)
+    return _validate_symbol(req.symbol, start, end, force=req.force)
 
 
 @app.get("/data/usage")
@@ -1724,7 +3444,8 @@ def data_coverage(
     start: str | None = None,
     end: str | None = None,
 ) -> list[DataCoverage]:
-    parsed = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
+    start, end = _request_date_range(start, end)
+    parsed = _market_symbols(symbols.split(","))
     return [_coverage_for_symbol(symbol, start, end) for symbol in parsed]
 
 
@@ -1733,35 +3454,104 @@ def data_sync(req: DataSyncRequest) -> dict[str, str]:
     mode = req.mode.lower()
     if mode not in _SYNC_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_SYNC_MODES)}")
-    symbols = sorted({symbol.strip().upper() for symbol in req.symbols if symbol.strip()})
+    start, end = _request_date_range(req.start, req.end)
+    assert start is not None
+    symbols = set(_market_symbols(req.symbols))
+    universe_pin = None
+    resolved_universe = None
+    if req.universe:
+        universe = _resolve_universe(req.universe)
+        resolved_universe = universe.name
+        universe_pin = _universe_definition_pin(req.universe)
+        if universe.mode == "static_snapshot":
+            symbols.update(universe.all_symbols())
+        else:
+            symbols.update(universe.members_overlapping(start, end or _today_iso()))
     if not symbols:
-        raise HTTPException(status_code=400, detail="at least one symbol is required")
-    request = DataSyncRequest(symbols=symbols, start=req.start, end=req.end, mode=mode)
+        raise HTTPException(
+            status_code=400,
+            detail="at least one symbol or a universe with memberships in range is required",
+        )
+    request = DataSyncRequest(
+        symbols=sorted(symbols),
+        universe=resolved_universe,
+        start=start,
+        end=end,
+        mode=mode,
+    )
     progress = SyncProgress(total=len(symbols))
-    job_id = _data_jobs.submit(lambda: _run_data_sync(request, progress), progress=progress)
+    cancel = threading.Event()
+
+    def task() -> dict[str, Any]:
+        result = _run_data_sync(request, progress, cancel.is_set)
+        result["universe_definition"] = universe_pin
+        return result
+
+    metadata = {
+        "kind": "data_sync",
+        "request": _model_dump(request),
+        "universe_definition": universe_pin,
+    }
+    job_id = _data_jobs.submit(
+        task,
+        progress=progress,
+        metadata=metadata,
+        cancel=cancel,
+    )
     return {"job_id": job_id, "status": "queued"}
 
 
-@app.get("/data/sync/{job_id}")
-def data_sync_status(job_id: str) -> dict[str, Any]:
-    job = _data_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="unknown sync job")
+def _data_sync_job_payload(job: Any) -> dict[str, Any]:
     return {
         "job_id": job.id,
         "status": job.status,
         "result": job.result,
         "error": job.error,
+        "termination_reason": job.termination_reason,
+        "stopping": job.cancel.is_set() and job.status in {"queued", "running"},
+        "request": job.metadata.get("request"),
+        "universe_definition": job.metadata.get("universe_definition"),
         "progress": job.progress.snapshot() if job.progress else None,
     }
 
 
+@app.get("/data/sync")
+def list_data_sync_jobs(active_only: bool = False) -> list[dict[str, Any]]:
+    jobs = [
+        job
+        for job in _data_jobs.list()
+        if job.metadata.get("kind") == "data_sync"
+        and (not active_only or job.status in {"queued", "running"})
+    ]
+    return [_data_sync_job_payload(job) for job in reversed(jobs)]
+
+
+@app.get("/data/sync/{job_id}")
+def data_sync_status(job_id: str) -> dict[str, Any]:
+    job = _data_jobs.get(job_id)
+    if job is None or job.metadata.get("kind") != "data_sync":
+        raise HTTPException(status_code=404, detail="unknown sync job")
+    return _data_sync_job_payload(job)
+
+
+@app.post("/data/sync/{job_id}/stop")
+def stop_data_sync(job_id: str) -> dict[str, bool]:
+    job = _data_jobs.get(job_id)
+    if job is None or job.metadata.get("kind") != "data_sync":
+        raise HTTPException(status_code=404, detail="unknown sync job")
+    return {"stopping": _data_jobs.cancel(job_id)}
+
+
 @app.post("/universes/sync-dates")
 def universes_sync_dates(req: MembershipSyncRequest) -> dict[str, str]:
-    symbols = sorted({symbol.strip().upper() for symbol in req.symbols if symbol.strip()})
+    symbols = _market_symbols(req.symbols)
     if not symbols:
         raise HTTPException(status_code=400, detail="at least one symbol is required")
-    request = MembershipSyncRequest(symbols=symbols, expected_start=req.expected_start)
+    expected_start = _request_timestamp(req.expected_start, label="expected start")
+    request = MembershipSyncRequest(
+        symbols=symbols,
+        expected_start=expected_start.date().isoformat(),
+    )
     progress = SyncProgress(total=len(symbols))
     job_id = _data_jobs.submit(lambda: _run_membership_sync(request, progress), progress=progress)
     return {"job_id": job_id, "status": "queued"}
@@ -1798,41 +3588,78 @@ def _validate_seeds(seeds: list[Any], config: GPConfig) -> None:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _session_exists(session_id: str) -> bool:
+    try:
+        return sessions.exists(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _live_session_job(session: dict[str, Any]) -> Any | None:
+    """Return an active in-process job and clear a stale persisted reservation."""
+    active_id = str(session.get("active_job_id") or "")
+    legacy_id = str(session.get("last_job_id") or "")
+    job = _jobs.get(active_id or legacy_id)
+    if job is not None and job.status in ("queued", "running"):
+        return job
+    if active_id:
+        status = job.status if job is not None else "interrupted"
+        error = job.error if job is not None else "application restarted during the segment"
+        sessions.finish_job(session["id"], active_id, status, error=error)
+    return None
+
+
 def _session_job_view(session: dict[str, Any]) -> dict[str, Any] | None:
-    job = _jobs.get(session.get("last_job_id") or "")
-    if job is None:
-        return None
-    return {
-        "id": job.id,
-        "status": job.status,
-        "progress": job.progress.snapshot() if job.progress is not None else None,
-    }
+    job = _live_session_job(session)
+    if job is not None:
+        return {
+            "id": job.id,
+            "status": job.status,
+            "termination_reason": job.termination_reason,
+            "progress": job.progress.snapshot() if job.progress is not None else None,
+        }
+    persisted = session.get("last_job")
+    if isinstance(persisted, dict):
+        return {**persisted, "progress": None}
+    return None
 
 
 @app.post("/sessions")
 def create_session(
     req: SessionCreateRequest,
-    panel: Panel = Depends(get_panel),  # noqa: B008
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
 ) -> dict[str, str]:
-    _load_persisted_formulas()
-    for spec in req.operators:
-        _register(spec)
-    panel = _panel_for_universe(req.universe, req.as_of, panel)
-    seeds, trial_baseline, test_reads_baseline = _load_seed_factors(req.seed_factor_ids)
-    config = GPConfig.from_dict(req.config)
-    _validate_seeds(seeds, config)
+    name = _session_name(req)
+    config = _gp_config_from_request(req.config)
+    requested_resources = _requested_resources(req.resources)
+    resources = _resolve_training_resources(req.resources, ic_method=config.ic_method)
+    resolved_as_of = _as_of_timestamp(req.as_of).date().isoformat()
+    universe_definition = _universe_definition_pin(req.universe)
+    panel = _panel_for_universe(req.universe, resolved_as_of, panel)
+    _validate_panel_config(config, panel)
     try:
         boundaries = sessions.derive_boundaries(
-            panel.dates, train=req.train, valid=req.valid, embargo=req.embargo
+            panel.dates,
+            train=req.train,
+            valid=req.valid,
+            embargo=req.embargo,
+            horizon=config.horizon,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    _load_persisted_formulas()
+    for spec in req.operators:
+        _register(spec)
+    seeds, trial_baseline, test_reads_baseline = _load_seed_factors(req.seed_factor_ids)
+    _validate_seeds(seeds, config)
+
     formula_revisions = _active_formula_operator_specs()
     session = sessions.new_session(
-        name=req.name,
-        universe=req.universe,
-        as_of=req.as_of,
+        name=name,
+        universe=str(universe_definition["name"]),
+        universe_definition=universe_definition,
+        as_of=resolved_as_of,
         config=config,
         operators=[_model_dump(spec) for spec in req.operators],
         formula_revisions=formula_revisions,
@@ -1841,27 +3668,64 @@ def create_session(
         trial_baseline=trial_baseline,
         test_reads_baseline=test_reads_baseline,
         created_at=_now_iso(),
+        resources=requested_resources.to_dict(),
     )
     session_id = session["id"]
-    allowed = _allowed_operators(config, {str(item["name"]) for item in formula_revisions})
-    progress = RunProgress(target_generations=config.generations)
+    allowed = _allowed_operators(
+        config,
+        {str(item["name"]) for item in formula_revisions},
+        {spec.name for spec in req.operators},
+    )
+    progress = RunProgress(
+        target_generations=config.generations,
+        resources=resources.to_dict(),
+    )
     cancel = threading.Event()
     job_id = uuid.uuid4().hex
+    if not sessions.claim_job(session_id, job_id):
+        raise HTTPException(status_code=409, detail="a segment is already running")
 
     def _task() -> dict[str, Any]:
-        return sessions.run_segment(
+        sessions.update_job_status(session_id, job_id, "running")
+        progress.set_phase("initializing")
+        try:
+            result = sessions.run_segment(
+                session_id,
+                job_id=job_id,
+                panel=panel,
+                config=config,
+                generations=config.generations,
+                seeds=seeds,
+                progress=progress,
+                stop=cancel.is_set,
+                allowed_operators=allowed,
+                resources=resources,
+                scheduler=TRAINING_SCHEDULER,
+            )
+        except (TrainingCancelled, TrainingLeaseCancelled):
+            sessions.finish_job(session_id, job_id, "stopped")
+            raise
+        except Exception as exc:
+            sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+            raise
+        sessions.finish_job(
             session_id,
-            job_id=job_id,
-            panel=panel,
-            config=config,
-            generations=config.generations,
-            seeds=seeds,
-            progress=progress,
-            stop=cancel.is_set,
-            allowed_operators=allowed,
+            job_id,
+            "stopped" if result.get("termination_reason") == "user_stopped" else "done",
         )
+        return result
 
-    _jobs.submit(_task, job_id=job_id, progress=progress, cancel=cancel)
+    try:
+        _jobs.submit(
+            _task,
+            job_id=job_id,
+            progress=progress,
+            metadata={"universe_definition": universe_definition},
+            cancel=cancel,
+        )
+    except Exception as exc:
+        sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+        raise
     return {"session_id": session_id, "job_id": job_id}
 
 
@@ -1869,16 +3733,54 @@ def create_session(
 def continue_session(
     session_id: str,
     req: SessionContinueRequest,
-    panel: Panel = Depends(get_panel),  # noqa: B008
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
 ) -> dict[str, str]:
     _load_persisted_formulas()
-    if not sessions.exists(session_id):
+    if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="unknown session")
     session = sessions.load_session(session_id)
 
-    job = _jobs.get(session.get("last_job_id") or "")
-    if job is not None and job.status in ("queued", "running"):
+    if _live_session_job(session) is not None:
         raise HTTPException(status_code=409, detail="a segment is already running")
+
+    if req.resources is None:
+        stored_resources = session.get("resources") or {
+            "profile": "auto",
+            "cpu_budget_percent": None,
+        }
+        if (
+            "cpu_budget_percent" not in stored_resources
+            and "custom_percent" in stored_resources
+        ):
+            stored_resources = {
+                **stored_resources,
+                "cpu_budget_percent": stored_resources.get("custom_percent"),
+            }
+        resource_request = TrainingResourcesRequest(**stored_resources)
+    else:
+        resource_request = req.resources
+    requested_resources = _requested_resources(resource_request)
+    stored_config = _gp_config_from_request(session["config"])
+    merged = {**session["config"], **req.config}
+    config = _gp_config_from_request(merged)
+    resources = _resolve_training_resources(resource_request, ic_method=config.ic_method)
+    if config.population_size * req.generations > MAX_SEARCH_EVALUATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "population_size * additional generations must not exceed "
+                f"{MAX_SEARCH_EVALUATIONS:,} evaluations"
+            ),
+        )
+    boundaries = sessions.Boundaries.from_dict(session["boundaries"])
+    if config.horizon > boundaries.embargo:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"horizon ({config.horizon}) exceeds the session's frozen embargo "
+                f"({boundaries.embargo})"
+            ),
+        )
 
     for spec in req.operators:  # newly added operators for this segment
         try:
@@ -1902,7 +3804,7 @@ def continue_session(
     for stored in pinned_formulas:
         try:
             ensure_operator(
-                stored["name"],
+                stored.get("runtime_name") or stored["name"],
                 [DType(t) for t in stored["arg_types"]],
                 DType(stored["out_type"]),
                 stored["body"],
@@ -1910,13 +3812,16 @@ def continue_session(
         except (InvalidOperator, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    universe = req.universe or session["universe"]
-    new_panel = _panel_for_universe(universe, session["as_of"], panel)
-    universe_changed = universe != session["universe"]
-
-    stored_config = GPConfig.from_dict(session["config"])
-    merged = {**session["config"], **req.config}
-    config = GPConfig.from_dict(merged)
+    requested_universe = req.universe or session["universe"]
+    universe_definition = _universe_definition_pin(requested_universe)
+    universe = str(universe_definition["name"])
+    new_panel = _panel_for_universe(requested_universe, session["as_of"], panel)
+    _validate_panel_config(config, new_panel)
+    stored_universe_definition = session.get("universe_definition") or {}
+    universe_changed = (
+        universe != session["universe"]
+        or stored_universe_definition.get("fingerprint") != universe_definition["fingerprint"]
+    )
     scoring_changed = any(
         getattr(stored_config, field) != getattr(config, field)
         for field in ("parsimony", "ic_method", "min_names", "horizon")
@@ -1926,34 +3831,79 @@ def continue_session(
     extra_seeds, _, _ = _load_seed_factors(req.seed_factor_ids)
     _validate_seeds(extra_seeds, config)
 
-    if universe_changed:
-        session["universe"] = universe
-        session["config"] = merged
-        sessions.save_session(session)
-    elif merged != session["config"]:
-        session["config"] = merged
-        sessions.save_session(session)
-
-    allowed = _allowed_operators(config, {str(item["name"]) for item in pinned_formulas})
-    progress = RunProgress(target_generations=config.generations)
-    cancel = threading.Event()
     job_id = uuid.uuid4().hex
+    if not sessions.claim_job(session_id, job_id):
+        raise HTTPException(status_code=409, detail="a segment is already running")
+
+    # Reload the reservation before persisting config/operator changes so a stale request
+    # snapshot cannot erase ``active_job_id``.
+    session = sessions.load_session(session_id)
+    if req.operators:
+        by_name = {str(item["name"]): item for item in session.get("operators", [])}
+        by_name.update({spec.name: _model_dump(spec) for spec in req.operators})
+        session["operators"] = list(by_name.values())
+    session["universe"] = universe
+    session["universe_definition"] = universe_definition
+    session["config"] = merged
+    session["resources"] = requested_resources.to_dict()
+    sessions.save_session(session)
+
+    allowed = _allowed_operators(
+        config,
+        {str(item["name"]) for item in pinned_formulas},
+        {
+            str(item["name"])
+            for item in [*session.get("operators", []), *[_model_dump(s) for s in req.operators]]
+        },
+    )
+    progress = RunProgress(
+        target_generations=config.generations,
+        resources=resources.to_dict(),
+    )
+    cancel = threading.Event()
 
     def _task() -> dict[str, Any]:
-        return sessions.run_segment(
+        sessions.update_job_status(session_id, job_id, "running")
+        progress.set_phase("initializing")
+        try:
+            result = sessions.run_segment(
+                session_id,
+                job_id=job_id,
+                panel=new_panel,
+                config=config,
+                generations=req.generations,
+                extra_seeds=extra_seeds,
+                rescore=rescore,
+                progress=progress,
+                stop=cancel.is_set,
+                allowed_operators=allowed,
+                resources=resources,
+                scheduler=TRAINING_SCHEDULER,
+            )
+        except (TrainingCancelled, TrainingLeaseCancelled):
+            sessions.finish_job(session_id, job_id, "stopped")
+            raise
+        except Exception as exc:
+            sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+            raise
+        sessions.finish_job(
             session_id,
-            job_id=job_id,
-            panel=new_panel,
-            config=config,
-            generations=req.generations,
-            extra_seeds=extra_seeds,
-            rescore=rescore,
-            progress=progress,
-            stop=cancel.is_set,
-            allowed_operators=allowed,
+            job_id,
+            "stopped" if result.get("termination_reason") == "user_stopped" else "done",
         )
+        return result
 
-    _jobs.submit(_task, job_id=job_id, progress=progress, cancel=cancel)
+    try:
+        _jobs.submit(
+            _task,
+            job_id=job_id,
+            progress=progress,
+            metadata={"universe_definition": universe_definition},
+            cancel=cancel,
+        )
+    except Exception as exc:
+        sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+        raise
     return {"session_id": session_id, "job_id": job_id}
 
 
@@ -1983,7 +3933,7 @@ def list_sessions() -> list[dict[str, Any]]:
 
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str) -> dict[str, Any]:
-    if not sessions.exists(session_id):
+    if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="unknown session")
     session = sessions.load_session(session_id)
     result_path = sessions.session_dir(session_id) / "result.json"
@@ -1996,6 +3946,8 @@ def get_session(session_id: str) -> dict[str, Any]:
 
 @app.get("/sessions/{session_id}/lineage")
 def get_session_lineage(session_id: str) -> dict[str, Any]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
     lineage_path = sessions.session_dir(session_id) / "lineage.json"
     if not lineage_path.exists():
         raise HTTPException(status_code=404, detail="no lineage yet")
@@ -2005,11 +3957,11 @@ def get_session_lineage(session_id: str) -> dict[str, Any]:
 
 @app.post("/sessions/{session_id}/stop")
 def stop_session(session_id: str) -> dict[str, bool]:
-    if not sessions.exists(session_id):
+    if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="unknown session")
     session = sessions.load_session(session_id)
-    job_id = session.get("last_job_id")
-    if job_id and _jobs.cancel(job_id):
+    job = _live_session_job(session)
+    if job is not None and _jobs.cancel(job.id):
         return {"stopping": True}
     return {"stopping": False}
 

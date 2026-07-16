@@ -3,10 +3,11 @@
 // existing Dashboard / Factor / Genealogy views render it unchanged.
 
 import { useEffect, useRef, useState } from "react";
-import type { RunResult } from "../api/types";
+import type { RunResult, TrainingResourcesRequest } from "../api/types";
 import { ProgressView } from "./ProgressView";
 import { RunConfigForm, type RunRequestForm } from "./RunConfigForm";
 import { useSession } from "./useSession";
+import { TrainingResourcePicker } from "./TrainingResourcePicker";
 
 export function TrainPanel({
   seedIds = [],
@@ -15,6 +16,7 @@ export function TrainPanel({
   onRunningChange,
   onOpenDashboard,
   onOpenUniverseEditor,
+  onOpenDataSync,
   onOpenFormulaEditor,
 }: {
   seedIds?: string[];
@@ -23,11 +25,17 @@ export function TrainPanel({
   onRunningChange?: (running: boolean, sessionId: string | null) => void;
   onOpenDashboard?: () => void;
   onOpenUniverseEditor?: (universeName: string) => void;
+  onOpenDataSync?: () => void;
   onOpenFormulaEditor?: () => void;
 }) {
   const { sessionId, state, error, notice, phase, start, cont, stop, attach, reset } =
     useSession(onComplete);
   const [moreGenerations, setMoreGenerations] = useState(5);
+  const [overrideResources, setOverrideResources] = useState(false);
+  const [continueResources, setContinueResources] = useState<TrainingResourcesRequest>({
+    profile: "auto",
+    cpu_budget_percent: null,
+  });
 
   // On reload, re-attach to a persisted session so an in-flight run keeps streaming progress.
   const restored = useRef(false);
@@ -44,13 +52,20 @@ export function TrainPanel({
   }, [phase, sessionId, onRunningChange]);
 
   const running = phase === "running";
-  const done = phase === "done";
+  // A run can stop before its first report exists; its persisted checkpoint/session is still
+  // valid and must remain resumable.
+  const done = phase === "done" || phase === "stopped";
+  const hasCompleteReport = Boolean(state?.result?.report);
+  const lastSegment = state?.segments[state.segments.length - 1];
+  const reportCancelled = Boolean(lastSegment?.report_cancelled);
 
   function handleStart(req: RunRequestForm) {
     void start({
       name: req.name,
       universe: req.universe,
+      as_of: req.as_of,
       config: req.config,
+      resources: req.resources,
       seed_factor_ids: req.seed_factor_ids,
     });
   }
@@ -65,6 +80,7 @@ export function TrainPanel({
           onStart={handleStart}
           disabled={running}
           onEditUniverse={onOpenUniverseEditor}
+          onOpenDataSync={onOpenDataSync}
           onOpenFormulaEditor={onOpenFormulaEditor}
         />
       )}
@@ -102,6 +118,13 @@ export function TrainPanel({
             </dl>
           )}
 
+          {reportCancelled && (
+            <p className="hint" role="status" data-testid="report-cancelled-note">
+              Report generation was cancelled before the locked test was opened. The checkpoint
+              is saved, and any previous completed report was retained.
+            </p>
+          )}
+
           {done && (
             <div className="train-continue" data-testid="train-continue">
               <h4>Continue training from this generation</h4>
@@ -115,18 +138,42 @@ export function TrainPanel({
                   onChange={(e) => setMoreGenerations(Number(e.target.value))}
                 />
               </label>
+              <label className="seed-option resource-override-toggle">
+                <input
+                  type="checkbox"
+                  checked={overrideResources}
+                  onChange={(event) => setOverrideResources(event.target.checked)}
+                />
+                <span>Change computer resources for this segment</span>
+              </label>
+              {overrideResources ? (
+                <TrainingResourcePicker
+                  value={continueResources}
+                  onChange={setContinueResources}
+                  label="Continue resources"
+                />
+              ) : (
+                <p className="hint">Uses this session's current resource profile.</p>
+              )}
               <div className="train-actions">
                 <button
                   type="button"
                   className="primary-action"
                   data-testid="continue-run"
-                  onClick={() => void cont({ generations: moreGenerations })}
+                  onClick={() =>
+                    void cont({
+                      generations: moreGenerations,
+                      ...(overrideResources ? { resources: continueResources } : {}),
+                    })
+                  }
                 >
                   Continue
                 </button>
-                <button type="button" className="ghost" onClick={onOpenDashboard}>
-                  Open dashboard
-                </button>
+                {hasCompleteReport && (
+                  <button type="button" className="ghost" onClick={onOpenDashboard}>
+                    Open dashboard
+                  </button>
+                )}
               </div>
               <p className="hint">
                 The locked test boundary is frozen for this session; continuing reads the

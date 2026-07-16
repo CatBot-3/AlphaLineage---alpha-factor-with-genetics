@@ -1,4 +1,4 @@
-"""Benchmark the C++ vs pure-Python evaluator on the hot path (for the writeup).
+"""Benchmark Python, scalar native, and bounded native batch evaluation.
 
 Run: ``python scripts/bench_evaluator.py``. Builds a large synthetic panel and times a batch of
 random expression trees through both backends; prints per-tree time and the speedup. If the C++
@@ -52,7 +52,8 @@ def _bench(t: int, n: int, n_trees: int, note: str) -> None:
         evaluate_python(tr, panel)
     py = time.perf_counter() - start
 
-    line = f"{t:>5} x {n:<3}  {len(trees):>4} trees | python {1e3 * py / len(trees):6.3f} ms/tree"
+    python_per_tree = py / len(trees)
+    line = f"{t:>5} x {n:<3}  {len(trees):>4} trees | python {1e3 * python_per_tree:6.3f} ms/tree"
     if cpp.available():
         cpp.evaluate_cpp(trees[0], panel)  # warm the cached panel arrays
         start = time.perf_counter()
@@ -60,18 +61,33 @@ def _bench(t: int, n: int, n_trees: int, note: str) -> None:
             cpp.evaluate_cpp(tr, panel)
         cc = time.perf_counter() - start
         line += f" | c++ {1e3 * cc / len(trees):6.3f} ms/tree | speedup {py / cc:4.1f}x"
+        # Keep retained DataFrame results below roughly 128 MiB for the large-panel case.
+        frame_bytes = t * n * np.dtype(np.float64).itemsize
+        batch_count = min(len(trees), max(1, (128 * 1024**2) // max(1, frame_bytes)))
+        batch_trees = trees[:batch_count]
+        workers = min(8, cpp.native_max_workers(), batch_count)
+        start = time.perf_counter()
+        results = cpp.evaluate_many(
+            batch_trees, panel, workers=workers, memory_budget_bytes=256 * 1024**2
+        )
+        batch = time.perf_counter() - start
+        assert all(result is not None for result in results)
+        batch_per_tree = batch / batch_count
+        line += (
+            f" | batch-{workers} {1e3 * batch_per_tree:6.3f} ms/tree"
+            f" | vs python {python_per_tree / batch_per_tree:4.1f}x"
+        )
     print(f"{line}  ({note})")
 
 
 def main() -> int:
     if not cpp.available():
         print("C++ extension not built - run `python scripts/build_cpp.py` to compare.\n")
-    # The GP hot path: a small point-in-time universe, evaluated millions of times. Here the
-    # per-op Python/pandas overhead dominates and C++ wins. On very large panels, pandas'
-    # vectorized C rolling/rank wins - but that is not the workload the GP actually runs.
+    # The GP hot path is dominated by many small/medium panel evaluations. Keep one large-panel
+    # case as a regression guard for the linear rolling and O(N log N) rank implementations.
     _bench(252, 10, 2000, "GP hot path - small universe")
     _bench(500, 12, 1500, "small universe, longer history")
-    _bench(2000, 200, 300, "large panel - pandas' vectorization wins")
+    _bench(2000, 200, 300, "large-panel regression guard")
     return 0
 
 

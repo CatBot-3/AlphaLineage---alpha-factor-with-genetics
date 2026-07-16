@@ -17,7 +17,7 @@ import type {
   SessionState,
 } from "../api/types";
 
-export type SessionPhase = "idle" | "running" | "done" | "failed";
+export type SessionPhase = "idle" | "running" | "done" | "stopped" | "failed";
 
 const POLL_MS = 1000;
 
@@ -51,11 +51,20 @@ export function useSession(onComplete?: (result: RunResult) => void) {
         setState(next);
         const status = next.job?.status;
         if (status === "done") {
-          if (next.result && !firedRef.current) {
+          if (next.result?.report && !firedRef.current) {
             firedRef.current = true;
             onCompleteRef.current?.(next.result);
           }
           return; // stop polling
+        }
+        if (status === "stopped") {
+          // A stop during research-only validation intentionally has no locked-test report.
+          // Keep that session resumable without publishing an incomplete result to Dashboard.
+          if (next.result?.report && !firedRef.current) {
+            firedRef.current = true;
+            onCompleteRef.current?.(next.result);
+          }
+          return;
         }
         if (status === "failed") {
           setError("the run failed; see the backend logs");

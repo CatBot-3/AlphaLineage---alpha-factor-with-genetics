@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pandas as pd
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import alphalineage.api.app as api_app
@@ -39,7 +41,7 @@ def _poll(client: TestClient, job_id: str, *, timeout: float = 60.0) -> dict:
     payload: dict = {}
     while time.monotonic() < deadline:
         payload = client.get(f"/runs/{job_id}").json()
-        if payload["status"] in ("done", "failed"):
+        if payload["status"] in ("done", "stopped", "failed"):
             return payload
         time.sleep(0.2)
     return payload
@@ -73,6 +75,119 @@ def test_health(client):
     assert response.json()["status"] == "ok"
 
 
+def test_training_capabilities_are_device_relative_and_python_fallback_is_visible(
+    client, monkeypatch
+):
+    monkeypatch.setattr(api_app.cpp, "available", lambda: False)
+    response = client.get("/training/capabilities")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["default_profile"] == "auto"
+    assert payload["worker_capacity"] <= 32
+    assert payload["profiles"]["auto"]["percent"] == 50
+    auto = payload["profiles"]["auto"]
+    assert auto["requested_workers"] >= auto["effective_workers"]
+    assert auto["effective_workers"] == auto["workers"] == 1
+    assert "one Python worker" in payload["fallback_reason"]
+
+
+def test_non_native_scoring_method_resolves_to_visible_single_worker(monkeypatch):
+    monkeypatch.setattr(api_app, "_acceleration_status", lambda: (True, None))
+    monkeypatch.setattr(
+        api_app.cpp, "supports_native_scoring", lambda method: method == "spearman"
+    )
+
+    resolved = api_app._resolve_training_resources(
+        api_app.TrainingResourcesRequest(profile="auto"), ic_method="pearson"
+    )
+
+    assert resolved.requested_workers > 1
+    assert resolved.effective_workers == resolved.workers == 1
+    assert "Pearson" in str(resolved.fallback_reason)
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"profile": "custom"},
+        {"profile": "auto", "cpu_budget_percent": 50},
+    ],
+)
+def test_training_resource_request_rejects_ambiguous_percent(client, resources):
+    response = client.post(
+        "/runs",
+        json={
+            "config": {
+                "population_size": 8,
+                "generations": 1,
+                "max_depth": 4,
+                "max_nodes": 20,
+            },
+            "resources": resources,
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_panel_dependency_is_lazy_until_request_universe_is_known():
+    assert get_panel() is None
+
+
+def test_cached_universe_rejects_any_missing_historical_member(synthetic_prices):
+    from alphalineage.data.cache import ParquetCache
+    from alphalineage.data.universe import Membership, Universe
+
+    cache = ParquetCache()
+    cache.store("LATE", api_app.schema.normalize(synthetic_prices))
+    universe = Universe(
+        "cache-completeness",
+        [
+            Membership("EARLY", pd.Timestamp("2000-01-01"), pd.Timestamp("2010-01-01")),
+            Membership("LATE", pd.Timestamp("2020-01-01")),
+        ],
+    )
+
+    with pytest.raises(HTTPException, match="EARLY"):
+        api_app._panel_from_universe_cache(universe, pd.Timestamp("2025-01-01"))
+
+
+def test_universe_cache_coverage_validates_membership_period_edges(synthetic_prices):
+    from alphalineage.data.cache import ParquetCache
+    from alphalineage.data.universe import Membership, Universe
+
+    prices = api_app.schema.normalize(synthetic_prices)
+    cache = ParquetCache()
+    cache.store("FULL", prices)
+    cache.store("LATE", prices.iloc[12:])
+    cache.store("STALE", prices.iloc[:10])
+    cutoff = prices.index.max()
+    universe = Universe(
+        "cache-edges",
+        [
+            Membership("FULL", prices.index.min()),
+            Membership("LATE", prices.index.min()),
+            Membership("STALE", prices.index.min()),
+        ],
+    )
+
+    complete = api_app._cache_coverage_for(
+        Universe("cache-full", [Membership("FULL", prices.index.min())]),
+        cutoff,
+        cache=cache,
+    )
+    assert complete["complete"] is True
+
+    coverage = api_app._cache_coverage_for(universe, cutoff, cache=cache)
+    assert coverage["complete"] is False
+    assert coverage["late_start_symbols"] == ["LATE"]
+    assert coverage["stale_symbols"] == ["STALE"]
+    assert coverage["incomplete_symbols"] == ["LATE", "STALE"]
+    assert coverage["symbol_coverage"]["FULL"]["issues"] == []
+
+    with pytest.raises(HTTPException, match="incomplete membership-period"):
+        api_app._panel_from_universe_cache(universe, cutoff)
+
+
 def test_job_lifecycle(client):
     config = {"population_size": 16, "generations": 2, "max_depth": 4, "max_nodes": 20, "seed": 0}
     submit = client.post("/runs", json={"config": config})
@@ -81,6 +196,7 @@ def test_job_lifecycle(client):
 
     final = _poll(client, job_id)
     assert final["status"] == "done", final
+    assert client.post(f"/runs/{job_id}/stop").json() == {"stopping": False}
     result = final["result"]
     assert "best_factor" in result
     assert "report" in result and "deflated_sharpe" in result["report"]
@@ -91,6 +207,46 @@ def test_job_lifecycle(client):
     saved = client.get(f"/workspaces/run-{job_id}")
     assert saved.status_code == 200
     assert saved.json()["run"]["best_factor"] == result["best_factor"]
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ({"populaton_size": 16}, "unknown GP config"),
+        ({"population_size": 5_001}, "population_size"),
+        ({"horizon": 6}, "embargo"),
+        ({"min_names": 7}, "symbol count"),
+    ],
+)
+def test_run_config_errors_are_rejected_before_queueing(client, config, message):
+    response = client.post("/runs", json={"config": config})
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_request_dates_are_validated_before_work_is_queued(client):
+    assert client.post("/runs", json={"as_of": "2999-01-01"}).status_code == 400
+    assert (
+        client.get(
+            "/data/coverage",
+            params={"symbols": "AAPL", "start": "not-a-date"},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/data/sync",
+            json={"symbols": ["AAPL"], "start": "2021-01-02", "end": "2021-01-01"},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/universes/sync-dates",
+            json={"symbols": ["AAPL"], "expected_start": "not-a-date"},
+        ).status_code
+        == 400
+    )
 
 
 def test_unknown_job_is_404(client):
@@ -158,7 +314,110 @@ def test_formula_save_reload_delete_and_validation(client):
     assert client.post("/formulas", json=bad).status_code == 400
 
     assert client.delete(f"/formulas/{spec['name']}").status_code == 200
-    assert client.get("/formulas").json() == []
+    assert all(
+        item["origin"] == "catalog_formula" for item in client.get("/formulas").json()
+    )
+
+
+def test_active_run_pins_formula_revisions_against_delete(client, monkeypatch):
+    formula = {
+        "name": "active_run_formula",
+        "display_name": "Active run formula",
+        "out_type": "series",
+        "body": {"name": "rank", "children": [{"name": "close"}]},
+    }
+    saved = client.post("/formulas", json=formula)
+    assert saved.status_code == 200
+    runtime_name = saved.json()["runtime_name"]
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_search(*args, **kwargs):
+        assert runtime_name in kwargs["allowed_operators"]
+        started.set()
+        assert release.wait(5)
+        return {"termination_reason": "completed"}
+
+    monkeypatch.setattr(api_app, "run_search", blocked_search)
+    try:
+        submit = client.post(
+            "/runs",
+            json={"config": {"population_size": 6, "generations": 1}},
+        )
+        assert submit.status_code == 200
+        job_id = submit.json()["job_id"]
+        assert started.wait(2)
+
+        impact = client.get(f"/formulas/{formula['name']}").json()["impact"]
+        assert impact["runs"] == [job_id]
+        blocked = client.delete(f"/formulas/{formula['name']}")
+        assert blocked.status_code == 400
+        assert blocked.json()["detail"]["runs"] == [job_id]
+    finally:
+        release.set()
+
+    final = _poll(client, job_id)
+    assert final["status"] == "done"
+    assert final["result"]["formula_revisions"] == [
+        {"name": formula["name"], "revision": 1, "runtime_name": runtime_name}
+    ]
+    workspace = client.get(f"/workspaces/run-{job_id}").json()
+    assert workspace["run"]["formula_revisions"] == final["result"]["formula_revisions"]
+    assert client.delete(f"/formulas/{formula['name']}").status_code == 200
+
+
+def test_active_run_pins_formula_used_by_request_operator(client, monkeypatch):
+    formula = {
+        "name": "request_dependency",
+        "out_type": "series",
+        "body": {"name": "rank", "children": [{"name": "close"}]},
+        "category": "condition",
+    }
+    runtime_name = client.post("/formulas", json=formula).json()["runtime_name"]
+    operator = {
+        "name": "request_wrapper",
+        "arg_types": [],
+        "out_type": "series",
+        "body": {"name": runtime_name},
+    }
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_search(*args, **kwargs):
+        assert operator["name"] in kwargs["allowed_operators"]
+        started.set()
+        assert release.wait(5)
+        return {"termination_reason": "completed"}
+
+    monkeypatch.setattr(api_app, "run_search", blocked_search)
+    try:
+        submit = client.post(
+            "/runs",
+            json={
+                "config": {
+                    "population_size": 6,
+                    "generations": 1,
+                    "enabled_categories": ["custom"],
+                },
+                "operators": [operator],
+            },
+        )
+        assert submit.status_code == 200
+        job_id = submit.json()["job_id"]
+        assert started.wait(2)
+        blocked = client.delete(f"/formulas/{formula['name']}")
+        assert blocked.status_code == 400
+        assert blocked.json()["detail"]["runs"] == [job_id]
+    finally:
+        release.set()
+
+    final = _poll(client, job_id)
+    assert final["status"] == "done"
+    assert {item["runtime_name"] for item in final["result"]["formula_revisions"]} == {
+        runtime_name
+    }
+    assert client.delete(f"/formulas/{formula['name']}").status_code == 200
 
 
 def test_define_point_in_time_universe(client):
@@ -225,6 +484,90 @@ def test_universe_get_update_delete_and_sample_protection(client):
 
     assert client.delete("/universes/editable-universe").status_code == 200
     assert client.get("/universes/editable-universe").status_code == 404
+
+
+def test_point_in_time_panel_masks_all_fields_and_keeps_historical_members():
+    from alphalineage.core.panel import Panel
+    from alphalineage.data.universe import Membership, Universe
+
+    dates = pd.date_range("2020-01-01", periods=6, freq="D")
+    close = pd.DataFrame(
+        {"OLD": [10, 11, 12, 13, 14, 15], "NEW": [20, 21, 22, 23, 24, 25]},
+        index=dates,
+        dtype=float,
+    )
+    panel = Panel.from_prices(
+        open=close,
+        high=close + 1,
+        low=close - 1,
+        close=close,
+        volume=close * 100,
+    )
+    universe = Universe(
+        "pit-mask-test",
+        [
+            Membership("OLD", pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-04")),
+            Membership("NEW", pd.Timestamp("2020-01-03")),
+        ],
+    )
+    api_app._universes[universe.name] = universe
+    try:
+        resolved = api_app._panel_for_universe(universe.name, "2020-01-05", panel)
+    finally:
+        api_app._universes.pop(universe.name, None)
+
+    assert resolved.dates.max() == pd.Timestamp("2020-01-05")
+    assert set(resolved.symbols) == {"OLD", "NEW"}  # exited member was not dropped
+    for field in resolved.fields.values():
+        assert pd.isna(field.loc["2020-01-04", "OLD"])
+        assert pd.isna(field.loc["2020-01-02", "NEW"])
+    assert pd.isna(resolved["returns"].loc["2020-01-03", "NEW"])
+    assert resolved["returns"].loc["2020-01-04", "NEW"] == pytest.approx(23 / 22 - 1)
+
+
+def test_universe_validation_unknown_run_and_honest_presets(client):
+    empty = client.post("/universes", json={"name": "empty-u", "memberships": []})
+    assert empty.status_code == 400
+    backwards = client.post(
+        "/universes",
+        json={
+            "name": "backwards-u",
+            "memberships": [{"symbol": "AAA", "entry": "2021-01-02", "exit": "2021-01-01"}],
+        },
+    )
+    assert backwards.status_code == 400
+    overlapping = client.post(
+        "/universes",
+        json={
+            "name": "overlap-u",
+            "memberships": [
+                {"symbol": "AAA", "entry": "2020-01-01", "exit": "2021-01-01"},
+                {"symbol": "AAA", "entry": "2020-06-01"},
+            ],
+        },
+    )
+    assert overlapping.status_code == 400
+    assert client.post("/runs", json={"universe": "does-not-exist"}).status_code == 400
+
+    presets = {item["id"]: item for item in client.get("/universe-presets").json()}
+    assert presets["sp500"]["status"] == "bundled_snapshot"
+    assert presets["sp500"]["available"] is True
+    assert presets["sp500"]["snapshot_available"] is True
+    assert presets["sp500"]["snapshot_universe"] == "builtin-sp500-current"
+    assert presets["sp500"]["pit_import_name"] == "sp500"
+    assert presets["sp500"]["pit_available"] is False
+    assert presets["sp500"]["research_ready"] is False
+    assert presets["sp500"]["definition"]["id"] == "builtin-sp500-current"
+    assert presets["sp500"]["definition"]["snapshot_date"] == "2026-07-15"
+    assert len(presets["sp500"]["fingerprint"]) == 64
+    assert presets["sp500"]["provenance_detail"]["provider"].startswith("Wikipedia:")
+    assert presets["sp500"]["provenance_detail"]["attribution"] == "Wikipedia contributors"
+    assert presets["sp500"]["provenance_detail"]["license"] == "CC BY-SA 4.0"
+    assert presets["sp500"]["readiness"]["research_ready"] is False
+    assert "memberships" not in presets["sp500"]
+    bundled = client.get("/universes/sp500-lite").json()
+    assert bundled["integrity"]["membership_history"] == "illustrative"
+    assert bundled["integrity"]["research_ready"] is False
 
 
 def test_symbol_search_and_validation(client, monkeypatch, synthetic_prices):
@@ -464,7 +807,7 @@ def test_membership_date_sync_detects_delisted_symbol(client, monkeypatch, synth
     result = final["result"]["results"][0]
     assert result["status"] == "resolved"
     assert result["delisted"] is True
-    assert result["exit"] == prices.index.max().date().isoformat()
+    assert result["exit"] == (prices.index.max() + pd.Timedelta(days=1)).date().isoformat()
     assert result["entry"] == prices.index.min().date().isoformat()
 
 
@@ -549,19 +892,22 @@ def test_run_progress_reaches_target(client):
 
 
 def test_run_search_stop_halts_early(signal_panel):
+    from alphalineage.api.progress import RunProgress
     from alphalineage.api.service import run_search
     from alphalineage.core.gp import GPConfig
 
     panel, _ = signal_panel
     config = GPConfig(population_size=16, generations=50, max_depth=4, max_nodes=20, seed=0)
-    calls = {"n": 0}
+    progress = RunProgress(target_generations=config.generations)
 
     def stop() -> bool:
-        calls["n"] += 1
-        return calls["n"] > 1  # let generation 1 run, then halt
+        # An idempotent cancellation source, matching the Event used by the API: allow the
+        # initial population and generation 1 to commit, then stop before generation 2.
+        return int(progress.snapshot()["generation"]) >= 1
 
-    result = run_search(config, panel, stop=stop)
-    assert result["generations"] < 50
+    result = run_search(config, panel, progress=progress, stop=stop)
+    assert result["generations"] == 1
+    assert result["termination_reason"] == "user_stopped"
 
 
 def test_stop_endpoint_returns_stopping(client):
@@ -574,7 +920,9 @@ def test_stop_endpoint_returns_stopping(client):
     assert client.post("/runs/does-not-exist/stop").status_code == 404
 
     final = _poll(client, job_id)
-    assert final["status"] == "done", final
+    assert final["status"] in {"done", "stopped"}, final
+    if final["status"] == "stopped":
+        assert final["termination_reason"] == "user_stopped"
 
 
 def test_run_progress_threadsafe_snapshot():
@@ -600,6 +948,28 @@ def test_run_progress_threadsafe_snapshot():
     final = progress.snapshot()
     assert final["generation"] >= 1
     assert len(final["history"]) == 20
+
+
+def test_run_progress_exposes_candidate_and_resource_telemetry():
+    from alphalineage.api.progress import RunProgress
+
+    progress = RunProgress(
+        target_generations=12,
+        resources={"profile": "auto", "workers": 8, "percent": 50},
+    )
+    progress.on_scoring(
+        phase="initializing",
+        generation=0,
+        done=21,
+        total=80,
+        factors_per_second=17.5,
+    )
+    snapshot = progress.snapshot()
+    assert snapshot["phase"] == "initializing"
+    assert snapshot["candidate_done"] == 21
+    assert snapshot["candidate_total"] == 80
+    assert snapshot["factors_per_second"] == 17.5
+    assert snapshot["resources"]["workers"] == 8
 
 
 def test_sync_progress_threadsafe_snapshot():
@@ -677,3 +1047,52 @@ def test_jobstore_runs_and_captures_failure():
     assert store.get(ok).result == 42
     assert store.get(bad).status == "failed"
     assert "ZeroDivisionError" in (store.get(bad).error or "")
+
+
+def test_jobstore_treats_training_cancellation_as_stopped_not_failed():
+    from alphalineage.api.progress import RunProgress
+    from alphalineage.core.gp import TrainingCancelled
+
+    store = JobStore()
+    progress = RunProgress()
+
+    def cancel() -> None:
+        raise TrainingCancelled("stopped before initialization committed")
+
+    job_id = store.submit(cancel, progress=progress)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and store.get(job_id).status in {"queued", "running"}:
+        time.sleep(0.01)
+    job = store.get(job_id)
+    assert job is not None
+    assert job.status == "stopped"
+    assert job.error is None
+    assert job.termination_reason == "user_stopped"
+    assert progress.snapshot()["phase"] == "stopped"
+
+
+def test_jobstore_rejects_stop_after_locked_test_finalization_starts():
+    import threading
+
+    from alphalineage.api.progress import RunProgress
+
+    store = JobStore()
+    progress = RunProgress()
+    finalizing = threading.Event()
+    release = threading.Event()
+
+    def finish_locked_report() -> dict[str, str]:
+        progress.set_phase("finalizing")
+        finalizing.set()
+        assert release.wait(2)
+        return {"termination_reason": "completed"}
+
+    cancel = threading.Event()
+    job_id = store.submit(finish_locked_report, progress=progress, cancel=cancel)
+    assert finalizing.wait(2)
+    try:
+        assert store.cancel(job_id) is False
+        assert cancel.is_set() is False
+        assert progress.snapshot()["phase"] == "finalizing"
+    finally:
+        release.set()

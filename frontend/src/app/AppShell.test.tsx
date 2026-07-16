@@ -41,7 +41,7 @@ describe("AppShell", () => {
     expect(demoLabels).toEqual([
       "Train",
       "Metrics",
-      "Best factor",
+      "Best Formula Result",
       "Genealogy",
       "Library",
       "Extend",
@@ -54,7 +54,7 @@ describe("AppShell", () => {
 
     fireEvent.click(extend); // opens the dropdown rather than navigating
     expect(screen.getByTestId("extend-menu")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Formula Editor" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Formula Builder" }));
     expect(onSelectExtendPage).toHaveBeenCalledWith("formula");
   });
 
@@ -64,7 +64,7 @@ describe("AppShell", () => {
 
     expect(extend).not.toHaveAttribute("aria-disabled");
     fireEvent.click(extend);
-    fireEvent.click(screen.getByRole("menuitem", { name: "Formula Editor" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Formula Builder" }));
     expect(onSelectExtendPage).toHaveBeenCalledWith("formula");
   });
 });

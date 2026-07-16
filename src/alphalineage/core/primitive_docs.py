@@ -19,7 +19,11 @@ PRIMITIVE_DOCS: dict[str, dict[str, Any]] = {
     "low": _entry("Low", "Lowest traded price for each symbol and trading date."),
     "close": _entry("Close", "Closing price for each symbol and trading date."),
     "volume": _entry("Volume", "Reported trading volume for each symbol and trading date."),
-    "vwap": _entry("VWAP", "Volume-weighted average price for each symbol and trading date."),
+    "vwap": _entry(
+        "Typical price (HLC3)",
+        "Average of high, low, and close. The legacy runtime field is named vwap, but no "
+        "intraday volume weighting is implied.",
+    ),
     "returns": _entry("Returns", "Single-period return derived from closing prices."),
     "add": _entry(
         "Add",
@@ -85,11 +89,36 @@ PRIMITIVE_DOCS: dict[str, dict[str, Any]] = {
         ("series", "Series to average."),
         ("lookback", "Number of periods in the trailing window."),
     ),
+    "ts_ema": _entry(
+        "Exponential moving average",
+        "Exponentially weighted moving average with greater weight on recent observations.",
+        ("series", "Series to average."),
+        ("lookback", "EMA span in periods."),
+    ),
     "ts_std": _entry(
         "Rolling standard deviation",
         "Trailing standard deviation over a fixed lookback window.",
         ("series", "Input series."),
         ("lookback", "Number of periods in the trailing window."),
+    ),
+    "ts_std_pop": _entry(
+        "Population rolling deviation",
+        "Trailing population standard deviation (ddof 0) over a fixed lookback window.",
+        ("series", "Input series."),
+        ("lookback", "Number of periods in the trailing window."),
+    ),
+    "ts_rma": _entry(
+        "Wilder moving average",
+        "Wilder's recursive moving average, seeded by a complete arithmetic-mean window.",
+        ("series", "Series to smooth."),
+        ("lookback", "Wilder smoothing period."),
+    ),
+    "ts_recursive_smooth": _entry(
+        "Recursive smoothing",
+        "Wilder-style recursive smoothing from an explicit initial value.",
+        ("series", "Series to smooth."),
+        ("lookback", "Recursive smoothing period."),
+        ("initial", "Initial state before the first finite observation."),
     ),
     "ts_sum": _entry(
         "Rolling sum",

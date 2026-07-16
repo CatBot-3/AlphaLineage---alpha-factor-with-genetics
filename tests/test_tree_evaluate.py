@@ -22,3 +22,9 @@ def test_evaluator_matches_reference(synthetic_panel):
     # f3: one-day change in close
     f3 = Node("sub", (Node("close"), Node("delay", (Node("close"), Node("window", value=1)))))
     pd.testing.assert_frame_equal(evaluate(f3, p), p["close"] - p["close"].shift(1))
+
+
+def test_exponential_moving_average_matches_pandas(synthetic_panel):
+    tree = Node("ts_ema", (Node("close"), Node("window", value=5)))
+    expected = synthetic_panel["close"].ewm(span=5, adjust=False, min_periods=5).mean()
+    pd.testing.assert_frame_equal(evaluate(tree, synthetic_panel), expected)

@@ -13,6 +13,7 @@ authors = [{ name = "AlphaLineage" }]
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.1",
+    "scipy>=1.11",
     "pyarrow>=14",
     "requests>=2.31",
     "yfinance>=0.2.40",
@@ -33,11 +34,24 @@ dev = [
     "types-requests>=2.31",
     "httpx>=0.27",
 ]
-# Optional: build the C++ evaluator accelerator (needs a C++ compiler + CMake + Ninja).
-cpp = ["pybind11>=2.12"]
+# Optional: build the native evaluator accelerator (a platform C++ compiler is still required).
+cpp = ["pybind11>=2.12", "cmake>=3.25", "ninja>=1.11"]
+
+[tool.hatch.build]
+# Release/Docker builds compile these into the package before hatch assembles the wheel. They are
+# gitignored locally, so declare them as artifacts explicitly.
+artifacts = ["src/alphalineage/_evaluator*.pyd", "src/alphalineage/_evaluator*.so"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/alphalineage"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+
+[tool.cibuildwheel]
+build = ["cp311-*", "cp312-*", "cp313-*"]
+skip = ["*-win32", "*-manylinux_i686", "*-musllinux*"]
+before-build = "pip install pybind11 cmake ninja && python scripts/build_cpp.py --skip-dependency-install"
+test-command = "python -m alphalineage.smoke"
 
 [tool.ruff]
 line-length = 100

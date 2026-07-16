@@ -120,8 +120,8 @@
 }
 
 .app-page {
-  width: min(100%, var(--max-content));
-  margin: 0 auto;
+  width: 100%;
+  margin: 0;
 }
 
 .view-head {
@@ -169,28 +169,7 @@
 }
 
 .view-card {
-  display: grid;
-  grid-template-columns: 80px 1fr;
-  gap: var(--space-5);
-}
-
-.view-rail {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  align-items: flex-start;
-  color: var(--color-accent);
-  font-family: var(--font-mono);
-  font-size: var(--type-small);
-  letter-spacing: var(--tracking-tiny);
-}
-
-.view-rail span:last-child {
-  width: 24px;
-  height: 1px;
   display: block;
-  background: var(--color-ink);
-  opacity: 0.45;
 }
 
 .view-body {
@@ -274,19 +253,6 @@
 
   .nav__divider {
     display: none;
-  }
-
-  .view-card {
-    grid-template-columns: 1fr;
-  }
-
-  .view-rail {
-    flex-direction: row;
-    align-items: center;
-  }
-
-  .view-rail span:last-child {
-    width: 100%;
   }
 
   .site-footer {

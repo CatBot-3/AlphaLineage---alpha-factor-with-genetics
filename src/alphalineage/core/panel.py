@@ -64,7 +64,12 @@ class Panel:
         close: pd.DataFrame,
         volume: pd.DataFrame,
     ) -> Panel:
-        """Build a panel from aligned wide OHLCV frames, deriving vwap and returns."""
+        """Build a panel from aligned wide OHLCV frames, deriving HLC3 and returns.
+
+        ``vwap`` is retained as the serialized field key for compatibility with saved factors,
+        but the available daily bars only support typical price ``(high + low + close) / 3``;
+        the UI deliberately labels it HLC3 rather than claiming true volume weighting.
+        """
         vwap = (high + low + close) / 3.0
         returns = close.pct_change(fill_method=None)
         return cls(

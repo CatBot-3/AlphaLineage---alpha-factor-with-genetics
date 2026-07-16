@@ -18,13 +18,16 @@ const history: HistoryPoint[] = [
 ];
 
 describe("dashboard (P6-T3)", () => {
-  it("shows the deflated / OOS metrics as the default (guardrail)", () => {
+  it("shows the correctly labelled holdout and overfitting metrics first", () => {
     render(<Dashboard report={report} history={history} />);
     const primary = screen.getByTestId("primary-metric");
-    expect(primary).toHaveTextContent(/out-of-sample/i);
-    expect(within(primary).getByText("Deflated Sharpe")).toBeInTheDocument();
-    expect(within(primary).getByText("0.030")).toBeInTheDocument(); // deflated sharpe value
-    expect(within(primary).getByText("0.120")).toBeInTheDocument(); // OOS IC value
+    const controls = screen.getByTestId("overfitting-controls");
+    expect(within(primary).getByText("OOS mean |rank IC|")).toBeInTheDocument();
+    expect(within(primary).getByText("0.120")).toBeInTheDocument();
+    expect(within(controls).getByText("Deflated Sharpe probability")).toBeInTheDocument();
+    expect(within(controls).getByText("3.0%")).toBeInTheDocument();
+    expect(within(controls).getByText("64.0%")).toBeInTheDocument();
+    expect(within(controls).getByText("6210")).toBeInTheDocument();
   });
 
   it("keeps train (in-sample) metrics secondary, not the default", () => {
@@ -42,5 +45,39 @@ describe("dashboard (P6-T3)", () => {
     const once = { test_reads: 1 } as unknown as RunResult;
     rerender(<Dashboard report={report} history={history} extra={once} />);
     expect(screen.queryByTestId("oos-warning")).not.toBeInTheDocument();
+  });
+
+  it("renders the locked equity and separate convergence charts when evidence is available", () => {
+    const result = {
+      oos_backtest: {
+        start: "2025-01-01",
+        end: "2025-01-03",
+        observations: 3,
+        metrics: {
+          signed_ic: 0.08,
+          mean_abs_ic: 0.12,
+          ic_ir: 0.5,
+          gross_sharpe: 1.1,
+          net_sharpe: 0.9,
+          max_drawdown: -0.1,
+          turnover: 0.2,
+          avg_gross: 1,
+          avg_positions: 20,
+          max_position: 0.05,
+          usable: true,
+        },
+        returns: [],
+        normalized_equity: [
+          { date: "2025-01-01", value: 1 },
+          { date: "2025-01-02", value: 1.02 },
+          { date: "2025-01-03", value: 1.01 },
+        ],
+      },
+    } as unknown as RunResult;
+    render(<Dashboard report={report} history={history} extra={result} />);
+    expect(screen.getByText("Normalized net equity")).toBeInTheDocument();
+    expect(screen.getByText("Population fitness")).toBeInTheDocument();
+    expect(screen.getAllByText("Best |rank IC|").length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("img")).toHaveLength(3);
   });
 });

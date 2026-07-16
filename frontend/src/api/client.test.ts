@@ -3,15 +3,24 @@ import {
   clearData,
   continueSession,
   createSession,
+  fetchRun,
   getMembershipSync,
   getSession,
+  getTrainingCapabilities,
+  getUniverse,
+  listDataSyncs,
+  listUniversePresets,
+  listUniverses,
   putCategories,
   putSettings,
   saveFactor,
   searchSymbols,
   setPrimitiveCategory,
   shutdown,
+  startFormulaTest,
+  keepFormulaTest,
   startMembershipSync,
+  stopDataSync,
   updateFormula,
   validateFormula,
 } from "./client";
@@ -31,11 +40,28 @@ afterEach(() => {
 });
 
 describe("session client", () => {
+  it("loads device-relative training capabilities", async () => {
+    const fetchSpy = mockFetch({
+      default_profile: "auto",
+      detected_cpus: 20,
+      worker_capacity: 19,
+      profiles: {
+        auto: { requested_workers: 10, effective_workers: 10, workers: 10 },
+      },
+    });
+    const capabilities = await getTrainingCapabilities();
+    expect(capabilities.profiles.auto.requested_workers).toBe(10);
+    expect(capabilities.profiles.auto.effective_workers).toBe(10);
+    expect(capabilities.profiles.auto.workers).toBe(10);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/training\/capabilities$/);
+  });
+
   it("POSTs the form config verbatim to /sessions", async () => {
     const fetchSpy = mockFetch({ session_id: "s1", job_id: "j1" });
     const handle = await createSession({
       name: "run",
       universe: "tech",
+      as_of: "2026-07-14",
       config: { population_size: 42, generations: 7 },
       seed_factor_ids: ["f1"],
     });
@@ -46,6 +72,7 @@ describe("session client", () => {
     expect(init.method).toBe("POST");
     const body = JSON.parse(init.body as string);
     expect(body.config.population_size).toBe(42);
+    expect(body.as_of).toBe("2026-07-14");
     expect(body.seed_factor_ids).toEqual(["f1"]);
   });
 
@@ -77,6 +104,26 @@ describe("session client", () => {
     await expect(continueSession("s1", { generations: 1 })).rejects.toThrow(
       "a segment is already running",
     );
+  });
+});
+
+describe("one-shot run client", () => {
+  it("does not poll forever when a run stops before producing a report", async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ job_id: "j1", status: "queued" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ job_id: "j1", status: "stopped", result: null, error: null }),
+      }) as unknown as typeof fetch;
+
+    await expect(fetchRun({ generations: 2 })).rejects.toThrow(/stopped before a report/i);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -120,6 +167,13 @@ describe("data + shutdown client", () => {
 });
 
 describe("symbol search + membership sync client", () => {
+  it("GETs honest common-index preset descriptors", async () => {
+    const fetchSpy = mockFetch([{ id: "sp500", status: "import_required", available: false }]);
+    const presets = await listUniversePresets();
+    expect(presets[0].status).toBe("import_required");
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/universe-presets$/);
+  });
+
   it("requests more than 5 results so the UI can reveal them on demand", async () => {
     const fetchSpy = mockFetch([]);
     await searchSymbols("AAPL");
@@ -142,6 +196,43 @@ describe("symbol search + membership sync client", () => {
     const job = await getMembershipSync("m1");
     expect(job.status).toBe("done");
     expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/universes\/sync-dates\/m1$/);
+  });
+
+  it("normalizes lightweight universe summaries and loads detail separately", async () => {
+    const fetchSpy = mockFetch([{
+      name: "builtin-sp500-current",
+      display_name: "S&P 500 static snapshot",
+      source: "bundled",
+      mode: "static_snapshot",
+      definition: { member_count: 500 },
+    }]);
+    const summaries = await listUniverses({ summary: true });
+    expect(summaries[0].memberships).toEqual([]);
+    expect(summaries[0].symbols).toEqual([]);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/universes\?view=summary$/);
+
+    mockFetch({
+      name: "builtin-sp500-current",
+      source: "bundled",
+      symbols: ["BRK.B"],
+      memberships: [{ symbol: "BRK.B", entry: "2026-07-14", exit: null }],
+      aliases: { "BRK.B": "BRK-B" },
+    });
+    const detail = await getUniverse("builtin-sp500-current");
+    expect(detail.aliases).toEqual({ "BRK.B": "BRK-B" });
+  });
+
+  it("lists and stops resumable data-sync jobs", async () => {
+    let fetchSpy = mockFetch([{ job_id: "sync-1", status: "running" }]);
+    const jobs = await listDataSyncs({ activeOnly: true });
+    expect(jobs[0].status).toBe("running");
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/data\/sync\?active_only=true$/);
+
+    fetchSpy = mockFetch({ stopping: true });
+    await expect(stopDataSync("sync-1")).resolves.toEqual({ stopping: true });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/data\/sync\/sync-1\/stop$/);
+    expect(init.method).toBe("POST");
   });
 });
 
@@ -169,6 +260,28 @@ describe("formula editor + category client", () => {
     const res = await validateFormula(spec);
     expect(res.ok).toBe(true);
     expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/formulas\/validate$/);
+  });
+
+  it("POSTs an unsaved formula test without registering the draft", async () => {
+    const fetchSpy = mockFetch({ job_id: "test-1", status: "queued" });
+    await startFormulaTest({
+      source: { kind: "draft", body: spec.body, inputs: [], out_type: "series" },
+      bindings: {},
+      universe: "sample",
+      end: "2026-07-14",
+      weighting_scheme: "quantile_ls",
+    });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/formula-tests$/);
+    expect(JSON.parse(init.body as string).source.kind).toBe("draft");
+  });
+
+  it("keeps a temporary test only through its explicit endpoint", async () => {
+    const fetchSpy = mockFetch({ id: "result-1", kind: "backtest" });
+    await keepFormulaTest("test-1", { name: "MACD stress" });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/formula-tests\/test-1\/keep$/);
+    expect(JSON.parse(init.body as string)).toEqual({ name: "MACD stress" });
   });
 
   it("PUTs a single primitive recategorization", async () => {

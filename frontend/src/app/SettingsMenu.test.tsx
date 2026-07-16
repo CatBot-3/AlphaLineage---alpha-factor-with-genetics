@@ -66,6 +66,7 @@ describe("SettingsMenu (L6)", () => {
     fireEvent.click(screen.getByLabelText("Settings menu"));
     const popover = await screen.findByTestId("settings-popover");
     fireEvent.click(within(popover).getByRole("button", { name: /Settings/ }));
+    expect(await screen.findByLabelText("Formula Results directory")).toHaveValue("/data/factors");
     fireEvent.change(await screen.findByLabelText("Evaluator backend"), {
       target: { value: "python" },
     });

@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from alphalineage.core.primitives import OPERATORS, REGISTRY, Kind, Primitive
-from alphalineage.core.tree import Node, from_dict
+from alphalineage.core.tree import InvalidTree, Node, from_dict, validate
 from alphalineage.core.types import DType, is_subtype
 
 #: Placeholder leaf for the i-th macro argument: ``Node(ARG, value=i)``.
@@ -22,9 +22,27 @@ ARG = "$arg"
 #: User-registered operators (name -> Primitive). Process-global (single-user local app).
 USER_OPERATORS: dict[str, Primitive] = {}
 
+# User formulas are data, but a malformed or manually edited formula store can still describe
+# a recursive or exponentially expanding macro graph.  Keep every expansion entry point bounded
+# so preview, backtest, training, and result persistence share the same safety envelope.
+# Keep these equal to the GP hard ceilings without importing ``core.gp`` (which imports the
+# evaluator and would introduce a cycle).  Compact macro calls therefore cannot bypass the
+# global expression limits used by training seeds and native compilation.
+MAX_EXPANDED_DEPTH = 32
+MAX_EXPANDED_NODES = 2_000
+
 
 class InvalidOperator(ValueError):
     """Raised when a user operator's body or signature is invalid."""
+
+
+def _body_node(body: Node | dict[str, Any]) -> Node:
+    if isinstance(body, Node):
+        return body
+    try:
+        return from_dict(body)
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise InvalidOperator("operator body must be a well-formed expression tree") from exc
 
 
 def infer_macro_type(body: Node, arg_types: Sequence[DType]) -> DType:
@@ -34,7 +52,9 @@ def infer_macro_type(body: Node, arg_types: Sequence[DType]) -> DType:
     primitives, composed with valid types. Anything else raises ``InvalidOperator``.
     """
     if body.name == ARG:
-        index = int(body.value) if body.value is not None else -1
+        if isinstance(body.value, bool) or not isinstance(body.value, int):
+            raise InvalidOperator(f"$arg index must be an integer, got {body.value!r}")
+        index = body.value
         if index < 0 or index >= len(arg_types):
             raise InvalidOperator(f"$arg index {index} out of range for {len(arg_types)} args")
         if body.children:
@@ -45,10 +65,14 @@ def infer_macro_type(body: Node, arg_types: Sequence[DType]) -> DType:
     if prim is None:
         raise InvalidOperator(f"unknown primitive {body.name!r} (only existing primitives allowed)")
     if prim.kind in (Kind.OPERAND, Kind.EPHEMERAL):
-        if body.children:
-            raise InvalidOperator(f"{body.name!r} is a leaf and must have no children")
+        try:
+            validate(body)
+        except InvalidTree as exc:
+            raise InvalidOperator(str(exc)) from exc
         return prim.out_type
 
+    if body.value is not None:
+        raise InvalidOperator(f"operator {body.name!r} must not carry a value")
     if len(body.children) != prim.arity:
         raise InvalidOperator(f"{body.name!r} expects {prim.arity} args, got {len(body.children)}")
     for child, expected in zip(body.children, prim.arg_types, strict=True):
@@ -71,7 +95,11 @@ def register_operator(
         raise InvalidOperator(f"{name!r} already exists; choose another name")
 
     types = tuple(arg_types)
-    body_node = body if isinstance(body, Node) else from_dict(body)
+    if any(not isinstance(arg_type, DType) for arg_type in types):
+        raise InvalidOperator("arg_types must contain only DType values")
+    if not isinstance(out_type, DType):
+        raise InvalidOperator("out_type must be a DType value")
+    body_node = _body_node(body)
     inferred = infer_macro_type(body_node, types)
     if not is_subtype(inferred, out_type):
         raise InvalidOperator(f"body produces {inferred}, not the declared output {out_type}")
@@ -97,7 +125,11 @@ def ensure_operator(
     before seeding a session (invariant 5: still data, never code).
     """
     types = tuple(arg_types)
-    body_node = body if isinstance(body, Node) else from_dict(body)
+    if any(not isinstance(arg_type, DType) for arg_type in types):
+        raise InvalidOperator("arg_types must contain only DType values")
+    if not isinstance(out_type, DType):
+        raise InvalidOperator("out_type must be a DType value")
+    body_node = _body_node(body)
     existing = USER_OPERATORS.get(name)
     if existing is not None:
         if (
@@ -145,11 +177,69 @@ def expand(node: Node, body: Node) -> Node:
     return substitute(body)
 
 
-def expand_all(node: Node) -> Node:
-    """Recursively expand every user macro in ``node`` into a built-in-only tree."""
-    prim = REGISTRY.get(node.name)
-    if prim is not None and prim.macro_body is not None:
-        return expand_all(expand(node, prim.macro_body))
-    if node.children:
-        return Node(node.name, tuple(expand_all(c) for c in node.children), node.value)
-    return node
+def expand_all(
+    node: Node,
+    *,
+    max_depth: int = MAX_EXPANDED_DEPTH,
+    max_nodes: int = MAX_EXPANDED_NODES,
+) -> Node:
+    """Expand all user macros, rejecting cycles and unreasonably large expanded trees.
+
+    The limits apply to the final built-in tree rather than the compact call-site tree.  This
+    prevents nested formulas from bypassing GP complexity limits and, more importantly, makes a
+    corrupt persisted cycle a visible validation error instead of an unbounded recursion.
+    """
+    if max_depth < 1 or max_nodes < 1:
+        raise InvalidOperator("expansion limits must be positive")
+    emitted = 0
+    expansions = 0
+
+    def visit(
+        current: Node,
+        depth: int,
+        active: tuple[str, ...],
+        *,
+        account: bool = True,
+    ) -> Node:
+        nonlocal emitted, expansions
+        if account and depth > max_depth:
+            raise InvalidOperator(
+                f"expanded expression depth exceeds the limit of {max_depth}"
+            )
+        prim = REGISTRY.get(current.name)
+        if prim is not None and prim.macro_body is not None:
+            if current.name in active:
+                start = active.index(current.name)
+                cycle = (*active[start:], current.name)
+                raise InvalidOperator(f"formula dependency cycle: {' -> '.join(cycle)}")
+            expansions += 1
+            if expansions > max_nodes:
+                raise InvalidOperator(
+                    f"expanded expression size exceeds the limit of {max_nodes} nodes"
+                )
+            # Resolve call-site arguments in the caller's dependency scope. This permits normal
+            # composition such as ``EMA(DIF(...))`` (and even ``SMA(SMA(...))``) without falsely
+            # treating the inner finite call as a recursive formula definition.
+            expanded_children = tuple(
+                visit(child, depth, active, account=False) for child in current.children
+            )
+            call = Node(current.name, expanded_children, current.value)
+            return visit(
+                expand(call, prim.macro_body),
+                depth,
+                (*active, current.name),
+                account=account,
+            )
+
+        if account:
+            emitted += 1
+            if emitted > max_nodes:
+                raise InvalidOperator(
+                    f"expanded expression size exceeds the limit of {max_nodes} nodes"
+                )
+        children = tuple(
+            visit(child, depth + 1, active, account=account) for child in current.children
+        )
+        return Node(current.name, children, current.value)
+
+    return visit(node, 1, ())

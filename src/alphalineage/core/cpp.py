@@ -10,6 +10,9 @@ and unit-testable without any compiler.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass
+from functools import lru_cache
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -17,14 +20,18 @@ import pandas as pd
 
 from alphalineage.core.extensions import expand_all
 from alphalineage.core.panel import Panel
-from alphalineage.core.primitives import OPERAND_FIELDS
+from alphalineage.core.primitives import OPERAND_FIELDS, checked_scalar, checked_window
 from alphalineage.core.tree import Node
+from alphalineage.core.types import DType
 
 # The compiled extension is optional; absence => Python fallback.
 try:
     from alphalineage import _evaluator as _EXT  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - exercised only when unbuilt
     _EXT = None
+
+_NATIVE_ABI_VERSION = 4
+_MAX_PLAN_CACHE = 4096
 
 # Opcodes - must match cpp/evaluator.cpp.
 OP_LOAD = 0
@@ -39,20 +46,88 @@ _TS = {
     "ts_max": 16,
     "delta": 17,
     "delay": 18,
+    "ts_ema": 21,
+    "ts_rank": 22,
+    "decay_linear": 23,
+    "ts_rma": 35,
+    "ts_std_pop": 37,
 }
-_CROSS = {"rank": 19, "zscore": 20}
+_TS_INITIAL = {"ts_recursive_smooth": 36}
+_BINARY_TS = {"ts_corr": 24, "ts_cov": 25}
+_CROSS = {"rank": 19, "zscore": 20, "scale": 26}
+_COMPARISON = {"gt": 27, "lt": 28, "ge": 29, "le": 30}
+_LOGICAL_BINARY = {"and_": 31, "or_": 32}
+_LOGICAL_UNARY = {"not_": 33}
+_TERNARY = {"where": 34}
 
 #: Built-in operators the C++ backend can evaluate (everything else => Python fallback).
-CPP_OPCODES: dict[str, int] = {**_BINARY, **_SCALAR, **_UNARY, **_TS, **_CROSS}
+CPP_OPCODES: dict[str, int] = {
+    **_BINARY,
+    **_SCALAR,
+    **_UNARY,
+    **_TS,
+    **_TS_INITIAL,
+    **_BINARY_TS,
+    **_CROSS,
+    **_COMPARISON,
+    **_LOGICAL_BINARY,
+    **_LOGICAL_UNARY,
+    **_TERNARY,
+}
 _FIELD_INDEX = {name: i for i, name in enumerate(OPERAND_FIELDS)}
 
 # One instruction = (opcode, a, b, ival, fval, field).
 Instruction = tuple[int, int, int, int, float, int]
+PlanArrays = tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]
+
+
+@dataclass
+class _CompiledPlan:
+    instructions: tuple[Instruction, ...]
+    root: int
+    arrays: PlanArrays
+    peak_buffers: int
+
+    def native_tuple(self) -> tuple[object, ...]:
+        return (*self.arrays, self.root)
 
 
 def available() -> bool:
-    """True if the compiled C++ evaluator extension is importable."""
-    return _EXT is not None
+    """True when a compatible compiled evaluator extension is importable."""
+    return (
+        _EXT is not None
+        and getattr(_EXT, "ABI_VERSION", None) == _NATIVE_ABI_VERSION
+        and hasattr(_EXT, "evaluate_many")
+        and hasattr(_EXT, "score_many")
+    )
+
+
+def unavailable_reason() -> str | None:
+    """Return a stable diagnostic for capability APIs, or ``None`` when native is ready."""
+    if _EXT is None:
+        return "native evaluator extension is not installed"
+    abi = getattr(_EXT, "ABI_VERSION", None)
+    if abi != _NATIVE_ABI_VERSION:
+        return f"native evaluator ABI {abi!r} is incompatible (expected {_NATIVE_ABI_VERSION})"
+    if not hasattr(_EXT, "evaluate_many"):
+        return "native evaluator does not provide ordered batch evaluation"
+    if not hasattr(_EXT, "score_many"):
+        return "native evaluator does not provide integrated batch scoring"
+    return None
+
+
+def native_max_workers() -> int:
+    """Maximum worker count accepted by this native build (one when unavailable)."""
+    if not available():
+        return 1
+    return max(1, int(getattr(_EXT, "MAX_WORKERS", 1)))
+
+
+def supports_native_scoring(method: str) -> bool:
+    """Whether the selected backend can preserve scoring semantics for this IC method."""
+    return method == "spearman" and backend_enabled()
 
 
 # Process-level backend override, set from the persisted UI setting. Resolved without a
@@ -85,6 +160,51 @@ def backend_enabled() -> bool:
 
 def flatten(node: Node) -> tuple[list[Instruction], int] | None:
     """Compile a tree into a post-order instruction list, or ``None`` if any op is unsupported."""
+    plan = _compile(node)
+    return None if plan is None else (list(plan.instructions), plan.root)
+
+
+def _instruction_dependencies(instruction: Instruction) -> tuple[int, ...]:
+    op, a, b, ival, _fval, _field = instruction
+    if op == OP_LOAD:
+        return ()
+    name = _OPCODE_NAMES[op]
+    if name in _BINARY or name in _COMPARISON or name in _LOGICAL_BINARY:
+        return (a, b)
+    if name in _BINARY_TS:
+        return (a, b)
+    if name in _TERNARY:
+        return (a, b, ival)
+    return (a,)
+
+
+def _peak_buffers(instructions: tuple[Instruction, ...]) -> int:
+    uses = [0] * len(instructions)
+    for instruction in instructions:
+        for dependency in _instruction_dependencies(instruction):
+            uses[dependency] += 1
+    live = peak = 0
+    for instruction in instructions:
+        live += 1  # output is acquired before its inputs are released
+        peak = max(peak, live)
+        for dependency in _instruction_dependencies(instruction):
+            uses[dependency] -= 1
+            if uses[dependency] == 0:
+                live -= 1
+    # Pairwise pandas parity requires pair-masked rolling means and independent std buffers.
+    # Include those native temporaries in the per-worker memory guard.
+    opcodes = {instruction[0] for instruction in instructions}
+    pair_scratch = 7 if _BINARY_TS["ts_corr"] in opcodes else 0
+    if _BINARY_TS["ts_cov"] in opcodes:
+        pair_scratch = max(pair_scratch, 6)
+    return max(1, peak + pair_scratch)
+
+
+_OPCODE_NAMES = {opcode: name for name, opcode in CPP_OPCODES.items()}
+
+
+@lru_cache(maxsize=_MAX_PLAN_CACHE)
+def _compile_expanded(node: Node) -> _CompiledPlan | None:
     instrs: list[Instruction] = []
 
     def emit(
@@ -105,16 +225,67 @@ def flatten(node: Node) -> tuple[list[Instruction], int] | None:
             return None if a is None or b is None else emit(op, a=a, b=b)
         if name in _SCALAR:
             a = visit(n.children[0])
-            return None if a is None else emit(op, a=a, fval=float(n.children[1].value or 0.0))
+            return None if a is None else emit(op, a=a, fval=checked_scalar(n.children[1].value))
         if name in _TS:
             a = visit(n.children[0])
-            return None if a is None else emit(op, a=a, ival=int(n.children[1].value or 0))
+            return None if a is None else emit(op, a=a, ival=checked_window(n.children[1].value))
+        if name in _TS_INITIAL:
+            a = visit(n.children[0])
+            return (
+                None
+                if a is None
+                else emit(
+                    op,
+                    a=a,
+                    ival=checked_window(n.children[1].value),
+                    fval=checked_scalar(n.children[2].value),
+                )
+            )
+        if name in _BINARY_TS:
+            a, b = visit(n.children[0]), visit(n.children[1])
+            return (
+                None
+                if a is None or b is None
+                else emit(op, a=a, b=b, ival=checked_window(n.children[2].value))
+            )
+        if name in _COMPARISON or name in _LOGICAL_BINARY:
+            a, b = visit(n.children[0]), visit(n.children[1])
+            return None if a is None or b is None else emit(op, a=a, b=b)
+        if name in _TERNARY:
+            condition, when_true, when_false = (visit(child) for child in n.children)
+            return (
+                None
+                if condition is None or when_true is None or when_false is None
+                else emit(op, a=condition, b=when_true, ival=when_false)
+            )
         # unary or cross-sectional: one series child
         a = visit(n.children[0])
         return None if a is None else emit(op, a=a)
 
-    root = visit(expand_all(node))
-    return None if root is None else (instrs, root)
+    root = visit(node)
+    if root is None:
+        return None
+    instructions = tuple(instrs)
+    columns: PlanArrays = (
+        np.ascontiguousarray([instruction[0] for instruction in instructions], dtype=np.int32),
+        np.ascontiguousarray([instruction[1] for instruction in instructions], dtype=np.int32),
+        np.ascontiguousarray([instruction[2] for instruction in instructions], dtype=np.int32),
+        np.ascontiguousarray([instruction[3] for instruction in instructions], dtype=np.int32),
+        np.ascontiguousarray([instruction[4] for instruction in instructions], dtype=np.float64),
+        np.ascontiguousarray([instruction[5] for instruction in instructions], dtype=np.int32),
+    )
+    for column in columns:
+        column.setflags(write=False)
+    return _CompiledPlan(instructions, root, columns, _peak_buffers(instructions))
+
+
+def _compile(node: Node) -> _CompiledPlan | None:
+    return _compile_expanded(expand_all(node))
+
+
+def clear_plan_cache() -> None:
+    """Clear cached native IR (primarily useful after runtime registry changes in tests)."""
+    _compile_expanded.cache_clear()
 
 
 _PANEL_ARRAYS: WeakKeyDictionary[Panel, np.ndarray] = WeakKeyDictionary()
@@ -134,17 +305,167 @@ def _panel_arrays(panel: Panel) -> np.ndarray:
 
 def evaluate_cpp(node: Node, panel: Panel) -> pd.DataFrame | None:
     """Evaluate via the C++ extension; ``None`` if unavailable or the tree is unsupported."""
-    if _EXT is None:
+    if not available():
         return None
-    plan = flatten(node)
+    plan = _compile(node)
     if plan is None:
         return None
-    instrs, root = plan
-    ops = np.array([i[0] for i in instrs], dtype=np.int32)
-    a = np.array([i[1] for i in instrs], dtype=np.int32)
-    b = np.array([i[2] for i in instrs], dtype=np.int32)
-    ival = np.array([i[3] for i in instrs], dtype=np.int32)
-    fval = np.array([i[4] for i in instrs], dtype=np.float64)
-    field = np.array([i[5] for i in instrs], dtype=np.int32)
-    result = _EXT.evaluate(_panel_arrays(panel), ops, a, b, ival, fval, field, root)
-    return pd.DataFrame(result, index=panel.dates, columns=panel.symbols)
+    result = _EXT.evaluate(_panel_arrays(panel), *plan.arrays, plan.root)
+    frame = pd.DataFrame(result, index=panel.dates, columns=panel.symbols)
+    return frame.astype(bool, copy=False) if node.out_type is DType.BOOL else frame
+
+
+def evaluate_many(
+    nodes: Iterable[Node],
+    panel: Panel,
+    *,
+    workers: int,
+    memory_budget_bytes: int | None = None,
+) -> list[pd.DataFrame | None]:
+    """Evaluate supported trees in deterministic input order with bounded native workers.
+
+    Unsupported trees (and every tree when native evaluation is disabled/unavailable) retain a
+    ``None`` marker so callers can apply the Python baseline serially.  ``memory_budget_bytes``
+    limits native scratch/output per chunk; it never changes results or drops work.
+    """
+    materialized = list(nodes)
+    results: list[pd.DataFrame | None] = [None] * len(materialized)
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+        raise ValueError("workers must be a positive integer")
+    if memory_budget_bytes is not None and (
+        isinstance(memory_budget_bytes, bool)
+        or not isinstance(memory_budget_bytes, int)
+        or memory_budget_bytes <= 0
+    ):
+        raise ValueError("memory_budget_bytes must be a positive integer or None")
+    if not materialized or not backend_enabled():
+        return results
+
+    supported: list[tuple[int, Node, _CompiledPlan]] = []
+    for index, node in enumerate(materialized):
+        plan = _compile(node)
+        if plan is not None:
+            supported.append((index, node, plan))
+    if not supported:
+        return results
+
+    frame_bytes = max(1, len(panel.dates) * len(panel.symbols) * np.dtype(np.float64).itemsize)
+    max_peak = max(plan.peak_buffers for _index, _node, plan in supported)
+    effective_workers = min(workers, native_max_workers(), len(supported))
+    chunk_size = len(supported)
+    if memory_budget_bytes is not None:
+        per_worker = frame_bytes * (max_peak + 1)
+        effective_workers = min(
+            effective_workers, max(1, memory_budget_bytes // max(1, per_worker))
+        )
+        scratch = effective_workers * max_peak * frame_bytes
+        remaining = memory_budget_bytes - min(memory_budget_bytes, scratch)
+        chunk_size = max(1, remaining // frame_bytes)
+        chunk_size = max(effective_workers, chunk_size)
+
+    fields = _panel_arrays(panel)
+    for start in range(0, len(supported), chunk_size):
+        chunk = supported[start : start + chunk_size]
+        native = _EXT.evaluate_many(
+            fields,
+            [plan.native_tuple() for _index, _node, plan in chunk],
+            min(effective_workers, len(chunk)),
+        )
+        for offset, (result_index, node, _plan) in enumerate(chunk):
+            # pandas may retain only a raw pointer for a pybind-owned slice; copy so each frame
+            # remains valid after the local 3-D batch owner is released/reused by the next chunk.
+            owned = np.array(native[offset], dtype=np.float64, order="C", copy=True)
+            frame = pd.DataFrame(owned, index=panel.dates, columns=panel.symbols)
+            results[result_index] = (
+                frame.astype(bool, copy=False) if node.out_type is DType.BOOL else frame
+            )
+    return results
+
+
+def score_many(
+    nodes: Iterable[Node],
+    panel: Panel,
+    forward_returns: pd.DataFrame,
+    *,
+    method: str = "spearman",
+    absolute: bool = True,
+    parsimony: float = 0.0,
+    min_names: int = 5,
+    min_valid_dates: int = 5,
+    workers: int,
+    memory_budget_bytes: int | None = None,
+) -> list[tuple[float, dict[str, float]] | None]:
+    """Evaluate and IC-score trees natively without materializing factor DataFrames.
+
+    Results remain in input order and unsupported entries are ``None``. The metric tuple exactly
+    mirrors :func:`alphalineage.core.fitness.score_tree`: ``fitness`` plus ``ic``/``ic_ir``.
+    """
+    materialized = list(nodes)
+    results: list[tuple[float, dict[str, float]] | None] = [None] * len(materialized)
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+        raise ValueError("workers must be a positive integer")
+    if memory_budget_bytes is not None and (
+        isinstance(memory_budget_bytes, bool)
+        or not isinstance(memory_budget_bytes, int)
+        or memory_budget_bytes <= 0
+    ):
+        raise ValueError("memory_budget_bytes must be a positive integer or None")
+    if method not in {"spearman", "pearson"}:
+        raise ValueError(f"unknown IC method {method!r}")
+    if not np.isfinite(parsimony):
+        raise ValueError("parsimony must be finite")
+    if isinstance(min_names, bool) or not isinstance(min_names, int) or min_names <= 0:
+        raise ValueError("min_names must be a positive integer")
+    if (
+        isinstance(min_valid_dates, bool)
+        or not isinstance(min_valid_dates, int)
+        or min_valid_dates <= 0
+    ):
+        raise ValueError("min_valid_dates must be a positive integer")
+    # Spearman is the GP default and has exact average-tie integer-rank semantics in native code.
+    # Pearson's degenerate constant-row IC-IR depends on NumPy reduction roundoff, so retain the
+    # Python scorer rather than silently changing that metric.
+    if not materialized or not backend_enabled() or method == "pearson":
+        return results
+
+    supported: list[tuple[int, Node, _CompiledPlan, int]] = []
+    for index, node in enumerate(materialized):
+        expanded = expand_all(node)
+        plan = _compile_expanded(expanded)
+        if plan is not None:
+            supported.append((index, node, plan, expanded.size()))
+    if not supported:
+        return results
+
+    frame_bytes = max(1, len(panel.dates) * len(panel.symbols) * np.dtype(np.float64).itemsize)
+    max_peak = max(plan.peak_buffers + 1 for _index, _node, plan, _size in supported)
+    effective_workers = min(workers, native_max_workers(), len(supported))
+    if memory_budget_bytes is not None:
+        effective_workers = min(
+            effective_workers,
+            max(1, memory_budget_bytes // max(1, max_peak * frame_bytes)),
+        )
+
+    target = forward_returns.reindex(index=panel.dates, columns=panel.symbols)
+    target_values = np.ascontiguousarray(target.to_numpy(dtype=np.float64, na_value=np.nan))
+    native = _EXT.score_many(
+        _panel_arrays(panel),
+        [plan.native_tuple() for _index, _node, plan, _size in supported],
+        target_values,
+        np.ascontiguousarray(
+            [size for _index, _node, _plan, size in supported], dtype=np.int32
+        ),
+        0 if method == "spearman" else 1,
+        absolute,
+        float(parsimony),
+        min_names,
+        min_valid_dates,
+        effective_workers,
+    )
+    for offset, (result_index, _node, _plan, _size) in enumerate(supported):
+        fitness, ic, information_ratio = (float(value) for value in native[offset])
+        results[result_index] = (
+            fitness,
+            {"ic": ic, "ic_ir": information_ratio},
+        )
+    return results

@@ -10,7 +10,7 @@ export type Tab = "train" | "dashboard" | "factor" | "genealogy" | "library" | "
 const TABS: Array<{ id: Tab; label: string; backendOnly?: boolean }> = [
   { id: "train", label: "Train", backendOnly: true },
   { id: "dashboard", label: "Metrics" },
-  { id: "factor", label: "Best factor" },
+  { id: "factor", label: "Best Formula Result" },
   { id: "genealogy", label: "Genealogy" },
   { id: "library", label: "Library", backendOnly: true },
   { id: "extend", label: "Extend" },

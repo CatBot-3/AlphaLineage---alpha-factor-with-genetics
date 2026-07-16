@@ -18,6 +18,12 @@ export interface FormulaNodeData extends Record<string, unknown> {
   inputTypes?: string[];
   inputNames?: string[];
   inputDescriptions?: string[];
+  /**
+   * Literal values for scalar/window arguments, keyed by the primitive's
+   * original argument index. Numeric arguments stay in the typed tree, but do
+   * not need a separate canvas node.
+   */
+  inlineValues?: Record<string, number | null>;
   outType: string;
   argIndex?: number;
   value?: number;
@@ -34,6 +40,11 @@ export interface FormulaGraph {
 }
 
 export const OUTPUT_NODE_ID = "formula-output";
+export const MAX_FORMULA_WINDOW = 100_000;
+
+const NODE_WIDTH = 176;
+const NODE_GAP_X = 64;
+const NODE_GAP_Y = 36;
 
 function dataOf(node: FormulaDraftNode): FormulaNodeData {
   return node.data as FormulaNodeData;
@@ -41,6 +52,44 @@ function dataOf(node: FormulaDraftNode): FormulaNodeData {
 
 function edgeId(source: string, target: string, handle: string): string {
   return `${source}-${target}-${handle}`;
+}
+
+export function formulaNodeHeight(node: FormulaDraftNode): number {
+  const data = dataOf(node);
+  const inputsHeight = (data.inputTypes?.length ?? 0) * 31;
+  const valueHeight = data.kind === "value" ? 39 : 0;
+  return Math.max(72, 72 + inputsHeight + valueHeight);
+}
+
+export function isInlineInputType(type: string): boolean {
+  return type === "window" || type === "scalar";
+}
+
+export function isConnectableInputType(type: string): boolean {
+  return !isInlineInputType(type);
+}
+
+function inlineValueForInput(input: FormulaInputSpec, type: string): number {
+  const configuredInput = input as FormulaInputSpec & {
+    default?: number | null;
+    default_value?: number | null;
+  };
+  const configured = configuredInput.default ?? configuredInput.default_value;
+  if (typeof configured === "number" && Number.isFinite(configured)) return configured;
+  return type === "window" ? 20 : 1;
+}
+
+function inlineLiteral(type: string, value: number | null | undefined, label: string): FactorNode {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    throw new Error(`${label}: enter a finite ${type} value.`);
+  }
+  if (type === "window") {
+    if (!Number.isInteger(value) || value < 1 || value > MAX_FORMULA_WINDOW) {
+      throw new Error(`${label}: window must be a whole number from 1 to ${MAX_FORMULA_WINDOW}.`);
+    }
+    return { name: "window", value };
+  }
+  return { name: "const", value };
 }
 
 export function typesCompatible(actual: string, expected: string): boolean {
@@ -92,6 +141,11 @@ export function primitiveNode(
       inputTypes: inputs.map((item) => item.type),
       inputNames: inputs.map((item) => item.name),
       inputDescriptions: inputs.map((item) => item.description),
+      inlineValues: Object.fromEntries(inputs.flatMap((item, index) => (
+        isInlineInputType(item.type)
+          ? [[String(index), inlineValueForInput(item, item.type)] as const]
+          : []
+      ))),
       outType: primitive.out_type,
       revision: primitive.revision ?? undefined,
       value: primitive.name === "window" ? 5 : primitive.name === "const" ? 1 : undefined,
@@ -132,6 +186,255 @@ export function blankFormulaGraph(inputs: FormulaInputSpec[], outType = "signal"
   return { nodes, edges: [] };
 }
 
+/** Fold legacy literal nodes into their owning operator without changing the tree. */
+export function foldInlineLiteralNodes(
+  nodes: FormulaDraftNode[],
+  edges: FormulaDraftEdge[],
+): FormulaGraph {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const nextInlineValues = new Map<string, Record<string, number | null>>();
+  const foldedEdges = new Set<FormulaDraftEdge>();
+  const foldedSources = new Set<string>();
+
+  for (const edge of edges) {
+    if (!edge.targetHandle?.startsWith("input-")) continue;
+    const index = Number(edge.targetHandle.slice("input-".length));
+    if (!Number.isInteger(index) || index < 0) continue;
+    const source = byId.get(edge.source);
+    const target = byId.get(edge.target);
+    if (!source || !target) continue;
+    const sourceData = dataOf(source);
+    const targetData = dataOf(target);
+    const expected = targetData.inputTypes?.[index];
+    if (targetData.kind !== "function" || !expected || !isInlineInputType(expected)) continue;
+    if (sourceData.kind !== "value") continue;
+    const literalKind = sourceData.valueKind ?? sourceData.primitiveName;
+    if ((expected === "window" && literalKind !== "window") ||
+        (expected === "scalar" && literalKind !== "const")) continue;
+
+    const values = nextInlineValues.get(target.id) ?? { ...(targetData.inlineValues ?? {}) };
+    const rawValue = sourceData.value;
+    values[String(index)] = typeof rawValue === "number" ? rawValue : null;
+    nextInlineValues.set(target.id, values);
+    foldedEdges.add(edge);
+    foldedSources.add(source.id);
+  }
+
+  if (foldedEdges.size === 0) return { nodes, edges };
+  const nextEdges = edges.filter((edge) => !foldedEdges.has(edge));
+  const stillReferenced = new Set(nextEdges.flatMap((edge) => [edge.source, edge.target]));
+  const nextNodes = nodes
+    .filter((node) => !foldedSources.has(node.id) || stillReferenced.has(node.id))
+    .map((node) => {
+      const values = nextInlineValues.get(node.id);
+      return values ? { ...node, data: { ...node.data, inlineValues: values } } : node;
+    });
+  return { nodes: nextNodes, edges: nextEdges };
+}
+
+/**
+ * Restore the required input/output nodes and discard references that cannot be
+ * represented by the current contract. Workspace drafts are intentionally plain
+ * JSON, so this also protects the editor from old or partially written snapshots.
+ */
+export function repairFormulaGraph(
+  nodes: FormulaDraftNode[],
+  edges: FormulaDraftEdge[],
+  inputs: FormulaInputSpec[],
+  outType = "signal",
+): FormulaGraph {
+  const folded = foldInlineLiteralNodes(nodes, edges);
+  const sourceNodes = folded.nodes;
+  const sourceEdges = folded.edges;
+  const canonicalIds = new Map<string, string>();
+  const usedIds = new Set<string>();
+  const repairedNodes: FormulaDraftNode[] = [];
+  const structuralIds = new Set([
+    OUTPUT_NODE_ID,
+    ...inputs.map((_, index) => `formula-input-${index}`),
+  ]);
+
+  for (const node of sourceNodes) {
+    const data = dataOf(node);
+    if (data.kind === "input" || data.kind === "output" || structuralIds.has(node.id)) continue;
+    if (usedIds.has(node.id)) continue;
+    usedIds.add(node.id);
+    canonicalIds.set(node.id, node.id);
+    repairedNodes.push(node);
+  }
+
+  inputs.forEach((input, index) => {
+    const expectedId = `formula-input-${index}`;
+    const existing = sourceNodes.find((node) => {
+      const data = dataOf(node);
+      return data.kind === "input" && (data.argIndex === index || node.id === expectedId);
+    });
+    if (existing) canonicalIds.set(existing.id, expectedId);
+    repairedNodes.push({
+      ...(existing ?? { id: expectedId, type: "formula", x: 40, y: 70 + index * 110, data: {} }),
+      id: expectedId,
+      type: "formula",
+      data: {
+        ...(existing?.data ?? {}),
+        kind: "input",
+        label: input.name,
+        description: input.description || "Formula input.",
+        outType: input.type,
+        argIndex: index,
+        locked: true,
+      } satisfies FormulaNodeData,
+    });
+    usedIds.add(expectedId);
+  });
+
+  const existingOutput = sourceNodes.find((node) => node.id === OUTPUT_NODE_ID || dataOf(node).kind === "output");
+  if (existingOutput) canonicalIds.set(existingOutput.id, OUTPUT_NODE_ID);
+  repairedNodes.push({
+    ...(existingOutput ?? { id: OUTPUT_NODE_ID, type: "formula", x: 700, y: 160, data: {} }),
+    id: OUTPUT_NODE_ID,
+    type: "formula",
+    data: {
+      ...(existingOutput?.data ?? {}),
+      kind: "output",
+      label: "Formula output",
+      description: "The value returned by this formula.",
+      outType,
+      locked: true,
+    } satisfies FormulaNodeData,
+  });
+  usedIds.add(OUTPUT_NODE_ID);
+
+  const byId = new Map(repairedNodes.map((node) => [node.id, node]));
+  const occupiedTargets = new Set<string>();
+  const usedEdgeIds = new Set<string>();
+  const repairedEdges: FormulaDraftEdge[] = [];
+  for (const edge of sourceEdges) {
+    const source = canonicalIds.get(edge.source) ?? edge.source;
+    const target = canonicalIds.get(edge.target) ?? edge.target;
+    const sourceNode = byId.get(source);
+    const targetNode = byId.get(target);
+    if (!sourceNode || !targetNode || source === target) continue;
+    if (dataOf(sourceNode).kind === "output" || dataOf(targetNode).kind === "input") continue;
+    const targetHandle = dataOf(targetNode).kind === "output" ? "result" : edge.targetHandle;
+    const expected = targetInputType(targetNode, targetHandle);
+    if (!expected || !typesCompatible(nodeOutputType(sourceNode), expected)) continue;
+    const targetKey = `${target}:${targetHandle}`;
+    if (occupiedTargets.has(targetKey) || connectionCreatesCycle(repairedEdges, source, target)) continue;
+
+    occupiedTargets.add(targetKey);
+    const baseId = edgeId(source, target, String(targetHandle));
+    let id = baseId;
+    let suffix = 2;
+    while (usedEdgeIds.has(id)) id = `${baseId}-${suffix++}`;
+    usedEdgeIds.add(id);
+    repairedEdges.push({
+      ...edge,
+      id,
+      source,
+      target,
+      sourceHandle: "output",
+      targetHandle,
+    });
+  }
+  return { nodes: repairedNodes, edges: repairedEdges };
+}
+
+export function removeFormulaInput(
+  nodes: FormulaDraftNode[],
+  edges: FormulaDraftEdge[],
+  removedIndex: number,
+  remainingInputs: FormulaInputSpec[],
+  outType: string,
+): FormulaGraph {
+  const removed = nodes.find((node) => dataOf(node).kind === "input" && dataOf(node).argIndex === removedIndex);
+  const idMap = new Map<string, string>();
+  const nextNodes = nodes.flatMap((node) => {
+    const data = dataOf(node);
+    if (node.id === removed?.id) return [];
+    if (data.kind !== "input" || Number(data.argIndex) < removedIndex) return [node];
+    const nextIndex = Number(data.argIndex) - 1;
+    const nextId = `formula-input-${nextIndex}`;
+    idMap.set(node.id, nextId);
+    return [{ ...node, id: nextId, data: { ...data, argIndex: nextIndex } }];
+  });
+  const nextEdges = edges
+    .filter((edge) => edge.source !== removed?.id && edge.target !== removed?.id)
+    .map((edge) => ({
+      ...edge,
+      source: idMap.get(edge.source) ?? edge.source,
+      target: idMap.get(edge.target) ?? edge.target,
+    }));
+  return repairFormulaGraph(nextNodes, nextEdges, remainingInputs, outType);
+}
+
+export function findAvailableNodePosition(
+  nodes: FormulaDraftNode[],
+  desired: { x: number; y: number },
+  candidate: FormulaDraftNode,
+): { x: number; y: number } {
+  const candidateHeight = formulaNodeHeight(candidate);
+  const overlaps = (point: { x: number; y: number }) => nodes.some((node) => (
+    point.x < node.x + NODE_WIDTH + 18 &&
+    point.x + NODE_WIDTH + 18 > node.x &&
+    point.y < node.y + formulaNodeHeight(node) + 18 &&
+    point.y + candidateHeight + 18 > node.y
+  ));
+  if (!overlaps(desired)) return desired;
+
+  // Search an expanding grid around the requested point. The first choice is
+  // close to the cursor while still making every newly inserted block visible.
+  const stepX = NODE_WIDTH + NODE_GAP_X;
+  const stepY = candidateHeight + NODE_GAP_Y;
+  for (let radius = 1; radius <= 12; radius += 1) {
+    for (let y = -radius; y <= radius; y += 1) {
+      for (let x = -radius; x <= radius; x += 1) {
+        if (Math.max(Math.abs(x), Math.abs(y)) !== radius) continue;
+        const point = { x: desired.x + x * stepX, y: desired.y + y * stepY };
+        if (!overlaps(point)) return point;
+      }
+    }
+  }
+  return { x: desired.x, y: desired.y + (nodes.length + 1) * stepY };
+}
+
+/** Place a copied subgraph with one shared translation so its topology is not distorted. */
+export function findAvailableSubgraphPosition(
+  nodes: FormulaDraftNode[],
+  candidates: FormulaDraftNode[],
+): FormulaDraftNode[] {
+  if (!candidates.length) return [];
+  const overlaps = (offset: { x: number; y: number }) => candidates.some((candidate) => {
+    const point = { x: candidate.x + offset.x, y: candidate.y + offset.y };
+    const candidateHeight = formulaNodeHeight(candidate);
+    return nodes.some((node) => (
+      point.x < node.x + NODE_WIDTH + 18 &&
+      point.x + NODE_WIDTH + 18 > node.x &&
+      point.y < node.y + formulaNodeHeight(node) + 18 &&
+      point.y + candidateHeight + 18 > node.y
+    ));
+  });
+  const translated = (offset: { x: number; y: number }) => candidates.map((candidate) => ({
+    ...candidate,
+    x: candidate.x + offset.x,
+    y: candidate.y + offset.y,
+  }));
+  if (!overlaps({ x: 0, y: 0 })) return candidates;
+
+  const maxHeight = Math.max(...candidates.map(formulaNodeHeight));
+  const stepX = NODE_WIDTH + NODE_GAP_X;
+  const stepY = maxHeight + NODE_GAP_Y;
+  for (let radius = 1; radius <= 12; radius += 1) {
+    for (let y = -radius; y <= radius; y += 1) {
+      for (let x = -radius; x <= radius; x += 1) {
+        if (Math.max(Math.abs(x), Math.abs(y)) !== radius) continue;
+        const offset = { x: x * stepX, y: y * stepY };
+        if (!overlaps(offset)) return translated(offset);
+      }
+    }
+  }
+  return translated({ x: 0, y: (nodes.length + 1) * stepY });
+}
+
 export function bodyToFormulaGraph(
   body: FactorNode,
   inputs: FormulaInputSpec[],
@@ -169,8 +472,33 @@ export function bodyToFormulaGraph(
       };
     }
     if (tree.value !== undefined) node.data = { ...node.data, value: tree.value };
-    graph.nodes.push(node);
+    const nodeIndex = graph.nodes.push(node) - 1;
     for (const [index, child] of (tree.children ?? []).entries()) {
+      const data = dataOf(graph.nodes[nodeIndex]);
+      const expected = data.inputTypes?.[index];
+      const literalName = expected === "window" ? "window" : expected === "scalar" ? "const" : null;
+      if (literalName && child.name === literalName && !(child.children?.length)) {
+        graph.nodes[nodeIndex] = {
+          ...graph.nodes[nodeIndex],
+          data: {
+            ...data,
+            inlineValues: {
+              ...(data.inlineValues ?? {}),
+              [String(index)]: typeof child.value === "number" ? child.value : null,
+            },
+          },
+        };
+        continue;
+      }
+      if (expected && isInlineInputType(expected)) {
+        graph.nodes[nodeIndex] = {
+          ...graph.nodes[nodeIndex],
+          data: {
+            ...data,
+            inlineValues: { ...(data.inlineValues ?? {}), [String(index)]: null },
+          },
+        };
+      }
       const childId = visit(child, Math.max(0, depth - 1), row + index);
       graph.edges.push({
         id: edgeId(childId, id, `input-${index}`),
@@ -220,10 +548,14 @@ export function graphToFormulaBody(
     if (data.kind !== "function") throw new Error(`${data.label} cannot feed another block.`);
 
     stack.add(id);
-    const children = (data.inputTypes ?? []).map((_, index) => {
+    const children = (data.inputTypes ?? []).map((inputType, index) => {
       const incoming = edges.find((edge) => edge.target === id && edge.targetHandle === `input-${index}`);
-      if (!incoming) throw new Error(`${data.label}: connect ${data.inputNames?.[index] ?? `input ${index + 1}`}.`);
-      return build(incoming.source);
+      if (incoming) return build(incoming.source);
+      const inputLabel = data.inputNames?.[index] ?? `input ${index + 1}`;
+      if (isInlineInputType(inputType)) {
+        return inlineLiteral(inputType, data.inlineValues?.[String(index)], `${data.label}: ${inputLabel}`);
+      }
+      throw new Error(`${data.label}: connect ${inputLabel}.`);
     });
     stack.delete(id);
     return { name: data.primitiveName ?? String(data.label), children };
@@ -255,6 +587,37 @@ export function connectionCreatesCycle(
   return false;
 }
 
+/**
+ * Remove a canvas selection while preserving the structural contract nodes.
+ * Keeping this operation independent of React Flow also makes keyboard edge
+ * deletion deterministic when an edge has not been laid out in the DOM yet.
+ */
+export function deleteFormulaSelection(
+  nodes: FormulaDraftNode[],
+  edges: FormulaDraftEdge[],
+  selectedNodeIds: Iterable<string>,
+  selectedEdgeIds: Iterable<string>,
+): FormulaGraph {
+  const requestedNodes = new Set(selectedNodeIds);
+  const removableNodes = new Set(nodes
+    .filter((node) => (
+      requestedNodes.has(node.id)
+      && node.id !== OUTPUT_NODE_ID
+      && dataOf(node).kind !== "input"
+    ))
+    .map((node) => node.id));
+  const removableEdges = new Set(selectedEdgeIds);
+
+  return {
+    nodes: nodes.filter((node) => !removableNodes.has(node.id)),
+    edges: edges.filter((edge) => (
+      !removableEdges.has(edge.id)
+      && !removableNodes.has(edge.source)
+      && !removableNodes.has(edge.target)
+    )),
+  };
+}
+
 export function autoLayoutGraph(
   nodes: FormulaDraftNode[],
   edges: FormulaDraftEdge[],
@@ -270,13 +633,13 @@ export function autoLayoutGraph(
     }
   }
   const maxDepth = Math.max(1, ...depth.values());
-  const rowByDepth = new Map<number, number>();
+  const yByDepth = new Map<number, number>();
   return {
     nodes: nodes.map((node) => {
       const nodeDepth = depth.get(node.id) ?? maxDepth;
-      const row = rowByDepth.get(nodeDepth) ?? 0;
-      rowByDepth.set(nodeDepth, row + 1);
-      return { ...node, x: 40 + (maxDepth - nodeDepth) * 235, y: 55 + row * 125 };
+      const y = yByDepth.get(nodeDepth) ?? 55;
+      yByDepth.set(nodeDepth, y + formulaNodeHeight(node) + NODE_GAP_Y);
+      return { ...node, x: 40 + (maxDepth - nodeDepth) * (NODE_WIDTH + NODE_GAP_X), y };
     }),
     edges,
   };

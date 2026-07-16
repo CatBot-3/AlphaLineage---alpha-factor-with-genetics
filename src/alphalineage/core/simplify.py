@@ -11,7 +11,9 @@ from __future__ import annotations
 from alphalineage.core.tree import Node
 
 # Time-series ops where a window of 1 is the identity (f(x, 1) == x).
-_TS_WINDOW1_IDENTITY = frozenset({"ts_mean", "ts_sum", "ts_min", "ts_max", "decay_linear"})
+_TS_WINDOW1_IDENTITY = frozenset(
+    {"ts_mean", "ts_ema", "ts_sum", "ts_min", "ts_max", "decay_linear"}
+)
 
 
 def _is_const(node: Node, value: float) -> bool:

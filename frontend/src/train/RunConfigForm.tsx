@@ -1,21 +1,42 @@
-// The run launcher: pick a universe, set GP hyperparameters, optionally seed from saved
-// factors, and start a session. Replaces the old hardcoded run config in the client.
+// The run launcher: pick a universe, set GP hyperparameters, optionally seed from kept
+// formula results, and start a session. Replaces the old hardcoded run config in the client.
 
 import { useEffect, useMemo, useState } from "react";
-import { getPrimitives, listFactors, listUniverses } from "../api/client";
-import type { GpConfig, PrimitiveInfo, SavedFactor, UniverseInfo } from "../api/types";
+import {
+  getPrimitives,
+  getUniverseCoverage,
+  listFormulaResults,
+  listUniverses,
+} from "../api/client";
+import type {
+  GpConfig,
+  PrimitiveInfo,
+  SavedFactor,
+  TrainingResourcesRequest,
+  UniverseCacheCoverage,
+  UniverseInfo,
+} from "../api/types";
 import { ADVANCED_FIELDS, CORE_FIELDS, DEFAULT_CONFIG } from "./defaults";
+import { TrainingResourcePicker } from "./TrainingResourcePicker";
 
 export interface RunRequestForm {
   name: string;
   universe: string;
+  as_of: string;
   config: GpConfig;
+  resources: TrainingResourcesRequest;
   seed_factor_ids: string[];
 }
 
 // A stable empty default so the `initialSeedIds` effect dependency doesn't change every render
 // (a fresh `[]` literal default would re-fire the effect forever -> infinite re-render).
 const NO_SEEDS: string[] = [];
+
+function localToday(): string {
+  const now = new Date();
+  const offset = now.getTimezoneOffset() * 60_000;
+  return new Date(now.getTime() - offset).toISOString().slice(0, 10);
+}
 
 function numberField(key: keyof GpConfig, value: number, onChange: (v: number) => void, label: string) {
   return (
@@ -37,30 +58,64 @@ export function RunConfigForm({
   onStart,
   disabled,
   onEditUniverse,
+  onOpenDataSync,
   onOpenFormulaEditor,
 }: {
   initialSeedIds?: string[];
   onStart: (req: RunRequestForm) => void;
   disabled?: boolean;
   onEditUniverse?: (universeName: string) => void;
+  onOpenDataSync?: () => void;
   onOpenFormulaEditor?: () => void;
 }) {
   const [name, setName] = useState("Session");
   const [universe, setUniverse] = useState("sp500-lite");
+  const [asOf, setAsOf] = useState(localToday);
   const [config, setConfig] = useState<GpConfig>({ ...DEFAULT_CONFIG });
+  const [resources, setResources] = useState<TrainingResourcesRequest>({
+    profile: "auto",
+    cpu_budget_percent: null,
+  });
   const [seedIds, setSeedIds] = useState<string[]>(initialSeedIds);
   const [universes, setUniverses] = useState<UniverseInfo[]>([]);
+  const [coverage, setCoverage] = useState<UniverseCacheCoverage | null>(null);
+  const [coverageLoading, setCoverageLoading] = useState(true);
+  const [coverageError, setCoverageError] = useState<string | null>(null);
   const [factors, setFactors] = useState<SavedFactor[]>([]);
   const [primitives, setPrimitives] = useState<PrimitiveInfo[]>([]);
   // Operator categories the GP may draw from this run. `condition` (boolean ops) is off by
   // default so the classic numeric search space is unchanged unless the user opts it in.
-  const [disabledCats, setDisabledCats] = useState<Set<string>>(new Set(["condition"]));
+  const [disabledCats, setDisabledCats] = useState<Set<string>>(
+    new Set(["condition", "technical_indicators"]),
+  );
 
   useEffect(() => {
-    listUniverses().then(setUniverses).catch(() => setUniverses([]));
-    listFactors().then(setFactors).catch(() => setFactors([]));
+    listUniverses({ summary: true }).then(setUniverses).catch(() => setUniverses([]));
+    listFormulaResults().then(setFactors).catch(() => setFactors([]));
     getPrimitives().then(setPrimitives).catch(() => setPrimitives([]));
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setCoverageLoading(true);
+    setCoverageError(null);
+    getUniverseCoverage(universe, asOf)
+      .then((next) => {
+        if (!cancelled) setCoverage(next);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setCoverage(null);
+          setCoverageError(error instanceof Error ? error.message : String(error));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCoverageLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [universe, asOf]);
 
   useEffect(() => setSeedIds(initialSeedIds), [initialSeedIds]);
 
@@ -91,53 +146,115 @@ export function RunConfigForm({
     });
   }
 
+  const selectedUniverse = universes.find((item) => item.name === universe);
+  const trainingReady = coverage?.complete === true;
+
   return (
     <form
       className="run-form"
       data-testid="run-config-form"
       onSubmit={(e) => {
         e.preventDefault();
+        if (disabled || coverageLoading || !trainingReady) return;
         const enabled = [...functionsByCategory.keys()].filter((c) => !disabledCats.has(c));
         onStart({
           name,
           universe,
+          as_of: asOf,
           config: { ...config, enabled_categories: enabled.length ? enabled : null },
+          resources,
           seed_factor_ids: seedIds,
         });
       }}
     >
-      <div className="field-grid">
-        <label className="field">
-          <span className="field-label">Session name</span>
-          <input value={name} aria-label="Session name" onChange={(e) => setName(e.target.value)} />
-        </label>
-        <label className="field">
-          <span className="field-label">Universe</span>
-          <span className="universe-field-row">
-            <select value={universe} aria-label="Universe" onChange={(e) => setUniverse(e.target.value)}>
-              {universes.length === 0 && <option value="sp500-lite">sp500-lite</option>}
-              {universes.map((u) => (
-                <option key={u.name} value={u.name}>
-                  {u.name} ({u.symbols.length})
-                </option>
-              ))}
-            </select>
-            {onEditUniverse && (
-              <button
-                type="button"
-                className="edit-universe-btn"
-                data-testid="edit-universe"
-                onClick={() => onEditUniverse(universe)}
-              >
-                Edit
-              </button>
-            )}
-          </span>
-        </label>
-        {CORE_FIELDS.map((f) =>
-          numberField(f.key, config[f.key] as number, set(f.key), f.label),
-        )}
-      </div>
+      <section className="run-form-section" aria-labelledby="run-setup-heading">
+        <div className="run-form-section__head">
+          <h3 id="run-setup-heading">Run setup</h3>
+          <span>Choose the research context before tuning the search.</span>
+        </div>
+        <div className="run-setup-grid">
+          <label className="field">
+            <span className="field-label">Session name</span>
+            <input value={name} aria-label="Session name" onChange={(e) => setName(e.target.value)} />
+          </label>
+          <label className="field run-universe-field">
+            <span className="field-label">Universe</span>
+            <span className="universe-field-row">
+              <select value={universe} aria-label="Universe" onChange={(e) => setUniverse(e.target.value)}>
+                {universes.length === 0 && <option value="sp500-lite">sp500-lite</option>}
+                {universes.map((u) => (
+                  <option key={u.name} value={u.name}>
+                    {u.display_name ?? u.name} ({u.symbol_count ?? u.definition?.member_count ?? u.symbols.length})
+                  </option>
+                ))}
+              </select>
+              {onEditUniverse && (
+                <button
+                  type="button"
+                  className="edit-universe-btn"
+                  data-testid="edit-universe"
+                  onClick={() => onEditUniverse(universe)}
+                >
+                  Edit
+                </button>
+              )}
+            </span>
+          </label>
+          <label className="field run-date-field">
+            <span className="field-label">As of date</span>
+            <input
+              type="date"
+              value={asOf}
+              max={localToday()}
+              required
+              aria-label="As of date"
+              onChange={(event) => setAsOf(event.target.value)}
+            />
+            <small className="hint">Membership and available data are evaluated on this date.</small>
+          </label>
+        </div>
+        <div
+          className={`run-readiness ${trainingReady ? "run-readiness--ready" : "run-readiness--attention"}`}
+          role="status"
+          data-testid="run-readiness"
+        >
+          <div>
+            <strong>
+              {coverageLoading
+                ? "Checking price readiness…"
+                : trainingReady
+                  ? "Price history ready"
+                  : "Price history needs attention"}
+            </strong>
+            <span>
+              {coverageLoading
+                ? "Training unlocks after cached coverage is checked."
+                : trainingReady
+                  ? `${selectedUniverse?.symbol_count ?? selectedUniverse?.definition?.member_count ?? coverage?.eligible_symbols.length ?? 0} symbols are covered through ${asOf}.`
+                  : coverageError ?? `${coverage?.incomplete_symbols?.length ?? 0} symbols are missing or incomplete through ${asOf}.`}
+            </span>
+          </div>
+          {!coverageLoading && !trainingReady && onOpenDataSync && (
+            <button type="button" className="ghost" onClick={onOpenDataSync}>
+              Data Sync
+            </button>
+          )}
+        </div>
+      </section>
+
+      <section className="run-form-section" aria-labelledby="search-budget-heading">
+        <div className="run-form-section__head">
+          <h3 id="search-budget-heading">Search budget</h3>
+          <span>Control breadth, duration, and expression complexity.</span>
+        </div>
+        <div className="search-budget-grid">
+          {CORE_FIELDS.map((f) =>
+            numberField(f.key, config[f.key] as number, set(f.key), f.label),
+          )}
+        </div>
+      </section>
+
+      <TrainingResourcePicker value={resources} onChange={setResources} disabled={disabled} />
 
       <details className="advanced">
         <summary>Advanced GP parameters</summary>
@@ -153,7 +270,7 @@ export function RunConfigForm({
         <div className="function-space-head">
           <span className="hint">
             Toggle which operator categories the search may use. Functions are not part of the
-            universe; edit them in the Formula Editor.
+            universe; edit them in the Formula Builder.
           </span>
           {onOpenFormulaEditor && (
             <button
@@ -186,7 +303,7 @@ export function RunConfigForm({
 
       {factors.length > 0 && (
         <fieldset className="seed-picker" data-testid="seed-picker">
-          <legend>Seed from saved factors (optional)</legend>
+          <legend>Seed training from Formula Results (optional)</legend>
           {factors.map((factor) => (
             <label key={factor.id} className="seed-option">
               <input
@@ -200,7 +317,11 @@ export function RunConfigForm({
         </fieldset>
       )}
 
-      <button type="submit" className="primary-action" disabled={disabled}>
+      <button
+        type="submit"
+        className="primary-action"
+        disabled={disabled || coverageLoading || !trainingReady}
+      >
         Start training
       </button>
     </form>

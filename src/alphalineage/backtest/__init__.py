@@ -13,6 +13,7 @@ from alphalineage.backtest.engine import (
     compare_schemes,
     comparison_frame,
     net_return_fn,
+    net_returns_for_factor,
 )
 from alphalineage.backtest.metrics import (
     annualized_sharpe,
@@ -29,6 +30,7 @@ from alphalineage.backtest.portfolio import (
     get_scheme,
     neutralize,
 )
+from alphalineage.backtest.reporting import backtest_report, json_number
 
 __all__ = [
     "SCHEMES",
@@ -39,12 +41,15 @@ __all__ = [
     "WeightingScheme",
     "annualized_sharpe",
     "backtest",
+    "backtest_report",
     "compare_schemes",
     "comparison_frame",
     "get_scheme",
     "ic_decay",
+    "json_number",
     "max_drawdown",
     "net_return_fn",
+    "net_returns_for_factor",
     "neutralize",
     "position_magnitude",
     "turnover",
