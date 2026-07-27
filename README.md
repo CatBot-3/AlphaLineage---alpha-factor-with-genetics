@@ -11,32 +11,8 @@ and when holdout evidence was opened**—not just receive an unexplained backtes
 The Python package is `alphalineage`. For a guided walkthrough, see
 [the tutorial](docs/TUTORIAL.md).
 
-## What it provides
-
-| Area | Capabilities |
-| --- | --- |
-| Formula research | Strongly typed visual graphs, reusable formulas, pinned revisions, inline parameters, and a managed technical-indicator catalog |
-| Evolution | Deterministic genetic programming with protected stepping stones, parameter neighborhoods, formula composition, checkpoint continuation, and bounded multicore native scoring |
-| Validation | Three chronological folds, fixed training polarity, coverage and portfolio-feasibility gates, and explicit strategy comparison |
-| Backtesting | Quantile long/short and rank-proportional portfolios, transaction costs, benchmark overlays, and invalid/no-exposure detection |
-| Evidence control | Validation-only rounds, user-pinned finalization plans, immutable results, and clearly labelled repeated holdout reads |
-| Data | Prepared S&P 500, DJIA, and Nasdaq-100 snapshots, custom point-in-time memberships, incremental price synchronization, and data-integrity checks |
-
-The research flow is deliberately staged:
-
-```text
-Universe + reusable formulas
-            ↓
-Deterministic evolutionary search
-            ↓
-Three chronological validation folds
-            ↓
-User-pinned portfolio strategy
-            ↓
-Explicit locked-holdout finalization
-            ↓
-Immutable result, formula graph, and genealogy
-```
+**Workflow:** prepare data → compose formulas → evolve candidates → validate strategies → finalize
+the holdout → inspect the result and its genealogy.
 
 ## Product tour
 
@@ -50,6 +26,9 @@ definition so readiness is visible before training begins.
   <img src="docs/images/readme/universe-editor.png" alt="AlphaLineage Universe Editor with prepared S&amp;P 500, DJIA, Nasdaq-100, and price synchronization controls" width="100%">
 </p>
 
+<sub>The LEH row shown in the import example deliberately demonstrates a historical exited
+constituent. It is not a member of the bundled live-stock sample.</sub>
+
 ### 2. Build formulas from formulas
 
 The Formula Builder uses the same typed expression model as training and backtesting. Market fields,
@@ -59,6 +38,9 @@ saved, nested inside another formula, backtested as a draft, or opened as an edi
 <p align="center">
   <img src="docs/images/readme/formula-builder.png" alt="AlphaLineage Formula Builder showing a composed RSI formula as a typed node graph" width="100%">
 </p>
+
+<sub>An expanded RSI graph is shown here to demonstrate a deeply composed formula; smaller formulas
+remain compact.</sub>
 
 ### 3. Validate before opening the holdout
 
@@ -92,6 +74,17 @@ synchronized so a result can be audited from metric back to expression.
 <p align="center">
   <img src="docs/images/readme/genealogy.png" alt="AlphaLineage Genealogy workspace with generation list, ancestry graph, and selected formula inspector" width="100%">
 </p>
+
+## Core capabilities
+
+| Area | Capabilities |
+| --- | --- |
+| Formula research | Strongly typed visual graphs, reusable formulas, pinned revisions, inline parameters, and a managed technical-indicator catalog |
+| Evolution | Deterministic genetic programming with protected stepping stones, parameter neighborhoods, formula composition, checkpoint continuation, and bounded multicore native scoring |
+| Validation | Three chronological folds, fixed training polarity, coverage and portfolio-feasibility gates, and explicit strategy comparison |
+| Backtesting | Quantile long/short and rank-proportional portfolios, transaction costs, benchmark overlays, and invalid/no-exposure detection |
+| Evidence control | Validation-only rounds, user-pinned finalization plans, immutable results, and clearly labelled repeated holdout reads |
+| Data | Prepared S&P 500, DJIA, and Nasdaq-100 snapshots, custom point-in-time memberships, incremental price synchronization, and data-integrity checks |
 
 ## Why AlphaLineage is different
 
@@ -206,7 +199,6 @@ python scripts/export_demo.py --workspace run-<id> --out frontend/public/demo-ru
 ```bash
 pytest -q
 ruff check .
-ruff format --check .
 mypy src
 
 cd frontend

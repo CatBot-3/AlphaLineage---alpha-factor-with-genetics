@@ -332,8 +332,8 @@ would not be.
 - **Seed a new search** — select one or more results and click
   **Seed training from Formula Results (N)**. The Train tab opens with those results preselected as
   seeds; choose a universe and parameters and **Start training**. The initial population begins
-  from the selected results (recorded as `seed` in
-  the lineage), which is how earlier results are combined into a new search.
+  from the selected results (recorded as `seed` in the lineage), which is how earlier results are
+  combined into a new search.
 
 ### 3.11 On honest metrics
 - The **test segment is locked** for the session's lifetime; changing the universe does not relocate
