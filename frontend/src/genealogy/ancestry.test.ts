@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Lineage } from "../api/types";
-import { ancestorClosure, bestFinalNode } from "./ancestry";
+import { ancestorClosure, bestFinalNode, compressEliteChains } from "./ancestry";
 
 const tree = { name: "close" };
 
@@ -36,5 +36,25 @@ describe("ancestry (B4)", () => {
     expect(bestFinalNode(undefined)).toBeNull();
     expect(bestFinalNode({} as unknown as Lineage)).toBeNull();
     expect(ancestorClosure({ run_id: "r", metadata: {}, nodes: [] }, 5).nodes).toEqual([]);
+  });
+});
+
+describe("compressEliteChains", () => {
+  it("collapses only a linear unchanged-elite run", () => {
+    const tree = { name: "close" };
+    const lineage = {
+      run_id: "r",
+      metadata: {},
+      nodes: [
+        { id: 0, generation: 0, op: "init", parents: [], tree, fitness: 0.1 },
+        { id: 1, generation: 1, op: "elite", parents: [0], tree, fitness: 0.1 },
+        { id: 2, generation: 2, op: "elite", parents: [1], tree, fitness: 0.1 },
+        { id: 3, generation: 3, op: "elite", parents: [2], tree, fitness: 0.1 },
+      ],
+    };
+    const compressed = compressEliteChains(lineage);
+    expect(compressed.nodes.map((node) => node.id)).toEqual([0, 3]);
+    expect(compressed.nodes[1].parents).toEqual([0]);
+    expect(compressed.nodes[1].op).toBe("elite × 3");
   });
 });

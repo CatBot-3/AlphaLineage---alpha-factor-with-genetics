@@ -17,7 +17,11 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def _reset_backend():
+def _reset_backend(monkeypatch):
+    # The real application intentionally loads the repository .env at startup. Tests
+    # isolate that machine-local configuration and opt into environment precedence only
+    # in the case that exercises it.
+    monkeypatch.delenv("TIINGO_API_KEY", raising=False)
     yield
     cpp.set_backend(None)  # don't leak the override into other tests
 
@@ -26,6 +30,8 @@ def test_settings_reports_evaluator_and_key_state(client):
     payload = client.get("/settings").json()
     assert "factors_dir" in payload
     assert payload["tiingo_api_key_set"] is False
+    assert payload["tiingo_api_key_source"] == "none"
+    assert payload["tiingo_stored_key_set"] is False
     assert payload["evaluator"] == "auto"
     assert isinstance(payload["cpp_available"], bool)
 
@@ -47,6 +53,8 @@ def test_tiingo_key_stored_but_never_echoed(client):
     assert put.status_code == 200
     body = put.json()
     assert body["tiingo_api_key_set"] is True
+    assert body["tiingo_api_key_source"] == "stored"
+    assert body["tiingo_stored_key_set"] is True
     assert "secret-key-123" not in str(body)  # the secret is never returned
     assert paths.tiingo_api_key() == "secret-key-123"  # but the backend can resolve it
 
@@ -67,3 +75,6 @@ def test_tiingo_env_overrides_setting(client, monkeypatch):
     client.put("/settings", json={"tiingo_api_key": "from-settings"})
     monkeypatch.setenv("TIINGO_API_KEY", "from-env")
     assert paths.tiingo_api_key() == "from-env"  # env wins (P-S3)
+    state = client.get("/settings").json()
+    assert state["tiingo_api_key_source"] == "environment"
+    assert state["tiingo_stored_key_set"] is True

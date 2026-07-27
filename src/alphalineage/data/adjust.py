@@ -19,6 +19,9 @@ import pandas as pd
 from alphalineage.data import schema
 
 _ADJ_PRICE_COLS = {"open": "adj_open", "high": "adj_high", "low": "adj_low", "close": "adj_close"}
+# Bump whenever the same cached canonical frame would produce different analysis prices.
+# Checkpoints and reports persist this independently from the GP scorer version.
+ADJUSTMENT_SCHEMA_VERSION = 2
 
 
 def _suffix_excl_self(factor: pd.Series) -> pd.Series:
@@ -27,9 +30,12 @@ def _suffix_excl_self(factor: pd.Series) -> pd.Series:
     return suffix_incl.shift(-1).fillna(1.0)  # drop self -> prod_{i > t}
 
 
-def price_adjustment(df: pd.DataFrame) -> pd.Series:
-    """Cumulative price adjustment factor (splits + dividends), one per day."""
+def price_adjustment(
+    df: pd.DataFrame, *, price_basis: schema.PriceBasis | None = None
+) -> pd.Series:
+    """Cumulative total-return adjustment appropriate to ``df``'s price basis."""
     schema.validate(df)
+    basis = price_basis or schema.resolve_price_basis(df)
     close = df["close"]
     prev_close = close.shift(1)
     div_cash = df["div_cash"]
@@ -41,13 +47,25 @@ def price_adjustment(df: pd.DataFrame) -> pd.Series:
     div_mult = pd.Series(1.0, index=df.index)
     div_mult[has_div] = 1.0 - div_cash[has_div] / prev_close[has_div]
 
-    day_factor = (1.0 / split_factor) * div_mult
+    if basis == "raw":
+        day_factor = (1.0 / split_factor) * div_mult
+    elif basis == "split_adjusted":
+        # Yahoo's OHLCV history is already split-normalized but not dividend-adjusted.
+        day_factor = div_mult
+    else:
+        # A total-return-adjusted provider has already incorporated both actions.
+        day_factor = pd.Series(1.0, index=df.index)
     return _suffix_excl_self(day_factor)
 
 
-def split_adjustment(df: pd.DataFrame) -> pd.Series:
-    """Cumulative split-only adjustment factor for prices and volume."""
+def split_adjustment(
+    df: pd.DataFrame, *, price_basis: schema.PriceBasis | None = None
+) -> pd.Series:
+    """Cumulative split-only adjustment, or identity for an adjusted provider."""
     schema.validate(df)
+    basis = price_basis or schema.resolve_price_basis(df)
+    if basis != "raw":
+        return pd.Series(1.0, index=df.index)
     split_factor = df["split_factor"].replace(0.0, 1.0)
     return _suffix_excl_self(1.0 / split_factor)
 
@@ -55,9 +73,10 @@ def split_adjustment(df: pd.DataFrame) -> pd.Series:
 def adjust(df: pd.DataFrame) -> pd.DataFrame:
     """Return ``df`` with ``adj_open/high/low/close`` and ``adj_volume`` appended."""
     schema.validate(df)
+    basis = schema.resolve_price_basis(df)
     out = df.copy()
-    price_cumadj = price_adjustment(df)
-    split_cumadj = split_adjustment(df)
+    price_cumadj = price_adjustment(df, price_basis=basis)
+    split_cumadj = split_adjustment(df, price_basis=basis)
 
     for raw_col, adj_col in _ADJ_PRICE_COLS.items():
         out[adj_col] = df[raw_col] * price_cumadj

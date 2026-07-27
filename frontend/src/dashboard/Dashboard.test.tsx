@@ -1,5 +1,5 @@
-import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import type { HistoryPoint, Report, RunResult } from "../api/types";
 import { Dashboard } from "./Dashboard";
 
@@ -22,7 +22,7 @@ describe("dashboard (P6-T3)", () => {
     render(<Dashboard report={report} history={history} />);
     const primary = screen.getByTestId("primary-metric");
     const controls = screen.getByTestId("overfitting-controls");
-    expect(within(primary).getByText("OOS mean |rank IC|")).toBeInTheDocument();
+    expect(within(primary).getByText("Oriented OOS rank IC")).toBeInTheDocument();
     expect(within(primary).getByText("0.120")).toBeInTheDocument();
     expect(within(controls).getByText("Deflated Sharpe probability")).toBeInTheDocument();
     expect(within(controls).getByText("3.0%")).toBeInTheDocument();
@@ -77,8 +77,135 @@ describe("dashboard (P6-T3)", () => {
     render(<Dashboard report={report} history={history} extra={result} />);
     expect(screen.getByText("Cumulative percentage return")).toBeInTheDocument();
     expect(screen.getByText("Population fitness")).toBeInTheDocument();
-    expect(screen.getAllByText("Best |rank IC|").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Best oriented rank IC").length).toBeGreaterThan(0);
     expect(screen.getAllByRole("img")).toHaveLength(3);
+  });
+
+  it("withholds a successful verdict when validation found no signal", () => {
+    const result = {
+      selection: {
+        validated: false,
+        reason: "no candidate has positive validation evidence",
+        first_seen: 0,
+        polarity: 1,
+        training_fitness: 0.2,
+        training_metrics: { signed_ic: 0.2, oriented_ic: 0.2 },
+        validation_fitness: -0.1,
+        validation_metrics: { signed_ic: -0.1, valid_dates: 12 },
+      },
+    } as unknown as RunResult;
+    render(
+      <Dashboard
+        report={{ ...report, significant: true, validation_passed: false }}
+        history={history}
+        extra={result}
+      />,
+    );
+    expect(screen.getByText("No validated signal")).toBeInTheDocument();
+    expect(screen.getByText("Validation oriented IC")).toBeInTheDocument();
+    expect(screen.queryByText("Passes checks")).not.toBeInTheDocument();
+  });
+
+  it("surfaces invalid portfolio paths and collapsed population diversity", () => {
+    const result = {
+      oos_backtest: {
+        start: "2025-01-01",
+        end: "2025-01-02",
+        observations: 2,
+        metrics: { usable: false, insolvent: true },
+        returns: [],
+        normalized_equity: [
+          { date: "2025-01-01", value: 1 },
+          { date: "2025-01-02", value: 0 },
+        ],
+        integrity: {
+          valid: false,
+          issues: ["portfolio return reached or crossed -100%"],
+          equity_terminated_reason: "insolvent",
+        },
+      },
+    } as unknown as RunResult;
+    render(
+      <Dashboard
+        report={report}
+        history={[
+          ...history,
+          {
+            generation: 2,
+            best_fitness: 0.5,
+            mean_fitness: 0.3,
+            best_ic: 0.5,
+            unique_tree_ratio: 0.5,
+            diversity_warning: 1,
+          },
+        ]}
+        extra={result}
+      />,
+    );
+    expect(screen.getByTestId("holdout-integrity-warning")).toBeInTheDocument();
+    expect(screen.getByTestId("diversity-warning")).toBeInTheDocument();
+  });
+
+  it("does not render a cash-only return curve as valid performance evidence", () => {
+    const result = {
+      oos_backtest: {
+        start: "2021-04-13",
+        end: "2026-07-24",
+        observations: 1326,
+        metrics: {
+          signed_ic: null,
+          mean_abs_ic: null,
+          ic_ir: null,
+          gross_sharpe: null,
+          net_sharpe: null,
+          max_drawdown: null,
+          turnover: 0,
+          avg_gross: 0,
+          avg_positions: 0,
+          max_position: 0,
+          usable: false,
+        },
+        returns: [{ date: "2021-04-13", gross: 0, net: 0, active: false }],
+        normalized_equity: [{ date: "2021-04-13", value: 1 }],
+        portfolio_health: {
+          eligible_dates: 1326,
+          calendar_observations: 1326,
+          active_observations: 0,
+          two_sided_observations: 0,
+          exposure_coverage: 0,
+          flat_factor_dates: 1326,
+          valid: false,
+          reason: "no_exposure",
+        },
+      },
+    } as unknown as RunResult;
+
+    render(<Dashboard report={report} history={history} extra={result} />);
+
+    expect(screen.getByTestId("no-exposure-warning")).toHaveTextContent(
+      /No tradable cross-sectional variation/i,
+    );
+    expect(screen.getByText("No tradable portfolio")).toBeInTheDocument();
+    expect(screen.queryByText("Cumulative percentage return")).not.toBeInTheDocument();
+    expect(screen.getByText(/1326 calendar/i)).toBeInTheDocument();
+    expect(screen.getByText(/0 active/i)).toBeInTheDocument();
+    expect(screen.getByText("Net Sharpe").parentElement).not.toHaveTextContent("0.000");
+    expect(screen.getByText("Gross Sharpe").parentElement).not.toHaveTextContent("0.000");
+    expect(screen.getByText("Maximum drawdown").parentElement).not.toHaveTextContent("0.0%");
+  });
+
+  it("labels pre-fix reports as invalid evidence", () => {
+    render(
+      <Dashboard
+        report={{ ...report, significant: true }}
+        history={history}
+        extra={{ validity: "invalid_legacy_semantics" } as RunResult}
+      />,
+    );
+    expect(screen.getByText("Invalid legacy report")).toBeInTheDocument();
+    expect(screen.getByTestId("legacy-invalid-warning")).toHaveTextContent(
+      /Restart with the same setup/i,
+    );
   });
 
   it("renders an equity curve from legacy dated net returns", () => {
@@ -99,5 +226,77 @@ describe("dashboard (P6-T3)", () => {
     render(<Dashboard report={report} history={history} extra={result} />);
     expect(screen.getByText("Cumulative percentage return")).toBeInTheDocument();
     expect(screen.queryByText(/Equity history is unavailable/)).not.toBeInTheDocument();
+  });
+
+  it("shows fold robustness and an explicit finalization action before holdout access", () => {
+    const finalize = vi.fn();
+    const validationRound = {
+      validation_only: true,
+      evidence_status: "validation_only",
+      selection: {
+        validated: true,
+        first_seen: 2,
+        polarity: -1,
+        training_fitness: 0.08,
+        training_metrics: { signed_ic: -0.09, oriented_ic: 0.09 },
+        validation_fitness: 0.04,
+        validation_metrics: { signed_ic: -0.04, valid_dates: 210 },
+        folds: [
+          { index: 0, valid_dates: 70, oriented_ic: 0.03, positive: true },
+          { index: 1, valid_dates: 70, oriented_ic: 0.05, positive: true },
+          { index: 2, valid_dates: 70, oriented_ic: -0.01, positive: false },
+        ],
+        positive_folds: 2,
+        required_positive_folds: 2,
+        median_oriented_ic: 0.03,
+        worst_fold_ic: -0.01,
+        complexity: {
+          expanded_nodes: 12,
+          mode: "normalized_budget",
+          penalty_value: 0.005,
+          deduction: 0.0015,
+          max_nodes: 40,
+        },
+        final_objective: 0.0285,
+        parameter_variants: 7,
+      },
+    } as unknown as RunResult;
+
+    render(
+      <Dashboard
+        report={null}
+        history={history}
+        extra={validationRound}
+        onFinalize={finalize}
+      />,
+    );
+
+    expect(screen.getByText("Validated candidate")).toBeInTheDocument();
+    expect(screen.getByText("Why this formula won")).toBeInTheDocument();
+    expect(screen.getByText("2 of 3 folds positive")).toBeInTheDocument();
+    expect(screen.queryByTestId("holdout-performance")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overfitting-controls")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("finalize-round"));
+    expect(finalize).toHaveBeenCalledOnce();
+  });
+
+  it("never labels repeated or post-holdout-adaptive evidence as passing", () => {
+    render(
+      <Dashboard
+        report={{ ...report, significant: true }}
+        history={history}
+        extra={
+          {
+            evidence_status: "repeated_same_holdout",
+            session_holdout_reads: 2,
+          } as unknown as RunResult
+        }
+      />,
+    );
+    expect(screen.getByText("Exploratory evidence")).toBeInTheDocument();
+    expect(screen.queryByText("Passes checks")).not.toBeInTheDocument();
+    expect(screen.getByTestId("oos-warning")).toHaveTextContent(
+      /trainer selected this formula using training and validation only/i,
+    );
   });
 });

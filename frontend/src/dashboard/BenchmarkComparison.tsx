@@ -411,6 +411,8 @@ export function BenchmarkComparison({
             : "The factor's compounded locked-holdout return after commission and slippage, measured from the explicit pre-return baseline."
         }
         baseline={0}
+        baselineAwarePadding
+        domainFloor={-1}
         formatValue={(value) => `${(value * 100).toFixed(1)}%`}
         series={chartSeries}
       />

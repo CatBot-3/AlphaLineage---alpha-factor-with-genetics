@@ -20,7 +20,13 @@ gp:
   point_mutation_rate: 0.1
   max_depth: 6
   max_nodes: 40
+  # Modern search scales complexity to a bounded maximum deduction at max_nodes.
   parsimony: 0.001
+  complexity_penalty_mode: normalized_budget
+  complexity_penalty_value: 0.005
+  parameter_neighbor_fraction: 0.25
+  validation_folds: 3
+  exploration_profile: aggressive
   elitism: 1
   ic_method: spearman
   min_names: 5

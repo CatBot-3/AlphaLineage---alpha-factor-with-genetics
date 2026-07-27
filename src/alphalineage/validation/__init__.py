@@ -16,6 +16,13 @@ from alphalineage.validation.pbo import pbo
 from alphalineage.validation.performance import long_short_returns, returns_matrix, tree_returns
 from alphalineage.validation.pipeline import LockedTestSet, OverfittingReport, judge
 from alphalineage.validation.purged_cv import purged_kfold
+from alphalineage.validation.selection import (
+    VALIDATION_SELECTION_VERSION,
+    ValidationSelection,
+    compare_validation_strategies,
+    orient_training_candidates,
+    select_validation_candidate,
+)
 from alphalineage.validation.splits import Split, time_split, walk_forward
 from alphalineage.validation.trials import TrialCounter
 
@@ -27,6 +34,11 @@ __all__ = [
     "deflated_sharpe_ratio",
     "expected_max_sharpe",
     "judge",
+    "ValidationSelection",
+    "VALIDATION_SELECTION_VERSION",
+    "compare_validation_strategies",
+    "orient_training_candidates",
+    "select_validation_candidate",
     "long_short_returns",
     "pbo",
     "probabilistic_sharpe_ratio",

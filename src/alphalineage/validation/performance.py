@@ -21,12 +21,20 @@ from alphalineage.core.tree import Node
 def long_short_returns(factor: pd.DataFrame, fwd: pd.DataFrame) -> pd.Series:
     """Daily dollar-neutral, unit-gross long-short return of ``factor`` vs forward returns."""
     f, r = factor.align(fwd, join="inner")
-    mask = f.notna() & r.notna()
-    f = f.where(mask)
+    # Weights are decided from information available at the signal date.  Masking the
+    # factor by a future return's availability silently reallocates the portfolio with
+    # hindsight and turns missing data into artificial performance.
     weights = f.sub(f.mean(axis=1), axis=0)  # demean -> dollar neutral
     gross = weights.abs().sum(axis=1).replace(0.0, np.nan)
     weights = weights.div(gross, axis=0)  # unit gross (sum |w| = 1)
-    return (weights * r).sum(axis=1, min_count=1)
+    result = (weights * r).sum(axis=1, min_count=1)
+    active = weights.ne(0.0)
+    finite = pd.DataFrame(
+        np.isfinite(r.to_numpy(dtype="float64")),
+        index=r.index,
+        columns=r.columns,
+    )
+    return result.mask((active & (~finite | r.isna())).any(axis=1))
 
 
 def tree_returns(tree: Node, panel: Panel, fwd: pd.DataFrame) -> pd.Series:

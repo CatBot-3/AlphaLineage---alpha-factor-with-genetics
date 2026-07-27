@@ -30,7 +30,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only when unbuilt
     _EXT = None
 
-_NATIVE_ABI_VERSIONS = {4, 5}
+_NATIVE_ABI_VERSIONS = {8}
+_NATIVE_SCORING_ABI = 8
 _MAX_PLAN_CACHE = 4096
 
 # Opcodes - must match cpp/evaluator.cpp.
@@ -141,7 +142,13 @@ def native_abi_version() -> int | None:
 
 def supports_native_scoring(method: str) -> bool:
     """Whether the selected backend can preserve scoring semantics for this IC method."""
-    return method == "spearman" and backend_enabled()
+    abi = native_abi_version()
+    return (
+        method == "spearman"
+        and backend_enabled()
+        and abi is not None
+        and abi >= _NATIVE_SCORING_ABI
+    )
 
 
 # Process-level backend override, set from the persisted UI setting. Resolved without a
@@ -422,6 +429,9 @@ def score_many(
     method: str = "spearman",
     absolute: bool = True,
     parsimony: float = 0.0,
+    complexity_penalty_mode: str = "per_node",
+    complexity_penalty_value: float | None = None,
+    max_nodes: int | None = None,
     min_names: int = 5,
     min_valid_dates: int = 5,
     workers: int,
@@ -444,8 +454,14 @@ def score_many(
         raise ValueError("memory_budget_bytes must be a positive integer or None")
     if method not in {"spearman", "pearson"}:
         raise ValueError(f"unknown IC method {method!r}")
-    if not np.isfinite(parsimony):
-        raise ValueError("parsimony must be finite")
+    from alphalineage.core.fitness import complexity_penalty_rate
+
+    penalty_rate = complexity_penalty_rate(
+        parsimony=parsimony,
+        complexity_penalty_mode=complexity_penalty_mode,
+        complexity_penalty_value=complexity_penalty_value,
+        max_nodes=max_nodes,
+    )
     if isinstance(min_names, bool) or not isinstance(min_names, int) or min_names <= 0:
         raise ValueError("min_names must be a positive integer")
     if (
@@ -457,20 +473,36 @@ def score_many(
     # Spearman is the GP default and has exact average-tie integer-rank semantics in native code.
     # Pearson's degenerate constant-row IC-IR depends on NumPy reduction roundoff, so retain the
     # Python scorer rather than silently changing that metric.
-    if not materialized or not backend_enabled() or method == "pearson":
+    if (
+        not materialized
+        or not backend_enabled()
+        or method == "pearson"
+        or (native_abi_version() or 0) < _NATIVE_SCORING_ABI
+    ):
         return results
 
-    supported: list[tuple[int, Node, _CompiledPlan, int]] = []
+    supported: list[tuple[int, Node, _CompiledPlan, int, int]] = []
     for index, node in enumerate(materialized):
         expanded = expand_all(node)
         plan = _compile_expanded(expanded)
         if plan is not None and _plan_supported_by_loaded_abi(plan):
-            supported.append((index, node, plan, expanded.unique_size()))
+            supported.append(
+                (
+                    index,
+                    node,
+                    plan,
+                    expanded.size(),
+                    expanded.unique_computation_size(),
+                )
+            )
     if not supported:
         return results
 
     frame_bytes = max(1, len(panel.dates) * len(panel.symbols) * np.dtype(np.float64).itemsize)
-    max_peak = max(plan.peak_buffers + 1 for _index, _node, plan, _size in supported)
+    max_peak = max(
+        plan.peak_buffers + 1
+        for _index, _node, plan, _size, _unique_size in supported
+    )
     effective_workers = min(workers, native_max_workers(), len(supported))
     if memory_budget_bytes is not None:
         effective_workers = min(
@@ -482,22 +514,53 @@ def score_many(
     target_values = np.ascontiguousarray(target.to_numpy(dtype=np.float64, na_value=np.nan))
     native = _EXT.score_many(
         _panel_arrays(panel),
-        [plan.native_tuple() for _index, _node, plan, _size in supported],
+        [
+            plan.native_tuple()
+            for _index, _node, plan, _size, _unique_size in supported
+        ],
         target_values,
         np.ascontiguousarray(
-            [size for _index, _node, _plan, size in supported], dtype=np.int32
+            [
+                size
+                for _index, _node, _plan, size, _unique_size in supported
+            ],
+            dtype=np.int32,
         ),
         0 if method == "spearman" else 1,
         absolute,
-        float(parsimony),
+        float(penalty_rate),
         min_names,
         min_valid_dates,
         effective_workers,
     )
-    for offset, (result_index, _node, _plan, _size) in enumerate(supported):
-        fitness, ic, information_ratio = (float(value) for value in native[offset])
-        results[result_index] = (
-            fitness,
-            {"ic": ic, "ic_ir": information_ratio},
-        )
+    for offset, (
+        result_index,
+        _node,
+        _plan,
+        size,
+        unique_size,
+    ) in enumerate(supported):
+        values = [float(value) for value in native[offset]]
+        fitness, ic, information_ratio = values[:3]
+        valid_dates = values[9]
+        metrics = {"ic": ic, "ic_ir": information_ratio}
+        if valid_dates >= min_valid_dates:
+            metrics.update(
+                {
+                    "raw_objective": ic,
+                    "expanded_complexity": float(size),
+                    "expanded_unique_nodes": float(unique_size),
+                    "complexity_penalty": float(penalty_rate * size),
+                    "signed_ic": values[3],
+                    "oriented_ic": values[4],
+                    "mean_abs_ic": values[5],
+                    "polarity": values[6],
+                    "oriented_ic_ir": values[7],
+                    "sign_consistency": values[8],
+                    "valid_dates": valid_dates,
+                    "avg_active_names": values[10],
+                    "min_active_names": values[11],
+                }
+            )
+        results[result_index] = (fitness, metrics)
     return results

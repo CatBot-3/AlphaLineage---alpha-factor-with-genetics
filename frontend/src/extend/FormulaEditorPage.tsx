@@ -945,16 +945,14 @@ export function FormulaEditorPage({
     const previous = dragStart.current;
     dragStart.current = null;
     if (!previous) return;
-    const repaired = repairFormulaGraph(nextNodes, edges, inputs, outType);
-    const moved = repaired.nodes.some((node) => {
+    const moved = nextNodes.some((node) => {
       const before = previous.nodes.find((candidate) => candidate.id === node.id);
       return before && (before.x !== node.x || before.y !== node.y);
     });
     if (!moved) return;
     setPast((history) => [...history.slice(-39), previous]);
     setFuture([]);
-    setNodes(repaired.nodes);
-    setEdges(repaired.edges);
+    setNodes(nextNodes);
     setDirty(true);
   }
 
@@ -1768,7 +1766,7 @@ export function FormulaEditorPage({
     <div className="formula-workspace" data-testid="formula-editor-page">
       <header className="formula-workspace__toolbar">
         <div>
-          <h3>Formula Builder</h3>
+          <h1>Formula Builder</h1>
           <p className="panel-note">Build from market data or other formulas, then save, reuse, and backtest the result.</p>
         </div>
         <div className="formula-toolbar__actions">
@@ -2022,6 +2020,7 @@ export function FormulaEditorPage({
           {activeMode === "visual" ? (
             <FormulaCanvas
               key={canvasRevision}
+              mode="edit"
               nodes={nodes}
               edges={edges}
               selectedNodeId={selectedNodeId}

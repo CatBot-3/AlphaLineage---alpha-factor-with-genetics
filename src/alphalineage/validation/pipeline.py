@@ -84,6 +84,15 @@ def judge(
     n_blocks: int = 16,
     returns_fn: Callable[[Node], pd.Series] | None = None,
     returns_from_factor: Callable[[pd.DataFrame], pd.Series] | None = None,
+    return_variants: Sequence[
+        tuple[
+            str,
+            Callable[[Node], pd.Series],
+            Callable[[pd.DataFrame], pd.Series] | None,
+        ]
+    ]
+    | None = None,
+    primary_return_variant: str | None = None,
     n_schemes: int = 1,
     progress: Callable[[int, int], None] | None = None,
     stop: Callable[[], bool] | None = None,
@@ -108,17 +117,46 @@ def judge(
     if not isinstance(factor, pd.DataFrame):
         raise TypeError("best_tree must evaluate to a panel (SERIES/SIGNAL)")
     returns_of = returns_fn or (lambda tree: tree_returns(tree, panel, fwd))
-    best_returns = (
-        returns_from_factor(factor)
-        if returns_from_factor is not None
-        else long_short_returns(factor, fwd)
-        if returns_fn is None
-        else returns_of(best_tree)
-    )
+    if return_variants is None:
+        variants = [
+            (
+                "default",
+                returns_of,
+                returns_from_factor,
+            )
+        ]
+        explicit_variants = False
+    else:
+        variants = list(return_variants)
+        explicit_variants = True
+        if not variants:
+            raise ValueError("return_variants must contain at least one strategy")
+        ids = [item[0] for item in variants]
+        if len(set(ids)) != len(ids):
+            raise ValueError("return variant ids must be unique")
+    primary_id = primary_return_variant or variants[0][0]
+    try:
+        primary_index = next(
+            index for index, item in enumerate(variants) if item[0] == primary_id
+        )
+    except StopIteration as exc:
+        raise ValueError("primary_return_variant must reference a return variant") from exc
+
+    best_variant_returns: list[pd.Series] = []
+    for _variant_id, variant_returns_of, variant_from_factor in variants:
+        if variant_from_factor is not None:
+            best_variant_returns.append(variant_from_factor(factor))
+        elif not explicit_variants and returns_fn is None:
+            best_variant_returns.append(long_short_returns(factor, fwd))
+        else:
+            best_variant_returns.append(variant_returns_of(best_tree))
+    best_returns = best_variant_returns[primary_index]
     best_key = to_json(best_tree)
 
-    def cached_returns_of(tree: Node) -> pd.Series:
-        return best_returns if to_json(tree) == best_key else returns_of(tree)
+    def cached_returns_of(tree: Node, variant_index: int) -> pd.Series:
+        if to_json(tree) == best_key:
+            return best_variant_returns[variant_index]
+        return variants[variant_index][1](tree)
 
     def ic_on(dates: pd.DatetimeIndex) -> float:
         return mean_ic(
@@ -138,15 +176,18 @@ def judge(
     trial_sharpe_values: list[float] = []
 
     def streamed_trial_returns() -> Iterator[pd.Series]:
-        total = len(trials)
-        for completed, tree in enumerate(trials, start=1):
-            if stop is not None and stop():
-                raise TrainingCancelled("report cancelled before locked-test finalization")
-            series = research(cached_returns_of(tree))
-            trial_sharpe_values.append(sharpe_ratio(series))
-            if progress is not None:
-                progress(completed, total)
-            yield series
+        total = len(trials) * len(variants)
+        completed = 0
+        for tree in trials:
+            for variant_index in range(len(variants)):
+                if stop is not None and stop():
+                    raise TrainingCancelled("report cancelled before locked-test finalization")
+                series = research(cached_returns_of(tree, variant_index))
+                trial_sharpe_values.append(sharpe_ratio(series))
+                completed += 1
+                if progress is not None:
+                    progress(completed, total)
+                yield series
 
     # Sessions can persist these compact columns and evaluate only newly discovered trials on
     # continuation. A missing/invalid cache retains the streaming reference path; pathological
@@ -156,20 +197,35 @@ def judge(
         summaries: list[ReportReturnSummary] = []
         key_of = summary_key or to_json
         try:
-            for completed, tree in enumerate(trials, start=1):
-                if stop is not None and stop():
-                    raise TrainingCancelled("report cancelled before locked-test finalization")
-                key = key_of(tree)
-                summary = summary_cache.get(key)
-                if summary is None:
-                    summary = summarize_report_returns(
-                        research(cached_returns_of(tree)), research_index, n_blocks=n_blocks
+            total = len(trials) * len(variants)
+            completed = 0
+            for tree in trials:
+                tree_key = key_of(tree)
+                for variant_index, (variant_id, _returns, _factor_returns) in enumerate(
+                    variants
+                ):
+                    if stop is not None and stop():
+                        raise TrainingCancelled(
+                            "report cancelled before locked-test finalization"
+                        )
+                    key = (
+                        tree_key
+                        if len(variants) == 1
+                        else f"{tree_key}\x1fstrategy={variant_id}"
                     )
-                    summary_cache[key] = summary
-                summaries.append(summary)
-                trial_sharpe_values.append(float(summary["sharpe"]))
-                if progress is not None:
-                    progress(completed, len(trials))
+                    summary = summary_cache.get(key)
+                    if summary is None:
+                        summary = summarize_report_returns(
+                            research(cached_returns_of(tree, variant_index)),
+                            research_index,
+                            n_blocks=n_blocks,
+                        )
+                        summary_cache[key] = summary
+                    summaries.append(summary)
+                    trial_sharpe_values.append(float(summary["sharpe"]))
+                    completed += 1
+                    if progress is not None:
+                        progress(completed, total)
             pbo_result = pbo_from_summaries(summaries)
         except (KeyError, TypeError, ValueError):
             # Ignore a stale/corrupt summary column and recompute through the exact reference.
@@ -182,13 +238,22 @@ def judge(
             research_index,
             n_blocks=n_blocks,
             nonfinite_fallback=lambda: pd.DataFrame(
-                {i: research(cached_returns_of(tree)) for i, tree in enumerate(trials)}
+                {
+                    (tree_index, variant_id): research(
+                        cached_returns_of(tree, variant_index)
+                    )
+                    for tree_index, tree in enumerate(trials)
+                    for variant_index, (variant_id, _returns, _factor_returns) in enumerate(
+                        variants
+                    )
+                }
             ),
             require_full_index=True,
         )
     trial_sharpes = pd.Series(trial_sharpe_values, dtype="float64").dropna()
     var_sr = float(trial_sharpes.var(ddof=1)) if len(trial_sharpes) > 1 else 0.0
-    effective_trials = n_trials * max(1, n_schemes)
+    variant_count = len(variants) if explicit_variants else max(1, n_schemes)
+    effective_trials = n_trials * variant_count
     dsr = deflated_sharpe_ratio(best_research, effective_trials, var_sr)
     pbo_value = float(pbo_result["pbo"])
 

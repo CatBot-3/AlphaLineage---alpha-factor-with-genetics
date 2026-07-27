@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
+
+# Production entrypoints intentionally load the repository .env. Test collection imports
+# the FastAPI module too, so opt out before those imports to keep tests machine-independent.
+os.environ.setdefault("ALPHALINEAGE_SKIP_DOTENV", "1")
 
 
 @pytest.fixture(autouse=True)

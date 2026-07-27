@@ -5,6 +5,7 @@ import { AppShell } from "./AppShell";
 function renderShell(mode: "demo" | "app" = "demo") {
   const onTabChange = vi.fn();
   const onSelectExtendPage = vi.fn();
+  const onQuit = vi.fn();
   render(
     <AppShell
       mode={mode}
@@ -15,13 +16,13 @@ function renderShell(mode: "demo" | "app" = "demo") {
       onLoadLocal={vi.fn()}
       onSaveBackend={vi.fn()}
       onLoadBackend={vi.fn()}
-      onQuit={vi.fn()}
+      onQuit={onQuit}
       onSelectExtendPage={onSelectExtendPage}
     >
       <div>content</div>
     </AppShell>,
   );
-  return { onTabChange, onSelectExtendPage };
+  return { onTabChange, onSelectExtendPage, onQuit };
 }
 
 describe("AppShell", () => {
@@ -67,5 +68,21 @@ describe("AppShell", () => {
     fireEvent.click(extend);
     fireEvent.click(screen.getByRole("menuitem", { name: "Formula Builder" }));
     expect(onSelectExtendPage).toHaveBeenCalledWith("formula");
+  });
+
+  it("uses an accessible gear and keeps Quit as a first-level app action", () => {
+    const { onQuit } = renderShell("app");
+
+    expect(screen.getByRole("button", { name: "Open settings" })).toHaveAttribute(
+      "aria-haspopup",
+      "dialog",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Quit" }));
+    expect(onQuit).toHaveBeenCalledOnce();
+  });
+
+  it("does not show a process Quit action in static demo mode", () => {
+    renderShell("demo");
+    expect(screen.queryByRole("button", { name: "Quit" })).not.toBeInTheDocument();
   });
 });

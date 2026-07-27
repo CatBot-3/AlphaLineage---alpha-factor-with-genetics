@@ -159,6 +159,58 @@ def test_schemes_are_dollar_neutral_and_unit_gross(synthetic_panel):
         assert np.allclose(gross[gross > 0].to_numpy(), 1.0, atol=1e-9)
 
 
+class _FixedWeightingScheme:
+    name = "fixed"
+
+    def __init__(self, row: list[float]) -> None:
+        self.row = row
+
+    def weights(self, factor: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame(
+            np.tile(self.row, (len(factor), 1)),
+            index=factor.index,
+            columns=factor.columns,
+        )
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ([0.5, -0.5, 0.0, 0.0, 0.0, np.inf], "must be finite"),
+        ([0.5, 0.5, 0.0, 0.0, 0.0, 0.0], "must be dollar neutral"),
+        ([0.25, -0.25, 0.0, 0.0, 0.0, 0.0], "must have unit gross exposure"),
+    ],
+)
+def test_backtest_rejects_invalid_active_weight_rows(
+    synthetic_panel,
+    row,
+    message,
+):
+    factor = evaluate(Node("close"), synthetic_panel)
+
+    with pytest.raises(ValueError, match=message):
+        backtest(
+            factor,
+            synthetic_panel,
+            forward_returns(synthetic_panel),
+            _FixedWeightingScheme(row),
+            TransactionCostModel(),
+        )
+
+
+def test_backtest_allows_cash_rows_from_weighting_scheme(synthetic_panel):
+    factor = evaluate(Node("close"), synthetic_panel)
+    result = backtest(
+        factor,
+        synthetic_panel,
+        forward_returns(synthetic_panel),
+        _FixedWeightingScheme([0.0] * factor.shape[1]),
+        TransactionCostModel(),
+    )
+
+    assert not result.active_exposure.any()
+
+
 def test_quantile_concentrates_rankproportional_spreads(synthetic_panel):
     factor = evaluate(Node("rank", (Node("close"),)), synthetic_panel)
     n = factor.shape[1]
@@ -166,6 +218,72 @@ def test_quantile_concentrates_rankproportional_spreads(synthetic_panel):
     rp_positions = (RankProportional().weights(factor) != 0).sum(axis=1).mean()
     assert q_positions < rp_positions
     assert rp_positions >= n - 1  # holds (nearly) all names
+
+
+def test_quantile_boundary_ties_expand_symmetrically_without_symbol_order_tiebreak():
+    factor = pd.DataFrame(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]],
+        index=pd.DatetimeIndex(["2024-01-02"]),
+        columns=[f"S{index}" for index in range(10)],
+    )
+    weights = QuantileLongShort(0.2).weights(factor).iloc[0]
+
+    assert (weights.iloc[:5] == -0.1).all()
+    assert (weights.iloc[5:] == 0.1).all()
+    assert weights.sum() == pytest.approx(0.0)
+    assert weights.abs().sum() == pytest.approx(1.0)
+
+
+def test_quantile_overlapping_boundary_tie_stays_cash_instead_of_partial_gross():
+    factor = pd.DataFrame(
+        [[0.0, 1.0, 1.0, 1.0, 2.0]],
+        index=pd.DatetimeIndex(["2024-01-02"]),
+        columns=list("ABCDE"),
+    )
+    weights = QuantileLongShort(0.4).weights(factor).iloc[0]
+
+    assert (weights == 0.0).all()
+
+
+def test_rank_proportional_excludes_nonfinite_factor_values():
+    factor = pd.DataFrame(
+        [[1.0, 2.0, np.inf, -np.inf, np.nan]],
+        index=pd.DatetimeIndex(["2024-01-02"]),
+        columns=list("ABCDE"),
+    )
+    weights = RankProportional().weights(factor).iloc[0]
+
+    assert weights["A"] == pytest.approx(-0.5)
+    assert weights["B"] == pytest.approx(0.5)
+    assert (weights[["C", "D", "E"]] == 0.0).all()
+
+
+def test_constant_factor_is_reported_as_no_exposure_not_zero_return_evidence(
+    synthetic_panel,
+):
+    from alphalineage.backtest.reporting import backtest_report
+
+    factor = synthetic_panel["close"] * 0.0 - 1.0
+    report = backtest_report(
+        factor,
+        synthetic_panel,
+        forward_returns(synthetic_panel),
+        QuantileLongShort(),
+        TransactionCostModel(),
+        synthetic_panel.dates,
+    )
+
+    assert report["observations"] == 0
+    assert report["calendar_observations"] > 0
+    assert report["portfolio_health"]["valid"] is False
+    assert report["portfolio_health"]["active_observations"] == 0
+    assert report["portfolio_health"]["reason"] == "no_exposure"
+    assert report["portfolio_health"]["flat_factor_dates"] > 0
+    assert report["metrics"]["gross_sharpe"] is None
+    assert report["metrics"]["net_sharpe"] is None
+    assert report["metrics"]["max_drawdown"] is None
+    assert "no portfolio exposure" in " ".join(report["integrity"]["issues"])
+    assert len(report["normalized_equity"]) == 1
 
 
 def test_neutralize_removes_group_means(synthetic_panel):

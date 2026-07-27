@@ -17,8 +17,14 @@ import type {
   FormulaTestBinding,
   FormulaTestJob,
   FormulaTestSource,
+  PortfolioHealth,
+  PortfolioStrategySpec,
   UniverseInfo,
 } from "../api/types";
+import {
+  PORTFOLIO_STRATEGIES,
+  portfolioStrategyLabel,
+} from "../dashboard/StrategyComparisonPanel";
 
 const DATA_FIELDS = ["open", "high", "low", "close", "volume", "vwap", "returns"];
 const COLORS = ["#0f1c4a", "#a97700", "#0f5b3d", "#9f1d20"];
@@ -30,6 +36,7 @@ interface ComparableResult {
   series: FormulaResultSeriesPoint[];
   temporary: boolean;
   jobId?: string;
+  health?: PortfolioHealth;
 }
 
 function compatible(actual: string | undefined, expected: string): boolean {
@@ -133,8 +140,10 @@ export function FormulaBacktestDrawer({
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [horizon, setHorizon] = useState(1);
-  const [scheme, setScheme] = useState<"quantile_ls" | "rank_proportional">("quantile_ls");
-  const [quantile, setQuantile] = useState(0.2);
+  const [strategyIds, setStrategyIds] = useState<string[]>([
+    "quantile_ls_20",
+    "rank_proportional",
+  ]);
   const [commission, setCommission] = useState(1);
   const [slippage, setSlippage] = useState(5);
   const [selected, setSelected] = useState<string[]>([]);
@@ -186,14 +195,33 @@ export function FormulaBacktestDrawer({
   }, [universe, universes]);
 
   const comparable = useMemo<ComparableResult[]>(() => {
-    const temporary = jobs.flatMap((job) => job.status === "done" && job.result ? [{
-      key: `job:${job.job_id}`,
-      label: `Backtest ${job.job_id.slice(0, 6)}`,
-      metrics: { ...job.result.metrics },
-      series: payloadSeries(job.result.returns, job.result.normalized_equity),
-      temporary: true,
-      jobId: job.job_id,
-    }] : []);
+    const temporary = jobs.flatMap((job) => {
+      if (job.status !== "done" || !job.result) return [];
+      if (job.result.strategy_results?.length) {
+        return job.result.strategy_results.flatMap((strategy) => {
+          const backtest = strategy.validation_backtest ?? strategy.oos_backtest;
+          if (!backtest) return [];
+          return [{
+            key: `job:${job.job_id}:${strategy.strategy_id}`,
+            label: `Backtest ${job.job_id.slice(0, 6)} · ${portfolioStrategyLabel(strategy.strategy_id)}`,
+            metrics: { ...backtest.metrics },
+            series: payloadSeries(backtest.returns, backtest.normalized_equity),
+            temporary: true,
+            jobId: job.job_id,
+            health: backtest.portfolio_health,
+          }];
+        });
+      }
+      return [{
+        key: `job:${job.job_id}`,
+        label: `Backtest ${job.job_id.slice(0, 6)}`,
+        metrics: { ...job.result.metrics },
+        series: payloadSeries(job.result.returns, job.result.normalized_equity),
+        temporary: true,
+        jobId: job.job_id,
+        health: job.result.portfolio_health,
+      }];
+    });
     const kept = results.map((result) => ({
       key: `result:${result.id}`,
       label: result.name,
@@ -212,6 +240,9 @@ export function FormulaBacktestDrawer({
   const missingBindings = inputs.filter((input) => !bindings[input.name]);
   const selectedUniverse = universes.find((item) => item.name === universe);
   const coverageComplete = selectedUniverse?.cache_coverage?.complete !== false;
+  const strategies = PORTFOLIO_STRATEGIES.filter((strategy) =>
+    strategyIds.includes(strategy.id),
+  ).map(({ label: _label, optional: _optional, ...strategy }) => strategy);
 
   function updatePanelBinding(inputName: string, encoded: string) {
     if (!encoded) {
@@ -236,6 +267,8 @@ export function FormulaBacktestDrawer({
     setSubmitting(true);
     setError(null);
     try {
+      const primary: PortfolioStrategySpec =
+        strategies[0] ?? { id: "quantile_ls_20", scheme: "quantile_ls", quantile: 0.2 };
       const job = await startFormulaTest({
         source,
         bindings,
@@ -243,8 +276,10 @@ export function FormulaBacktestDrawer({
         start: start || null,
         end,
         horizon,
-        weighting_scheme: scheme,
-        quantile: scheme === "quantile_ls" ? quantile : undefined,
+        strategies,
+        // Compatibility aliases keep the request valid against an older local backend.
+        weighting_scheme: primary.scheme,
+        quantile: primary.scheme === "quantile_ls" ? primary.quantile ?? undefined : undefined,
         commission_bps: commission,
         slippage_bps: slippage,
       });
@@ -314,11 +349,30 @@ export function FormulaBacktestDrawer({
           <label className="field"><span className="field-label">Start</span><input type="date" value={start} onChange={(event) => setStart(event.target.value)} /></label>
           <label className="field"><span className="field-label">End</span><input type="date" value={end} onChange={(event) => setEnd(event.target.value)} /></label>
           <label className="field"><span className="field-label">Forward horizon</span><input type="number" min={1} value={horizon} onChange={(event) => setHorizon(Math.max(1, Number(event.target.value) || 1))} /></label>
-          <label className="field"><span className="field-label">Portfolio</span><select value={scheme} onChange={(event) => setScheme(event.target.value as typeof scheme)}><option value="quantile_ls">Quantile long/short</option><option value="rank_proportional">Rank proportional</option></select></label>
-          {scheme === "quantile_ls" && <label className="field"><span className="field-label">Tail quantile</span><input type="number" min={0.01} max={0.49} step={0.01} value={quantile} onChange={(event) => setQuantile(Number(event.target.value))} /></label>}
           <label className="field"><span className="field-label">Commission (bps)</span><input type="number" min={0} step={0.1} value={commission} onChange={(event) => setCommission(Number(event.target.value))} /></label>
           <label className="field"><span className="field-label">Slippage (bps)</span><input type="number" min={0} step={0.1} value={slippage} onChange={(event) => setSlippage(Number(event.target.value))} /></label>
         </div>
+        <fieldset className="strategy-picker">
+          <legend>Portfolio strategies</legend>
+          {PORTFOLIO_STRATEGIES.map((strategy) => (
+            <label key={strategy.id}>
+              <input
+                type="checkbox"
+                checked={strategyIds.includes(strategy.id)}
+                disabled={!strategy.optional}
+                onChange={(event) =>
+                  setStrategyIds((current) =>
+                    event.target.checked
+                      ? [...current, strategy.id]
+                      : current.filter((id) => id !== strategy.id),
+                  )
+                }
+              />
+              <span>{strategy.label}</span>
+              {!strategy.optional && <small>default</small>}
+            </label>
+          ))}
+        </fieldset>
         {!coverageComplete && <div className="surface-message formula-backtest__coverage-warning">
           <span>This universe has incomplete cached data. Sync it before relying on the result.</span>
           <button
@@ -345,6 +399,13 @@ export function FormulaBacktestDrawer({
             <label><input type="checkbox" checked={selected.includes(item.key)} disabled={!selected.includes(item.key) && selected.length >= 4} onChange={(event) => setSelected((current) => event.target.checked ? [...current, item.key] : current.filter((key) => key !== item.key))} /> <strong>{item.label}</strong></label>
             <span>{item.temporary ? "Temporary" : "Kept"}</span>
             <small>Net Sharpe {metric(item.metrics.net_sharpe)} · Drawdown {metric(item.metrics.max_drawdown)}</small>
+            {item.health && !item.health.valid && (
+              <small className="error">
+                {item.health.reason === "no_exposure"
+                  ? "No tradable cross-sectional variation"
+                  : item.health.reason ?? "Portfolio evidence unavailable"}
+              </small>
+            )}
             {item.temporary && <div className="actions"><input aria-label={`Name ${item.label}`} value={keepName} onChange={(event) => setKeepName(event.target.value)} /><button type="button" onClick={() => keep(item)}>Keep result</button><button type="button" onClick={() => item.jobId && clearFormulaTest(item.jobId).then(refresh)}>Clear</button></div>}
           </article>)}
         </div>

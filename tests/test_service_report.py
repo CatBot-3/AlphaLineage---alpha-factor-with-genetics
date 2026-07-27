@@ -13,7 +13,7 @@ import pytest
 from alphalineage.api.service import build_report, user_operator_count
 from alphalineage.backtest.costs import TransactionCostModel
 from alphalineage.backtest.engine import backtest, net_return_fn
-from alphalineage.backtest.portfolio import QuantileLongShort
+from alphalineage.backtest.portfolio import PortfolioStrategySpec, QuantileLongShort
 from alphalineage.core.evaluate import evaluate
 from alphalineage.core.extensions import ARG, register_operator, unregister_operator
 from alphalineage.core.fitness import forward_returns, mean_ic
@@ -52,7 +52,8 @@ def test_build_report_deflates_on_net_returns(signal_panel):
     holdout = report["oos_backtest"]
     assert holdout["start"] == split.test.min().date().isoformat()
     assert holdout["end"] == split.test.max().date().isoformat()
-    assert holdout["metrics"]["mean_abs_ic"] == pytest.approx(report["oos_ic"])
+    assert abs(holdout["metrics"]["signed_ic"]) == pytest.approx(report["oos_ic"])
+    assert holdout["metrics"]["mean_abs_ic"] >= abs(holdout["metrics"]["signed_ic"])
     assert len(holdout["returns"]) == len(split.test) - 1
     assert len(holdout["normalized_equity"]) == len(split.test)
     assert holdout["normalized_equity"][0] == {
@@ -99,6 +100,59 @@ def test_build_report_accepts_custom_scheme_and_costs(signal_panel):
         returns_fn=net_return_fn(panel, fwd, QuantileLongShort(), zero_costs),
     )
     assert report["deflated_sharpe"] == pytest.approx(expected.deflated_sharpe)
+
+
+def test_build_report_uses_actual_strategy_variants_for_dsr_pbo_and_aliases(
+    signal_panel,
+):
+    panel, _ = signal_panel
+    split = time_split(panel.dates)
+    trials = [Node("volume"), Node("returns")]
+    strategies = [
+        PortfolioStrategySpec("q20", "quantile_ls", 0.2),
+        PortfolioStrategySpec("rank", "rank_proportional"),
+    ]
+
+    report = build_report(
+        trials[0],
+        trials,
+        split,
+        panel,
+        searched_trials=len(trials),
+        strategy_specs=strategies,
+        primary_strategy_id="rank",
+    )
+
+    assert report["n_trials"] == len(trials) * len(strategies)
+    assert report["primary_strategy_id"] == "rank"
+    assert [item["strategy_id"] for item in report["strategy_results"]] == [
+        "q20",
+        "rank",
+    ]
+    primary = next(
+        item for item in report["strategy_results"] if item["role"] == "primary"
+    )
+    assert report["oos_backtest"] == primary["oos_backtest"]
+
+
+def test_no_exposure_primary_can_never_be_significant(signal_panel):
+    panel, _ = signal_panel
+    split = time_split(panel.dates)
+    constant = Node(
+        "mul_scalar",
+        (Node("close"), Node("const", value=0.0)),
+    )
+
+    report = build_report(
+        constant,
+        [constant],
+        split,
+        panel,
+        searched_trials=1,
+    )
+
+    assert report["oos_backtest"]["portfolio_health"]["reason"] == "no_exposure"
+    assert report["significant"] is False
 
 
 def test_build_report_uses_configured_horizon_and_ic_method(signal_panel):

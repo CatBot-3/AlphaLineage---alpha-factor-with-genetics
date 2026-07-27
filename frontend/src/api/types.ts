@@ -15,6 +15,8 @@ export interface Report {
   train_ic: number;
   n_trials: number;
   significant: boolean;
+  validation_passed?: boolean;
+  validation_reason?: string | null;
   oos_backtest?: RunBacktestReport;
   formula_revisions?: Array<{ runtime_name?: string; name?: string; revision?: number }>;
 }
@@ -39,20 +41,119 @@ export interface HistoryPoint {
   best_fitness: number;
   mean_fitness: number;
   best_ic: number;
+  best_signed_ic?: number;
+  unique_tree_count?: number;
+  unique_tree_ratio?: number;
+  duplicate_count?: number;
+  novel_offspring_count?: number;
+  champion_age?: number;
+  generations_since_improvement?: number;
+  diversity_warning?: number | boolean;
+  parameter_neighbor_count?: number;
+  formula_default_injection_count?: number;
+  formula_exploration?: Record<string, FormulaParameterCoverage>;
+}
+
+export interface CandidateScoreMetrics {
+  ic?: number;
+  signed_ic?: number;
+  oriented_ic?: number;
+  mean_abs_ic?: number;
+  ic_ir?: number;
+  oriented_ic_ir?: number;
+  polarity?: number;
+  sign_consistency?: number;
+  valid_dates?: number;
+  valid_date_coverage?: number;
+  avg_active_names?: number;
+  min_active_names?: number;
+  varying_factor_coverage?: number;
+  exposure_coverage?: number;
+  two_sided_coverage?: number;
+}
+
+export interface ValidationSelection {
+  validated: boolean;
+  reason?: string | null;
+  first_seen: number;
+  polarity: 1 | -1;
+  training_fitness: number;
+  training_metrics: CandidateScoreMetrics;
+  validation_fitness: number;
+  validation_metrics: CandidateScoreMetrics;
+  source_expression?: string;
+  oriented_expression?: string;
+  folds?: ValidationFold[];
+  positive_folds?: number;
+  required_positive_folds?: number;
+  median_oriented_ic?: number | null;
+  worst_fold_ic?: number | null;
+  complexity?: ValidationComplexity;
+  final_objective?: number | null;
+  parameter_variants?: number;
+  parameter_coverage?: Record<string, FormulaParameterCoverage>;
+}
+
+export interface ValidationFold {
+  index: number;
+  start?: string | null;
+  end?: string | null;
+  observations?: number;
+  valid_dates: number;
+  ic_coverage?: number | null;
+  signed_ic?: number | null;
+  oriented_ic?: number | null;
+  ic_ir?: number | null;
+  avg_active_names?: number | null;
+  min_active_names?: number | null;
+  varying_factor_dates?: number;
+  varying_factor_coverage?: number | null;
+  active_weight_dates?: number;
+  exposure_coverage?: number | null;
+  two_sided_dates?: number;
+  two_sided_coverage?: number | null;
+  realized_coverage?: number | null;
+  avg_gross_exposure?: number | null;
+  adequate_coverage?: boolean;
+  coverage_failures?: string[];
+  positive: boolean;
+}
+
+export interface ValidationComplexity {
+  expanded_nodes: number;
+  mode: "per_node" | "normalized_budget";
+  penalty_value: number;
+  deduction: number;
+  max_nodes: number;
+}
+
+export interface FormulaParameterCoverage {
+  calls_searched?: number;
+  distinct_parameter_tuples?: number;
+  best_training_score?: number | null;
+  best_validation_score?: number | null;
 }
 
 export interface RunResult {
   best_factor: string | FactorNode; // the service returns a JSON string; demo JSON may store a tree
-  report: Report;
+  /** Null for validation-only rounds until the user explicitly finalizes one. */
+  report: Report | null;
   generations: number;
   history: HistoryPoint[];
   lineage: Lineage;
   // session-aware fields (present for runs launched as a session segment)
   session_id?: string;
   segment?: number;
+  round_index?: number;
+  round_metadata?: SessionRoundSummary;
   test_reads?: number;
   cumulative_trials?: number;
   repeated_oos_warning?: boolean;
+  test_read_index?: number | null;
+  evidence_status?: EvidenceStatus;
+  validity?: "valid" | "invalid_legacy_semantics";
+  restart_required?: boolean;
+  selection?: ValidationSelection;
   formula_revisions?: Array<{ runtime_name?: string; name?: string; revision?: number }>;
   resources?: ResolvedTrainingResources | null;
   termination_reason?: "completed" | "user_stopped" | "time_budget";
@@ -62,7 +163,19 @@ export interface RunResult {
     total_seconds: number;
   };
   context?: RunContext;
-  oos_backtest?: RunBacktestReport;
+  oos_backtest?: RunBacktestReport | null;
+  strategy_results?: StrategyBacktestResult[];
+  primary_strategy_id?: string | null;
+  strategy_plan_id?: string | null;
+  comparison_id?: string | null;
+  validation_only?: boolean;
+  finalization?: SessionFinalizationDetail | null;
+  session_holdout_reads?: number;
+  inherited_test_reads?: number;
+  inherited_evidence_sources?: string[];
+  holdout_fingerprint?: string | null;
+  same_holdout_read_index?: number | null;
+  parameter_coverage?: Record<string, FormulaParameterCoverage>;
 }
 
 export interface RunContext {
@@ -98,6 +211,8 @@ export interface RunBacktestMetrics {
   avg_positions: number | null;
   max_position: number | null;
   usable: boolean;
+  insolvent?: boolean;
+  missing_return_observations?: number;
 }
 
 export interface RunBacktestReport {
@@ -107,6 +222,41 @@ export interface RunBacktestReport {
   metrics: RunBacktestMetrics;
   returns: FormulaTestReturnPoint[];
   normalized_equity: FormulaTestEquityPoint[];
+  portfolio_health?: PortfolioHealth;
+  integrity?: {
+    valid: boolean;
+    issues: string[];
+    equity_terminated_reason?: "missing_realized_return" | "insolvent" | string | null;
+  };
+}
+
+export interface PortfolioHealth {
+  eligible_dates: number;
+  calendar_observations: number;
+  active_observations: number;
+  two_sided_observations: number;
+  exposure_coverage: number;
+  flat_factor_dates: number;
+  valid: boolean;
+  reason: string | null;
+}
+
+export interface PortfolioStrategySpec {
+  id: string;
+  scheme: "quantile_ls" | "rank_proportional";
+  quantile?: number | null;
+}
+
+export interface StrategyBacktestResult {
+  strategy_id: string;
+  spec: PortfolioStrategySpec;
+  role?: "primary" | "comparison";
+  /** Present for pre-holdout strategy comparisons. */
+  validation_backtest?: RunBacktestReport | null;
+  /** Present only after the frozen strategy bundle is explicitly finalized. */
+  oos_backtest?: RunBacktestReport | null;
+  folds?: Array<Record<string, unknown>>;
+  eligible?: boolean;
 }
 
 export interface BenchmarkDefinition {
@@ -139,6 +289,19 @@ export interface GpConfig {
   max_depth: number;
   max_nodes: number;
   parsimony: number;
+  /**
+   * Legacy/direct callers remain per-node. The app explicitly requests a
+   * normalized total deduction so larger legal formulas are not priced out.
+   */
+  complexity_penalty_mode?: "per_node" | "normalized_budget";
+  complexity_penalty_value?: number | null;
+  parameter_neighbor_fraction?: number;
+  validation_folds?: number;
+  /**
+   * Missing legacy requests retain the classic trajectory. The app explicitly
+   * opts new sessions into protected valley-crossing exploration.
+   */
+  exploration_profile?: "classic" | "balanced" | "aggressive";
   elitism: number;
   ic_method: string;
   min_names: number;
@@ -222,13 +385,152 @@ export interface SessionSegment {
   resources?: ResolvedTrainingResources | null;
   termination_reason?: string;
   report_cancelled?: boolean;
+  requested_generations?: number;
+  started_at?: string;
+  completed_at?: string | null;
+  report_available?: boolean;
+  test_read_index?: number | null;
+  evidence_status?: EvidenceStatus;
+  selected_lineage_node_id?: number | null;
+  timings?: RunResult["timings"];
+  panel_fingerprint?: string;
+  scorer_version?: number;
+  evolution_version?: number;
+  adjustment_version?: number;
+}
+
+export interface SessionRoundSummary {
+  index: number;
+  segment_index: number;
+  report_available: boolean;
+  test_read_index: number | null;
+  evidence_status: EvidenceStatus;
+  status: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  requested_generations: number;
+  gen_start: number;
+  gen_end: number;
+  termination_reason?: string | null;
+  selected_lineage_node_id?: number | null;
+  resources?: ResolvedTrainingResources | null;
+  timings?: RunResult["timings"];
+  panel_fingerprint?: string | null;
+  scorer_version?: number | null;
+  evolution_version?: number | null;
+  adjustment_version?: number | null;
+  validity?: "valid" | "invalid_legacy_semantics";
+  restart_required?: boolean;
+  invalid_reason?: string;
+  finalization_available?: boolean;
+  latest_finalization_id?: string | null;
+  latest_strategy_comparison_id?: string | null;
+  latest_strategy_plan_id?: string | null;
+}
+
+export type EvidenceStatus =
+  | "validation_only"
+  | "post_holdout_adaptive"
+  | "locked_first_read"
+  | "repeated_same_holdout"
+  // Legacy aliases retained for old saved sessions/demo payloads.
+  | "locked"
+  | "exploratory_repeat";
+
+export interface SessionFinalizationSummary {
+  evaluation_id: string;
+  round_index: number;
+  status: string;
+  evidence_status: "locked_first_read" | "repeated_same_holdout";
+  same_holdout_read_index: number;
+  session_holdout_reads: number;
+  holdout_fingerprint: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  report_available: boolean;
+  strategy_plan_id?: string | null;
+  comparison_id?: string | null;
+  primary_strategy_id?: string | null;
+  inherited_evidence_sources?: string[];
+  /** Deprecated compatibility aggregate. */
+  test_reads?: number;
+}
+
+export interface SessionFinalizationDetail extends SessionFinalizationSummary {
+  best_factor: string | FactorNode;
+  report: Report;
+  oos_backtest?: RunBacktestReport | null;
+  strategy_results?: StrategyBacktestResult[];
+  context?: RunContext;
+  selection?: ValidationSelection;
+}
+
+export interface SessionFinalizationHandle {
+  session_id: string;
+  round_index: number;
+  evaluation_id: string;
+  job_id: string;
+  status: string;
 }
 
 export interface SessionJob {
   id: string;
+  job_id?: string;
   status: string; // queued | running | done | stopped | failed
   progress: ProgressSnapshot | null;
   termination_reason?: string | null;
+  metadata?: Record<string, unknown>;
+  error?: string | null;
+  evaluation_id?: string;
+  round_index?: number;
+  strategy_plan_id?: string | null;
+  comparison_id?: string | null;
+  primary_strategy_id?: string | null;
+}
+
+export interface StrategyComparisonSummary {
+  comparison_id: string;
+  round_index: number;
+  status: string;
+  evidence_status?: "validation_only" | "post_holdout_adaptive" | string;
+  prior_holdout_reads?: number;
+  created_at?: string | null;
+  completed_at?: string | null;
+  strategies?: PortfolioStrategySpec[];
+  strategy_ids?: string[];
+  result_available?: boolean;
+  job_id?: string | null;
+  error?: string | null;
+}
+
+export interface StrategyComparisonDetail extends StrategyComparisonSummary {
+  session_id?: string;
+  schema_version?: number;
+  portfolio_schema_version?: string;
+  costs?: { commission_bps?: number; slippage_bps?: number };
+  strategy_results: StrategyBacktestResult[];
+}
+
+export interface StrategyComparisonHandle {
+  session_id: string;
+  round_index: number;
+  comparison_id: string;
+  job_id: string;
+  status: string;
+}
+
+export interface FinalizationPlan {
+  strategy_plan_id: string;
+  session_id?: string;
+  round_index: number;
+  comparison_id: string;
+  primary_strategy_id: string;
+  strategies?: PortfolioStrategySpec[];
+  strategy_ids?: string[];
+  costs?: { commission_bps?: number; slippage_bps?: number };
+  holdout_fingerprint?: string | null;
+  source_comparison_evidence_status?: "validation_only" | "post_holdout_adaptive" | string;
+  created_at?: string | null;
 }
 
 export interface SessionState {
@@ -245,9 +547,16 @@ export interface SessionState {
   trial_baseline: number;
   cumulative_trials: number;
   test_reads: number;
+  session_holdout_reads?: number;
+  inherited_test_reads?: number;
+  inherited_evidence_sources?: string[];
+  holdout_read_counts?: Record<string, number>;
   segments: SessionSegment[];
+  rounds?: SessionRoundSummary[];
   last_job_id: string | null;
   job: SessionJob | null;
+  finalization_job?: SessionJob | null;
+  last_finalization_job?: SessionJob | null;
   result: RunResult | null;
 }
 
@@ -259,6 +568,13 @@ export interface SessionSummary {
   segments: number;
   cumulative_trials: number;
   test_reads: number;
+  updated_at?: string;
+  current_generation?: number;
+  last_status?: string | null;
+  has_checkpoint?: boolean;
+  has_report?: boolean;
+  latest_completed_round?: number | null;
+  requested_generations?: number | null;
 }
 
 export interface SessionCreateRequest {
@@ -362,6 +678,7 @@ export interface FormulaTestRequest {
   start?: string | null;
   end?: string | null;
   horizon?: number;
+  strategies?: PortfolioStrategySpec[];
   weighting_scheme?: "quantile_ls" | "rank_proportional";
   quantile?: number;
   commission_bps?: number;
@@ -396,6 +713,7 @@ export interface FormulaTestReturnPoint {
   date: string;
   gross: number | null;
   net: number | null;
+  active?: boolean;
 }
 
 export interface FormulaTestEquityPoint {
@@ -424,6 +742,10 @@ export interface FormulaTestResultPayload {
   metrics: FormulaTestMetrics;
   returns: FormulaTestReturnPoint[];
   normalized_equity: FormulaTestEquityPoint[];
+  oos_backtest?: RunBacktestReport;
+  portfolio_health?: PortfolioHealth;
+  strategy_results?: StrategyBacktestResult[];
+  primary_strategy_id?: string;
   disclaimer: string;
 }
 
@@ -439,6 +761,12 @@ export interface FormulaTestJob {
 export interface Settings {
   factors_dir: string;
   tiingo_api_key_set: boolean;
+  /**
+   * Additive backend metadata. Optional so the packaged frontend remains
+   * compatible with an older local backend during rolling upgrades.
+   */
+  tiingo_api_key_source?: "environment" | "stored" | "none";
+  tiingo_stored_key_set?: boolean;
   evaluator: "auto" | "python" | "cpp";
   cpp_available: boolean;
 }
@@ -888,6 +1216,7 @@ export interface WorkspaceUiState {
   selectedFactorNode?: { name: string; value?: number } | null;
   selectedLineage?: number | null;
   sessionId?: string | null;
+  selectedRound?: number | null;
 }
 
 export interface WorkspaceSnapshot {

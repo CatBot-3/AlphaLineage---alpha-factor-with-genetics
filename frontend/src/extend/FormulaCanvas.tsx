@@ -15,7 +15,14 @@ import {
   useUpdateNodeInternals,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useCallback, useEffect, useRef, type DragEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+} from "react";
 import type { FormulaDraftEdge, FormulaDraftNode } from "../api/types";
 import {
   connectionCreatesCycle,
@@ -28,6 +35,7 @@ import {
 } from "./formulaGraph";
 
 interface InteractiveData extends FormulaNodeData {
+  readOnly?: boolean;
   selectedSlot?: number | null;
   boundInlineInputs?: number[];
   onSelectSlot?: (nodeId: string, index: number) => void;
@@ -37,7 +45,7 @@ interface InteractiveData extends FormulaNodeData {
   onInlineValueCommit?: () => void;
 }
 
-type FormulaFlowNode = Node<InteractiveData, "formula">;
+export type FormulaFlowNode = Node<InteractiveData, "formula">;
 
 export interface FormulaCanvasDropPlacement {
   exact: true;
@@ -47,8 +55,9 @@ export interface FormulaCanvasDropPlacement {
 function FormulaBlock({ id, data, selected }: NodeProps<FormulaFlowNode>) {
   const inputs = data.inputTypes ?? [];
   const boundInlineInputs = data.boundInlineInputs ?? [];
+  const readOnly = data.readOnly === true;
   const updateNodeInternals = useUpdateNodeInternals();
-  const layoutSignature = `${inputs.join("|")}:${boundInlineInputs.join("|")}:${data.kind}`;
+  const layoutSignature = formulaNodePortSignature(data);
   useEffect(() => {
     updateNodeInternals(id);
   }, [id, layoutSignature, updateNodeInternals]);
@@ -67,15 +76,29 @@ function FormulaBlock({ id, data, selected }: NodeProps<FormulaFlowNode>) {
           const bound = boundInlineInputs.includes(index);
           const value = data.inlineValues?.[String(index)];
           return (
-            <label
+            <div
               className={`formula-block__inline nodrag${bound ? " is-bound" : ""}`}
               title={data.inputDescriptions?.[index]}
               key={`${id}-input-${index}`}
             >
-              {bound && <Handle type="target" position={Position.Left} id={`input-${index}`} />}
+              {bound && (
+                <Handle
+                  type="target"
+                  position={Position.Left}
+                  id={`input-${index}`}
+                  isConnectable={!readOnly}
+                />
+              )}
               <span><span>{inputName}</span><small>{type}</small></span>
               {bound ? (
                 <span className="formula-block__binding">Bound input</span>
+              ) : readOnly ? (
+                <output
+                  className="formula-block__inline-value"
+                  aria-label={`${data.label} ${inputName}`}
+                >
+                  {value ?? "—"}
+                </output>
               ) : (
                 <input
                   aria-label={`${data.label} ${inputName}`}
@@ -94,42 +117,59 @@ function FormulaBlock({ id, data, selected }: NodeProps<FormulaFlowNode>) {
                   }}
                 />
               )}
-            </label>
+            </div>
           );
         }
         return (
           <div
             className={`formula-block__input${data.selectedSlot === index ? " is-targeted" : ""}`}
             key={`${id}-input-${index}`}
-            onDragOver={(event) => {
+            onDragOver={readOnly ? undefined : (event) => {
               event.preventDefault();
               event.dataTransfer.dropEffect = "copy";
             }}
-            onDrop={(event) => {
+            onDrop={readOnly ? undefined : (event) => {
               event.preventDefault();
               event.stopPropagation();
               const primitive = event.dataTransfer.getData("application/x-alphalineage-primitive");
               if (primitive) data.onDropPrimitive?.(id, index, primitive);
             }}
           >
-            <Handle type="target" position={Position.Left} id={`input-${index}`} />
-            <button
-              type="button"
-              className="formula-block__socket nodrag"
-              title={data.inputDescriptions?.[index]}
-              onClick={(event) => {
-                event.stopPropagation();
-                data.onSelectSlot?.(id, index);
-              }}
-            >
-              <span>{inputName}</span>
-              <small>{type}</small>
-            </button>
+            <Handle
+              type="target"
+              position={Position.Left}
+              id={`input-${index}`}
+              isConnectable={!readOnly}
+            />
+            {readOnly ? (
+              <span className="formula-block__socket nodrag" title={data.inputDescriptions?.[index]}>
+                <span>{inputName}</span>
+                <small>{type}</small>
+              </span>
+            ) : (
+              <button
+                type="button"
+                className="formula-block__socket nodrag"
+                title={data.inputDescriptions?.[index]}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  data.onSelectSlot?.(id, index);
+                }}
+              >
+                <span>{inputName}</span>
+                <small>{type}</small>
+              </button>
+            )}
           </div>
         );
       })}
 
-      {data.kind === "value" && (
+      {data.kind === "value" && readOnly && (
+        <output className="formula-block__value formula-block__value--readonly">
+          {Number(data.value ?? 0)}
+        </output>
+      )}
+      {data.kind === "value" && !readOnly && (
         <input
           className="formula-block__value nodrag"
           aria-label={`${data.label} value`}
@@ -144,10 +184,20 @@ function FormulaBlock({ id, data, selected }: NodeProps<FormulaFlowNode>) {
       {data.kind === "output" && <span className="formula-block__locked">Required result</span>}
       <span className="formula-block__type">{data.outType}</span>
       {data.kind === "output" && (
-        <Handle type="target" position={Position.Left} id="result" />
+        <Handle
+          type="target"
+          position={Position.Left}
+          id="result"
+          isConnectable={!readOnly}
+        />
       )}
       {data.kind !== "output" && (
-        <Handle type="source" position={Position.Right} id="output" />
+        <Handle
+          type="source"
+          position={Position.Right}
+          id="output"
+          isConnectable={!readOnly}
+        />
       )}
     </div>
   );
@@ -155,10 +205,18 @@ function FormulaBlock({ id, data, selected }: NodeProps<FormulaFlowNode>) {
 
 const NODE_TYPES = { formula: FormulaBlock };
 
+export function formulaNodePortSignature(data: Pick<
+  InteractiveData,
+  "inputTypes" | "boundInlineInputs" | "kind"
+>): string {
+  return `${(data.inputTypes ?? []).join("|")}:${(data.boundInlineInputs ?? []).join("|")}:${data.kind}`;
+}
+
 function toFlowNode(
   node: FormulaDraftNode,
   callbacks: Omit<InteractiveData, keyof FormulaNodeData>,
   selectedNodeId: string | null,
+  editable: boolean,
   selectedNodeIds?: ReadonlySet<string>,
 ): FormulaFlowNode {
   const data = node.data as FormulaNodeData;
@@ -170,23 +228,64 @@ function toFlowNode(
     initialHeight: formulaNodeHeight(node),
     data: { ...data, ...callbacks },
     selected: selectedNodeIds ? selectedNodeIds.has(node.id) : node.id === selectedNodeId,
-    deletable: data.kind !== "input" && data.kind !== "output",
-    draggable: data.kind !== "input",
+    deletable: editable && data.kind !== "input" && data.kind !== "output",
+    draggable: editable && data.kind !== "input",
   };
 }
 
-function fromFlowNode(node: Node): FormulaDraftNode {
-  const {
-    onSelectSlot: _select,
-    onDropPrimitive: _drop,
-    onValueChange: _value,
-    onInlineValueChange: _inlineValue,
-    onInlineValueCommit: _inlineCommit,
-    selectedSlot: _slot,
-    boundInlineInputs: _boundInlineInputs,
-    ...data
-  } = node.data as InteractiveData;
-  return { id: node.id, type: "formula", x: node.position.x, y: node.position.y, data };
+/**
+ * Reconcile persisted formula nodes into React Flow without throwing away
+ * measurements, handle bounds, or an in-progress drag. Draft nodes deliberately
+ * never receive those React Flow-only fields.
+ */
+export function reconcileCanvasNodes(
+  current: FormulaFlowNode[],
+  incoming: FormulaFlowNode[],
+): FormulaFlowNode[] {
+  const currentById = new Map(current.map((node) => [node.id, node]));
+  return incoming.map((node) => {
+    const previous = currentById.get(node.id);
+    if (!previous) return node;
+    return {
+      ...previous,
+      ...node,
+      position: previous.dragging ? previous.position : node.position,
+    };
+  });
+}
+
+/**
+ * React Flow owns position, selection, drag and measurement changes locally.
+ * Structural removal is routed through the editor's explicit delete command.
+ */
+export function applyCanvasNodeChanges(
+  changes: NodeChange<FormulaFlowNode>[],
+  current: FormulaFlowNode[],
+): FormulaFlowNode[] {
+  return applyNodeChanges(
+    changes.filter((change) => (
+      change.type === "dimensions" ||
+      change.type === "position" ||
+      change.type === "select"
+    )),
+    current,
+  );
+}
+
+/**
+ * Copy only final coordinates back to the serializable domain nodes. Starting
+ * from the domain objects guarantees that measurements, selection, callbacks,
+ * and other React Flow internals can never leak into workspace persistence.
+ */
+export function commitCanvasPositions(
+  domainNodes: FormulaDraftNode[],
+  canvasNodes: ReadonlyArray<Pick<FormulaFlowNode, "id" | "position">>,
+): FormulaDraftNode[] {
+  const canvasById = new Map(canvasNodes.map((node) => [node.id, node.position]));
+  return domainNodes.map((node) => {
+    const position = canvasById.get(node.id);
+    return position ? { ...node, x: position.x, y: position.y } : node;
+  });
 }
 
 function toFlowEdge(edge: FormulaDraftEdge, selectedEdgeIds?: ReadonlySet<string>): Edge {
@@ -211,40 +310,26 @@ function fromFlowEdge(edge: Edge): FormulaDraftEdge {
   };
 }
 
-export function FormulaCanvas({
-  nodes,
-  edges,
-  selectedNodeId,
-  selectedNodeIds,
-  selectedEdgeIds,
-  selectedSlot,
-  onNodesChange,
-  onEdgesChange,
-  onConnect,
-  onSelectNode,
-  onSelectionChange,
-  onNodeDragStart,
-  onNodeDragStop,
-  onSelectSlot,
-  onClearSlot,
-  onDropPrimitive,
-  onDropCanvas,
-  onValueChange,
-  onInlineValueChange,
-  onInlineValueCommit,
-  onInit,
-}: {
+interface FormulaCanvasBaseProps {
   nodes: FormulaDraftNode[];
   edges: FormulaDraftEdge[];
   selectedNodeId: string | null;
   selectedNodeIds?: string[];
   selectedEdgeIds?: string[];
+  onSelectNode?: (id: string | null) => void;
+  onSelectionChange?: (nodeIds: string[], edgeIds: string[]) => void;
+  onInit?: (instance: ReactFlowInstance) => void;
+  ariaLabel?: string;
+  compact?: boolean;
+}
+
+export interface FormulaCanvasEditProps extends FormulaCanvasBaseProps {
+  mode: "edit";
   selectedSlot: { nodeId: string; index: number } | null;
   onNodesChange: (nodes: FormulaDraftNode[]) => void;
   onEdgesChange: (edges: FormulaDraftEdge[]) => void;
   onConnect: (connection: Connection) => void;
   onSelectNode: (id: string | null) => void;
-  onSelectionChange?: (nodeIds: string[], edgeIds: string[]) => void;
   onNodeDragStart?: () => void;
   onNodeDragStop?: (nodes: FormulaDraftNode[]) => void;
   onSelectSlot: (nodeId: string, index: number) => void;
@@ -258,12 +343,56 @@ export function FormulaCanvas({
   onValueChange: (nodeId: string, value: number) => void;
   onInlineValueChange?: (nodeId: string, index: number, value: number | null) => void;
   onInlineValueCommit?: () => void;
-  onInit: (instance: ReactFlowInstance) => void;
-}) {
+}
+
+export interface FormulaCanvasInspectProps extends FormulaCanvasBaseProps {
+  mode: "inspect";
+}
+
+export type FormulaCanvasProps = FormulaCanvasEditProps | FormulaCanvasInspectProps;
+
+function isTextEntryTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+export function FormulaCanvas(props: FormulaCanvasProps) {
+  const {
+    nodes,
+    edges,
+    selectedNodeId,
+    selectedNodeIds,
+    selectedEdgeIds,
+    onSelectNode,
+    onSelectionChange,
+    onInit,
+  } = props;
+  const editable = props.mode === "edit";
+  const selectedSlot = editable ? props.selectedSlot : null;
+  const onNodesChange = editable ? props.onNodesChange : undefined;
+  const onEdgesChange = editable ? props.onEdgesChange : undefined;
+  const onConnect = editable ? props.onConnect : undefined;
+  const onNodeDragStart = editable ? props.onNodeDragStart : undefined;
+  const onNodeDragStop = editable ? props.onNodeDragStop : undefined;
+  const onSelectSlot = editable ? props.onSelectSlot : undefined;
+  const onClearSlot = editable ? props.onClearSlot : undefined;
+  const onDropPrimitive = editable ? props.onDropPrimitive : undefined;
+  const onDropCanvas = editable ? props.onDropCanvas : undefined;
+  const onValueChange = editable ? props.onValueChange : undefined;
+  const onInlineValueChange = editable ? props.onInlineValueChange : undefined;
+  const onInlineValueCommit = editable ? props.onInlineValueCommit : undefined;
   const flowInstance = useRef<ReactFlowInstance | null>(null);
-  const selectedIdSet = selectedNodeIds ? new Set(selectedNodeIds) : undefined;
-  const selectedEdgeIdSet = selectedEdgeIds ? new Set(selectedEdgeIds) : undefined;
-  const changeInlineValue = (nodeId: string, index: number, value: number | null) => {
+  const canvasNodesRef = useRef<FormulaFlowNode[]>([]);
+  const selectedIdSet = useMemo(
+    () => selectedNodeIds ? new Set(selectedNodeIds) : undefined,
+    [selectedNodeIds],
+  );
+  const selectedEdgeIdSet = useMemo(
+    () => selectedEdgeIds ? new Set(selectedEdgeIds) : undefined,
+    [selectedEdgeIds],
+  );
+  const changeInlineValue = useCallback((nodeId: string, index: number, value: number | null) => {
+    if (!onNodesChange) return;
     if (onInlineValueChange) {
       onInlineValueChange(nodeId, index, value);
       return;
@@ -278,27 +407,39 @@ export function FormulaCanvas({
         },
       },
     } : node));
-  };
-  const callbacks = {
+  }, [nodes, onInlineValueChange, onNodesChange]);
+  const callbacks = useMemo(() => ({
+    readOnly: !editable,
     selectedSlot: null,
     onSelectSlot,
     onDropPrimitive,
     onValueChange,
     onInlineValueChange: changeInlineValue,
     onInlineValueCommit,
-  };
-  const boundInlineByNode = new Map<string, number[]>();
-  for (const edge of edges) {
-    if (!edge.targetHandle?.startsWith("input-")) continue;
-    const index = Number(edge.targetHandle.slice("input-".length));
-    const target = nodes.find((node) => node.id === edge.target);
-    const type = target ? (target.data as FormulaNodeData).inputTypes?.[index] : undefined;
-    if (!type || !isInlineInputType(type)) continue;
-    const indexes = boundInlineByNode.get(edge.target) ?? [];
-    indexes.push(index);
-    boundInlineByNode.set(edge.target, indexes);
-  }
-  const flowNodes = nodes.map((node) => toFlowNode(
+  }), [
+    changeInlineValue,
+    editable,
+    onDropPrimitive,
+    onInlineValueCommit,
+    onSelectSlot,
+    onValueChange,
+  ]);
+  const boundInlineByNode = useMemo(() => {
+    const result = new Map<string, number[]>();
+    const nodesById = new Map(nodes.map((node) => [node.id, node]));
+    for (const edge of edges) {
+      if (!edge.targetHandle?.startsWith("input-")) continue;
+      const index = Number(edge.targetHandle.slice("input-".length));
+      const target = nodesById.get(edge.target);
+      const type = target ? (target.data as FormulaNodeData).inputTypes?.[index] : undefined;
+      if (!type || !isInlineInputType(type)) continue;
+      const indexes = result.get(edge.target) ?? [];
+      indexes.push(index);
+      result.set(edge.target, indexes);
+    }
+    return result;
+  }, [edges, nodes]);
+  const incomingCanvasNodes = useMemo(() => nodes.map((node) => toFlowNode(
     node,
     {
       ...callbacks,
@@ -306,9 +447,33 @@ export function FormulaCanvas({
       boundInlineInputs: boundInlineByNode.get(node.id) ?? [],
     },
     selectedNodeId,
+    editable,
     selectedIdSet,
-  ));
-  const flowEdges = edges.map((edge) => toFlowEdge(edge, selectedEdgeIdSet));
+  )), [
+    boundInlineByNode,
+    callbacks,
+    editable,
+    nodes,
+    selectedIdSet,
+    selectedNodeId,
+    selectedSlot,
+  ]);
+  const [canvasNodes, setCanvasNodes] = useState<FormulaFlowNode[]>(incomingCanvasNodes);
+  const hasMountedCanvas = useRef(false);
+  useEffect(() => {
+    if (!hasMountedCanvas.current) {
+      hasMountedCanvas.current = true;
+      return;
+    }
+    setCanvasNodes((current) => reconcileCanvasNodes(current, incomingCanvasNodes));
+  }, [incomingCanvasNodes]);
+  useEffect(() => {
+    canvasNodesRef.current = canvasNodes;
+  }, [canvasNodes]);
+  const flowEdges = useMemo(
+    () => edges.map((edge) => toFlowEdge(edge, selectedEdgeIdSet)),
+    [edges, selectedEdgeIdSet],
+  );
   const handleSelectionChange = useCallback(({ nodes: selectedNodes, edges: selectedEdges }: {
     nodes: Node[];
     edges: Edge[];
@@ -331,14 +496,29 @@ export function FormulaCanvas({
 
   return (
     <div
-      className="formula-canvas"
-      onDragOver={(event) => {
+      className={`formula-canvas formula-canvas--${props.mode}${props.compact ? " formula-canvas--compact" : ""}`}
+      role="region"
+      aria-label={props.ariaLabel ?? (editable ? "Formula editor canvas" : "Read-only formula diagram")}
+      aria-readonly={!editable}
+      aria-keyshortcuts="0 Escape"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (isTextEntryTarget(event.target)) return;
+        if (event.key === "0") {
+          event.preventDefault();
+          void flowInstance.current?.fitView({ padding: 0.16 });
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          onSelectNode?.(null);
+        }
+      }}
+      onDragOver={editable ? (event) => {
         event.preventDefault();
         event.dataTransfer.dropEffect = "copy";
-      }}
+      } : undefined}
     >
       <ReactFlow
-        nodes={flowNodes}
+        nodes={canvasNodes}
         edges={flowEdges}
         nodeTypes={NODE_TYPES}
         fitView
@@ -347,54 +527,56 @@ export function FormulaCanvas({
         zoomOnScroll
         zoomOnPinch
         panOnDrag
+        nodesDraggable={editable}
+        nodesConnectable={editable}
         deleteKeyCode={null}
         onInit={(instance) => {
           const typed = instance as unknown as ReactFlowInstance;
           flowInstance.current = typed;
-          onInit(typed);
+          onInit?.(typed);
         }}
-        isValidConnection={valid}
-        onConnect={(connection) => {
-          if (valid(connection)) onConnect(connection);
-        }}
+        isValidConnection={editable ? valid : undefined}
+        onConnect={editable ? (connection) => {
+          if (valid(connection)) onConnect?.(connection);
+        } : undefined}
         onNodesChange={(changes: NodeChange[]) => {
-          // React Flow owns measured dimensions. Persisting a measurement-only
-          // change strips that internal state from our serializable draft and
-          // causes controlled nodes to remain hidden as "unmeasured".
-          const structuralIds = new Set(flowNodes
-            .filter((node) => node.data.kind === "input" || node.data.kind === "output")
-            .map((node) => node.id));
-          const draftChanges = changes.filter((change) => (
-            change.type !== "dimensions" &&
-            !(change.type === "remove" && structuralIds.has(change.id))
+          setCanvasNodes((current) => applyCanvasNodeChanges(
+            changes as NodeChange<FormulaFlowNode>[],
+            current,
           ));
-          if (draftChanges.length > 0) {
-            onNodesChange(applyNodeChanges(draftChanges, flowNodes).map(fromFlowNode));
-          }
         }}
-        onEdgesChange={(changes: EdgeChange[]) => {
+        onEdgesChange={editable ? (changes: EdgeChange[]) => {
           const persistedChanges = changes.filter((change) => change.type !== "select");
           if (persistedChanges.length > 0) {
-            onEdgesChange(applyEdgeChanges(persistedChanges, flowEdges).map(fromFlowEdge));
+            onEdgesChange?.(applyEdgeChanges(persistedChanges, flowEdges).map(fromFlowEdge));
           }
-        }}
+        } : undefined}
         onNodeClick={(_event, node) => {
-          onClearSlot();
-          onSelectNode(node.id);
+          onClearSlot?.();
+          onSelectNode?.(node.id);
         }}
-        onNodeDragStart={() => onNodeDragStart?.()}
-        onNodeDragStop={(_event, stoppedNode, draggedNodes) => {
-          if (!onNodeDragStop) return;
+        onNodeDragStart={editable ? () => onNodeDragStart?.() : undefined}
+        onNodeDragStop={editable ? (_event, stoppedNode, draggedNodes) => {
           const moved = new Map(draggedNodes.map((node) => [node.id, node]));
           moved.set(stoppedNode.id, stoppedNode);
-          onNodeDragStop(flowNodes.map((node) => fromFlowNode(moved.get(node.id) ?? node)));
-        }}
+          const finalCanvasNodes = canvasNodesRef.current.map((node) => {
+            const finalNode = moved.get(node.id);
+            return finalNode ? {
+              ...node,
+              position: finalNode.position,
+              dragging: false,
+            } : node;
+          });
+          setCanvasNodes(finalCanvasNodes);
+          canvasNodesRef.current = finalCanvasNodes;
+          onNodeDragStop?.(commitCanvasPositions(nodes, finalCanvasNodes));
+        } : undefined}
         onSelectionChange={onSelectionChange ? handleSelectionChange : undefined}
         onPaneClick={() => {
-          onClearSlot();
-          onSelectNode(null);
+          onClearSlot?.();
+          onSelectNode?.(null);
         }}
-        onDrop={(event: DragEvent) => {
+        onDrop={editable ? (event: DragEvent) => {
           event.preventDefault();
           const primitive = event.dataTransfer.getData("application/x-alphalineage-primitive");
           if (!primitive) return;
@@ -402,8 +584,8 @@ export function FormulaCanvas({
             x: event.clientX,
             y: event.clientY,
           });
-          if (point) onDropCanvas(primitive, point, { exact: true, anchor: "center" });
-        }}
+          if (point) onDropCanvas?.(primitive, point, { exact: true, anchor: "center" });
+        } : undefined}
       >
         <Background gap={20} size={1} />
       </ReactFlow>

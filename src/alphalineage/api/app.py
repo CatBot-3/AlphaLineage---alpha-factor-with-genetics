@@ -24,7 +24,8 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException
+from dotenv import find_dotenv, load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -42,7 +43,10 @@ from alphalineage.api.resources import (
 )
 from alphalineage.api.service import run_search
 from alphalineage.backtest.costs import TransactionCostModel
-from alphalineage.backtest.portfolio import QuantileLongShort, RankProportional, WeightingScheme
+from alphalineage.backtest.portfolio import (
+    PORTFOLIO_SCHEMA_VERSION,
+    PortfolioStrategySpec,
+)
 from alphalineage.backtest.reporting import backtest_report
 from alphalineage.core import categories as core_categories
 from alphalineage.core import cpp
@@ -74,9 +78,11 @@ from alphalineage.core.tree import to_dict as tree_to_dict
 from alphalineage.core.tree import to_json as tree_to_json
 from alphalineage.core.tree import validate as validate_tree
 from alphalineage.core.types import DType, is_subtype
-from alphalineage.data import paths, schema, usage
+
+# ``schema`` remains re-exported from this module for older integrations/tests.
+from alphalineage.data import paths, schema, usage  # noqa: F401
 from alphalineage.data.adjust import split_adjusted_close
-from alphalineage.data.cache import ParquetCache
+from alphalineage.data.cache import ParquetCache, merge_price_frames
 from alphalineage.data.identifiers import (
     atomic_write_text,
     child_path,
@@ -107,6 +113,13 @@ from alphalineage.library.indicator_catalog import (
     LEGACY_CATALOG_REPLACEMENTS,
 )
 from alphalineage.validation.splits import time_split
+
+# Local launches historically read ``.env`` in some helper scripts but not in the
+# application process itself.  Load it before settings/providers are resolved while
+# preserving the standard precedence of an explicitly supplied process environment.
+_DOTENV_PATH = find_dotenv(usecwd=True)
+if _DOTENV_PATH and os.environ.get("ALPHALINEAGE_SKIP_DOTENV") != "1":
+    load_dotenv(_DOTENV_PATH, override=False)
 
 app = FastAPI(title="AlphaLineage", version="0.1.0")
 # Allow the browser `app` build (Vite dev server) to call the local backend.
@@ -313,6 +326,15 @@ class FormulaBinding(BaseModel):
     value: float | int | None = None
 
 
+class PortfolioStrategyRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=80)
+    scheme: Literal["quantile_ls", "rank_proportional"]
+    quantile: float | None = Field(default=None, gt=0.0, lt=0.5)
+
+    def to_spec(self) -> PortfolioStrategySpec:
+        return PortfolioStrategySpec(self.id, self.scheme, self.quantile)
+
+
 class FormulaTestRequest(BaseModel):
     source: FormulaTestSource
     bindings: dict[str, FormulaBinding] = Field(default_factory=dict, max_length=64)
@@ -324,6 +346,10 @@ class FormulaTestRequest(BaseModel):
     quantile: float = Field(default=0.2, ge=0.01, le=0.49)
     commission_bps: float = Field(default=1.0, ge=0.0, le=10_000.0)
     slippage_bps: float = Field(default=5.0, ge=0.0, le=10_000.0)
+    strategies: list[PortfolioStrategyRequest] | None = Field(
+        default=None, min_length=1, max_length=4
+    )
+    primary_strategy_id: str | None = Field(default=None, min_length=1, max_length=80)
 
 
 class FormulaTestKeepRequest(BaseModel):
@@ -456,6 +482,21 @@ class SessionContinueRequest(BaseModel):
     operators: list[OperatorSpec] = Field(default_factory=list, max_length=100)
     seed_factor_ids: list[str] = Field(default_factory=list, max_length=100)
     resources: TrainingResourcesRequest | None = None
+
+
+class SessionFinalizeRequest(BaseModel):
+    confirm_repeat: bool = False
+    strategy_plan_id: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class SessionStrategyComparisonRequest(BaseModel):
+    strategies: list[PortfolioStrategyRequest] = Field(min_length=1, max_length=4)
+    confirm_repeat: bool = False
+
+
+class SessionFinalizationPlanRequest(BaseModel):
+    comparison_id: str = Field(min_length=1, max_length=80)
+    primary_strategy_id: str = Field(min_length=1, max_length=80)
 
 
 def _acceleration_status() -> tuple[bool, str | None]:
@@ -1654,9 +1695,7 @@ def _coverage_for_symbol(
 
 
 def _merge_price_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    merged = pd.concat(frames).sort_index()
-    merged = merged[~merged.index.duplicated(keep="last")]
-    return schema.validate(merged[schema.PRICE_COLUMNS].astype("float64"))
+    return merge_price_frames(frames)
 
 
 def _sync_one_symbol(
@@ -2518,16 +2557,16 @@ def _panel_for_universe(universe: str, as_of: str, default_panel: Panel | None) 
 
 def _load_seed_factors(
     factor_ids: list[str],
-) -> tuple[list[Any], int, int]:
+) -> tuple[list[Any], int, int, list[dict[str, Any]]]:
     """Resolve saved factors into seed trees, re-registering their operators (P4).
 
-    Returns ``(seed_trees, trial_baseline, test_reads_baseline)`` where the baselines sum the
-    provenance of distinct source sessions, so a seeded session inherits their honesty counts.
+    Returns trees, trial/test baselines, and non-secret evidence provenance.
     """
     store = _factor_store()
     seeds: list[Any] = []
     trial_baseline = 0
     test_reads_baseline = 0
+    evidence_sources: list[dict[str, Any]] = []
     seen: set[str] = set()
     for factor_id in factor_ids:
         factor = store.get(factor_id)
@@ -2551,7 +2590,15 @@ def _load_seed_factors(
             seen.add(key)
             trial_baseline += int(provenance.get("cumulative_trials", 0) or 0)
             test_reads_baseline += int(provenance.get("test_reads", 0) or 0)
-    return seeds, trial_baseline, test_reads_baseline
+            evidence_sources.append(
+                {
+                    "factor_id": factor_id,
+                    "session_id": provenance.get("session_id"),
+                    "holdout_fingerprint": provenance.get("holdout_fingerprint"),
+                    "test_reads": int(provenance.get("test_reads", 0) or 0),
+                }
+            )
+    return seeds, trial_baseline, test_reads_baseline, evidence_sources
 
 
 def _gp_config_from_request(data: dict[str, Any]) -> GPConfig:
@@ -2996,20 +3043,52 @@ def _formula_test_result(
         raise TrainingCancelled("formula test stopped")
     progress.set_phase("backtesting")
     fwd = forward_returns(panel, req.horizon)
-    scheme: WeightingScheme
-    if req.weighting_scheme == "quantile_ls":
-        scheme = QuantileLongShort(req.quantile)
+    if req.strategies is not None:
+        strategy_specs = [item.to_spec() for item in req.strategies]
     else:
-        scheme = RankProportional()
+        strategy_specs = [
+            PortfolioStrategySpec(
+                "primary",
+                req.weighting_scheme,
+                req.quantile if req.weighting_scheme == "quantile_ls" else None,
+            )
+        ]
+    if len({item.id for item in strategy_specs}) != len(strategy_specs):
+        raise ValueError("strategy ids must be unique")
+    primary_strategy_id = req.primary_strategy_id or strategy_specs[0].id
+    if primary_strategy_id not in {item.id for item in strategy_specs}:
+        raise ValueError("primary_strategy_id must reference a strategy")
     costs = TransactionCostModel(req.commission_bps, req.slippage_bps)
-    reported = backtest_report(
-        factor,
-        panel,
-        fwd,
-        scheme,
-        costs,
-        report_dates,
-        horizon=req.horizon,
+    strategy_results: list[dict[str, Any]] = []
+    for strategy_spec in strategy_specs:
+        tested = backtest_report(
+            factor,
+            panel,
+            fwd,
+            strategy_spec.weighting_scheme(),
+            costs,
+            report_dates,
+            horizon=req.horizon,
+        )
+        strategy_results.append(
+            {
+                "strategy_id": strategy_spec.id,
+                "spec": strategy_spec.to_dict(),
+                "role": (
+                    "primary"
+                    if strategy_spec.id == primary_strategy_id
+                    else "comparison"
+                ),
+                "oos_backtest": tested,
+            }
+        )
+    reported = next(
+        item["oos_backtest"]
+        for item in strategy_results
+        if item["strategy_id"] == primary_strategy_id
+    )
+    primary_strategy = next(
+        item for item in strategy_specs if item.id == primary_strategy_id
     )
     if cancel.is_set():
         raise TrainingCancelled("formula test stopped")
@@ -3023,10 +3102,12 @@ def _formula_test_result(
         "start": data_coverage["start"],
         "end": data_coverage["end"],
         "horizon": req.horizon,
-        "weighting_scheme": req.weighting_scheme,
-        "quantile": req.quantile,
+        "weighting_scheme": primary_strategy.scheme,
+        "quantile": primary_strategy.quantile,
         "commission_bps": req.commission_bps,
         "slippage_bps": req.slippage_bps,
+        "primary_strategy_id": primary_strategy_id,
+        "strategies": [item.to_dict() for item in strategy_specs],
     }
     return {
         "kind": "backtest",
@@ -3044,6 +3125,10 @@ def _formula_test_result(
         "metrics": reported["metrics"],
         "returns": reported["returns"],
         "normalized_equity": reported["normalized_equity"],
+        "oos_backtest": reported,
+        "primary_strategy_id": primary_strategy_id,
+        "strategy_results": strategy_results,
+        "portfolio_schema_version": PORTFOLIO_SCHEMA_VERSION,
         "disclaimer": DISCLAIMER,
         "exploratory": True,
         "termination_reason": "completed",
@@ -3945,9 +4030,21 @@ def delete_factor(factor_id: str) -> dict[str, str]:
 @app.get("/settings")
 def get_settings() -> dict[str, Any]:
     stored = paths.read_settings()
+    environment_key_set = bool(os.environ.get("TIINGO_API_KEY", "").strip())
+    stored_key_set = bool(str(stored.get("tiingo_api_key") or "").strip())
+    key_source = (
+        "environment"
+        if environment_key_set
+        else "stored"
+        if stored_key_set
+        else "none"
+    )
     return {
         "factors_dir": str(paths.factors_dir()),
-        "tiingo_api_key_set": bool(paths.tiingo_api_key()),  # never echo the secret itself
+        # Never echo, mask, size, or otherwise reveal the secret itself.
+        "tiingo_api_key_set": key_source != "none",
+        "tiingo_api_key_source": key_source,
+        "tiingo_stored_key_set": stored_key_set,
         "evaluator": stored.get("evaluator", "auto"),
         "cpp_available": cpp.available(),
     }
@@ -4312,6 +4409,50 @@ def _session_job_view(session: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _session_finalization_job_view(
+    session: dict[str, Any],
+) -> dict[str, Any] | None:
+    def normalized(payload: dict[str, Any]) -> dict[str, Any]:
+        metadata = dict(payload.get("metadata") or {})
+        for key in (
+            "evaluation_id",
+            "round_index",
+            "strategy_plan_id",
+            "comparison_id",
+            "primary_strategy_id",
+        ):
+            if key not in metadata:
+                metadata[key] = payload.get(key)
+        return {
+            **payload,
+            "id": str(payload.get("id") or payload.get("job_id") or ""),
+            "progress": payload.get("progress"),
+            "metadata": metadata,
+        }
+
+    active_id = str(session.get("active_finalization_job_id") or "")
+    job = _jobs.get(active_id)
+    if job is not None and job.status in ("queued", "running"):
+        return normalized({
+            "id": job.id,
+            "status": job.status,
+            "termination_reason": job.termination_reason,
+            "progress": job.progress.snapshot() if job.progress is not None else None,
+            "metadata": dict(job.metadata),
+        })
+    if active_id:
+        status = job.status if job is not None else "interrupted"
+        error = job.error if job is not None else "application restarted during finalization"
+        sessions.finish_finalization_job(
+            session["id"],
+            active_id,
+            status,
+            error=error,
+        )
+    persisted = session.get("last_finalization_job")
+    return normalized(dict(persisted)) if isinstance(persisted, dict) else None
+
+
 @app.post("/sessions")
 def create_session(
     req: SessionCreateRequest,
@@ -4339,7 +4480,12 @@ def create_session(
     _load_persisted_formulas()
     for spec in req.operators:
         _register(spec)
-    seeds, trial_baseline, test_reads_baseline = _load_seed_factors(req.seed_factor_ids)
+    (
+        seeds,
+        trial_baseline,
+        test_reads_baseline,
+        inherited_evidence_sources,
+    ) = _load_seed_factors(req.seed_factor_ids)
     _validate_seeds(seeds, config)
 
     formula_revisions = _active_formula_operator_specs()
@@ -4357,6 +4503,7 @@ def create_session(
         operators=[_model_dump(spec) for spec in req.operators],
         formula_revisions=formula_revisions,
         seed_factor_ids=req.seed_factor_ids,
+        inherited_evidence_sources=inherited_evidence_sources,
         boundaries=boundaries,
         trial_baseline=trial_baseline,
         test_reads_baseline=test_reads_baseline,
@@ -4370,7 +4517,13 @@ def create_session(
     )
     cancel = threading.Event()
     job_id = uuid.uuid4().hex
-    if not sessions.claim_job(session_id, job_id):
+    if not sessions.claim_job(
+        session_id,
+        job_id,
+        requested_generations=config.generations,
+        config=config.to_dict(),
+        resources=requested_resources.to_dict(),
+    ):
         raise HTTPException(status_code=409, detail="a segment is already running")
 
     def _task() -> dict[str, Any]:
@@ -4430,6 +4583,19 @@ def continue_session(
 
     if _live_session_job(session) is not None:
         raise HTTPException(status_code=409, detail="a segment is already running")
+    active_finalization_id = str(session.get("active_finalization_job_id") or "")
+    active_finalization = _jobs.get(active_finalization_id)
+    if active_finalization is not None and active_finalization.status in {
+        "queued",
+        "running",
+    }:
+        raise HTTPException(status_code=409, detail="holdout finalization is running")
+    restart_reason = sessions.continuation_restart_reason(session_id)
+    if restart_reason:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Restart with the same setup: {restart_reason}",
+        )
 
     if req.resources is None:
         stored_resources = session.get("resources") or {
@@ -4522,7 +4688,7 @@ def continue_session(
     )
     rescore = universe_changed or scoring_changed
 
-    extra_seeds, _, _ = _load_seed_factors(req.seed_factor_ids)
+    extra_seeds, _, _, _ = _load_seed_factors(req.seed_factor_ids)
     _validate_seeds(extra_seeds, config)
 
     effective_operator_names = {
@@ -4535,7 +4701,13 @@ def continue_session(
     )
 
     job_id = uuid.uuid4().hex
-    if not sessions.claim_job(session_id, job_id):
+    if not sessions.claim_job(
+        session_id,
+        job_id,
+        requested_generations=req.generations,
+        config=config.to_dict(),
+        resources=requested_resources.to_dict(),
+    ):
         raise HTTPException(status_code=409, detail="a segment is already running")
 
     # Reload the reservation before persisting config/operator changes so a stale request
@@ -4552,7 +4724,7 @@ def continue_session(
     sessions.save_session(session)
 
     progress = RunProgress(
-        target_generations=config.generations,
+        target_generations=req.generations,
         resources=resources.to_dict(),
     )
     cancel = threading.Event()
@@ -4612,18 +4784,49 @@ def list_sessions() -> list[dict[str, Any]]:
         if not (directory / "session.json").exists():
             continue
         session = sessions.load_session(directory.name)
+        _session_job_view(session)  # reconcile a reservation left by a prior process
+        session = sessions.load_session(directory.name)
+        segments = session.get("segments") or []
+        rounds = sessions.list_rounds(session["id"])
+        finalizations = sessions.list_finalizations(session["id"])
+        last_job = session.get("last_job") or {}
+        current_generation = max(
+            (
+                int(segment["gen_end"])
+                for segment in segments
+                if segment.get("gen_end") is not None
+            ),
+            default=0,
+        )
         summaries.append(
             {
                 "id": session["id"],
                 "name": session["name"],
                 "created_at": session.get("created_at", ""),
+                "updated_at": session.get("updated_at", session.get("created_at", "")),
                 "universe": session["universe"],
-                "segments": len(session["segments"]),
-                "cumulative_trials": session["cumulative_trials"],
-                "test_reads": session["test_reads"],
+                "segments": len(segments),
+                "rounds": len(rounds),
+                "latest_completed_round": rounds[-1]["index"] if rounds else None,
+                "current_generation": current_generation,
+                "last_status": last_job.get("status")
+                or (segments[-1].get("status") if segments else "created"),
+                "has_checkpoint": (
+                    sessions.session_dir(session["id"]) / "checkpoint.json"
+                ).exists(),
+                "has_report": bool(finalizations),
+                "finalizations": len(finalizations),
+                "requested_generations": session.get("last_requested_generations")
+                or session.get("config", {}).get("generations"),
+                "cumulative_trials": session.get("cumulative_trials", 0),
+                "test_reads": session.get("test_reads", 0),
             }
         )
-    return sorted(summaries, key=lambda item: item["created_at"], reverse=True)
+    return sorted(
+        summaries,
+        key=lambda item: (item["updated_at"], item["created_at"]),
+        reverse=True,
+    )
 
 
 @app.get("/sessions/{session_id}")
@@ -4631,23 +4834,429 @@ def get_session(session_id: str) -> dict[str, Any]:
     if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="unknown session")
     session = sessions.load_session(session_id)
+    job = _session_job_view(session)
+    finalization_job = _session_finalization_job_view(session)
+    # Re-read after stale-job reconciliation so an application restart never returns
+    # an already-cleared active reservation to a reconnecting client.
+    session = sessions.load_session(session_id)
+    session["rounds"] = sessions.list_rounds(session_id)
     result_path = sessions.session_dir(session_id) / "result.json"
     result = None
     if result_path.exists():
         result = json.loads(result_path.read_text(encoding="utf-8"))
-        result = {k: v for k, v in result.items() if k != "lineage"}  # lineage via its endpoint
-    return {**session, "job": _session_job_view(session), "result": result}
+        result = {
+            key: value
+            for key, value in result.items()
+            if key not in {"lineage", "report_trials"}
+        }
+    return {
+        **session,
+        "job": job,
+        "finalization_job": finalization_job,
+        "result": result,
+    }
 
 
 @app.get("/sessions/{session_id}/lineage")
-def get_session_lineage(session_id: str) -> dict[str, Any]:
+def get_session_lineage(
+    session_id: str,
+    round: int | None = Query(default=None, ge=0),  # noqa: A002
+) -> dict[str, Any]:
     if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="unknown session")
+    if round is not None:
+        round_lineage = sessions.lineage_for_round(session_id, round)
+        if round_lineage is None:
+            raise HTTPException(status_code=404, detail="unknown or unavailable round")
+        return round_lineage
     lineage_path = sessions.session_dir(session_id) / "lineage.json"
     if not lineage_path.exists():
         raise HTTPException(status_code=404, detail="no lineage yet")
-    data: dict[str, Any] = json.loads(lineage_path.read_text(encoding="utf-8"))
-    return data
+    lineage: dict[str, Any] = json.loads(lineage_path.read_text(encoding="utf-8"))
+    return lineage
+
+
+@app.get("/sessions/{session_id}/rounds")
+def get_session_rounds(session_id: str) -> list[dict[str, Any]]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    return sessions.list_rounds(session_id)
+
+
+@app.post(
+    "/sessions/{session_id}/rounds/{round_index}/strategy-comparisons"
+)
+def compare_session_round_strategies(
+    session_id: str,
+    round_index: int,
+    req: SessionStrategyComparisonRequest,
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
+) -> dict[str, Any]:
+    """Compare up to four weighting strategies on validation data only."""
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    round_payload = sessions.load_round(session_id, round_index)
+    if round_index < 0 or round_payload is None:
+        raise HTTPException(status_code=404, detail="unknown round")
+    if round_payload.get("restart_required"):
+        raise HTTPException(
+            status_code=409,
+            detail="Restart with the same setup before comparing this legacy round.",
+        )
+    try:
+        strategy_specs = [item.to_spec() for item in req.strategies]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session = sessions.load_session(session_id)
+    context = dict(round_payload.get("context") or {})
+    universe = str(context.get("universe") or session["universe"])
+    as_of = str(context.get("as_of") or session["as_of"])
+    resolved_panel = _panel_for_universe(universe, as_of, panel)
+    comparison_id = uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
+    claimed, reason = sessions.claim_strategy_comparison(
+        session_id,
+        job_id=job_id,
+        comparison_id=comparison_id,
+        round_index=round_index,
+        strategies=strategy_specs,
+        confirm_repeat=req.confirm_repeat,
+    )
+    if not claimed:
+        status = 404 if reason == "unknown round" else 409
+        raise HTTPException(status_code=status, detail=reason)
+    progress = RunProgress(target_generations=0)
+    cancel = threading.Event()
+
+    def _task() -> dict[str, Any]:
+        sessions.update_strategy_comparison_status(
+            session_id, comparison_id, job_id, "running"
+        )
+        try:
+            return sessions.run_strategy_comparison(
+                session_id,
+                round_index,
+                comparison_id=comparison_id,
+                job_id=job_id,
+                panel=resolved_panel,
+                progress=progress,
+                stop=cancel.is_set,
+            )
+        except (TrainingCancelled, TrainingLeaseCancelled):
+            sessions.update_strategy_comparison_status(
+                session_id, comparison_id, job_id, "stopped"
+            )
+            raise
+        except Exception as exc:
+            sessions.update_strategy_comparison_status(
+                session_id,
+                comparison_id,
+                job_id,
+                "failed",
+                error=repr(exc),
+            )
+            raise
+
+    try:
+        _jobs.submit(
+            _task,
+            job_id=job_id,
+            progress=progress,
+            metadata={
+                "session_id": session_id,
+                "round_index": round_index,
+                "comparison_id": comparison_id,
+                "kind": "strategy_comparison",
+            },
+            cancel=cancel,
+        )
+    except Exception as exc:
+        sessions.update_strategy_comparison_status(
+            session_id,
+            comparison_id,
+            job_id,
+            "failed",
+            error=repr(exc),
+        )
+        raise
+    return {
+        "session_id": session_id,
+        "round_index": round_index,
+        "comparison_id": comparison_id,
+        "job_id": job_id,
+        "status": "queued",
+    }
+
+
+@app.get(
+    "/sessions/{session_id}/rounds/{round_index}/strategy-comparisons"
+)
+def get_session_round_strategy_comparisons(
+    session_id: str,
+    round_index: int,
+) -> list[dict[str, Any]]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if sessions.load_round(session_id, round_index) is None:
+        raise HTTPException(status_code=404, detail="unknown round")
+    return [
+        item
+        for item in sessions.list_strategy_comparisons(session_id)
+        if int(item.get("round_index", -1)) == round_index
+    ]
+
+
+@app.get(
+    "/sessions/{session_id}/rounds/{round_index}/strategy-comparisons/{comparison_id}"
+)
+def get_session_round_strategy_comparison(
+    session_id: str,
+    round_index: int,
+    comparison_id: str,
+) -> dict[str, Any]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    try:
+        payload = sessions.load_strategy_comparison(session_id, comparison_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="unknown strategy comparison") from exc
+    if payload is None or int(payload.get("round_index", -1)) != round_index:
+        raise HTTPException(status_code=404, detail="unknown strategy comparison")
+    return payload
+
+
+@app.post("/sessions/{session_id}/rounds/{round_index}/finalization-plans")
+def create_session_round_finalization_plan(
+    session_id: str,
+    round_index: int,
+    req: SessionFinalizationPlanRequest,
+) -> dict[str, Any]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if sessions.load_round(session_id, round_index) is None:
+        raise HTTPException(status_code=404, detail="unknown round")
+    try:
+        return sessions.create_finalization_plan(
+            session_id,
+            round_index,
+            comparison_id=req.comparison_id,
+            primary_strategy_id=req.primary_strategy_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/sessions/{session_id}/rounds/{round_index}/finalization-plans")
+def get_session_round_finalization_plans(
+    session_id: str,
+    round_index: int,
+) -> list[dict[str, Any]]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if sessions.load_round(session_id, round_index) is None:
+        raise HTTPException(status_code=404, detail="unknown round")
+    return [
+        item
+        for item in sessions.list_finalization_plans(session_id)
+        if int(item.get("round_index", -1)) == round_index
+    ]
+
+
+@app.get(
+    "/sessions/{session_id}/rounds/{round_index}/finalization-plans/{strategy_plan_id}"
+)
+def get_session_round_finalization_plan(
+    session_id: str,
+    round_index: int,
+    strategy_plan_id: str,
+) -> dict[str, Any]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    try:
+        payload = sessions.load_finalization_plan(session_id, strategy_plan_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="unknown finalization plan") from exc
+    if payload is None or int(payload.get("round_index", -1)) != round_index:
+        raise HTTPException(status_code=404, detail="unknown finalization plan")
+    return payload
+
+
+@app.post("/sessions/{session_id}/rounds/{round_index}/finalize")
+def finalize_session_round(
+    session_id: str,
+    round_index: int,
+    req: SessionFinalizeRequest,
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
+) -> dict[str, Any]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if round_index < 0:
+        raise HTTPException(status_code=404, detail="unknown round")
+    round_payload = sessions.load_round(session_id, round_index)
+    if round_payload is None:
+        raise HTTPException(status_code=404, detail="unknown round")
+    if round_payload.get("restart_required"):
+        raise HTTPException(
+            status_code=409,
+            detail="Restart with the same setup before finalizing this legacy round.",
+        )
+    session = sessions.load_session(session_id)
+    context = dict(round_payload.get("context") or {})
+    universe = str(context.get("universe") or session["universe"])
+    as_of = str(context.get("as_of") or session["as_of"])
+    resolved_panel = _panel_for_universe(universe, as_of, panel)
+    metadata = dict(round_payload.get("round_metadata") or {})
+    try:
+        config = GPConfig.from_dict(metadata.get("config") or session["config"])
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"round configuration is invalid: {exc}",
+        ) from exc
+    boundaries = sessions.Boundaries.from_dict(session["boundaries"])
+    fingerprint = sessions.holdout_fingerprint(resolved_panel, boundaries, config)
+    evaluation_id = uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
+    claimed, reason = sessions.claim_finalization(
+        session_id,
+        job_id=job_id,
+        evaluation_id=evaluation_id,
+        round_index=round_index,
+        holdout_fingerprint_value=fingerprint,
+        confirm_repeat=req.confirm_repeat,
+        strategy_plan_id=req.strategy_plan_id,
+    )
+    if not claimed:
+        status = 404 if reason == "unknown round" else 409
+        raise HTTPException(status_code=status, detail=reason)
+    reservation = dict(
+        sessions.load_session(session_id).get("active_finalization") or {}
+    )
+    resolved_strategy_plan_id = str(
+        reservation.get("strategy_plan_id") or ""
+    ) or None
+    pinned_plan = (
+        sessions.load_finalization_plan(session_id, resolved_strategy_plan_id)
+        if resolved_strategy_plan_id is not None
+        else None
+    )
+
+    progress = RunProgress(target_generations=0)
+    cancel = threading.Event()
+
+    def _task() -> dict[str, Any]:
+        sessions.update_finalization_status(session_id, job_id, "running")
+        try:
+            result = sessions.finalize_round(
+                session_id,
+                round_index,
+                job_id=job_id,
+                evaluation_id=evaluation_id,
+                panel=resolved_panel,
+                strategy_plan_id=resolved_strategy_plan_id,
+                progress=progress,
+                stop=cancel.is_set,
+            )
+        except (TrainingCancelled, TrainingLeaseCancelled):
+            sessions.finish_finalization_job(session_id, job_id, "stopped")
+            raise
+        except Exception as exc:
+            sessions.finish_finalization_job(
+                session_id,
+                job_id,
+                "failed",
+                error=repr(exc),
+            )
+            raise
+        return result
+
+    try:
+        _jobs.submit(
+            _task,
+            job_id=job_id,
+            progress=progress,
+            metadata={
+                "session_id": session_id,
+                "round_index": round_index,
+                "evaluation_id": evaluation_id,
+                "strategy_plan_id": resolved_strategy_plan_id,
+                "comparison_id": (
+                    pinned_plan.get("comparison_id")
+                    if pinned_plan is not None
+                    else None
+                ),
+                "primary_strategy_id": (
+                    pinned_plan.get("primary_strategy_id")
+                    if pinned_plan is not None
+                    else None
+                ),
+                "kind": "session_finalization",
+            },
+            cancel=cancel,
+        )
+    except Exception as exc:
+        sessions.finish_finalization_job(
+            session_id,
+            job_id,
+            "failed",
+            error=repr(exc),
+        )
+        raise
+    return {
+        "session_id": session_id,
+        "round_index": round_index,
+        "evaluation_id": evaluation_id,
+        "strategy_plan_id": resolved_strategy_plan_id,
+        "comparison_id": (
+            pinned_plan.get("comparison_id") if pinned_plan is not None else None
+        ),
+        "primary_strategy_id": (
+            pinned_plan.get("primary_strategy_id")
+            if pinned_plan is not None
+            else None
+        ),
+        "job_id": job_id,
+        "status": "queued",
+    }
+
+
+@app.get("/sessions/{session_id}/rounds/{round_index}")
+def get_session_round(session_id: str, round_index: int) -> dict[str, Any]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if round_index < 0:
+        raise HTTPException(status_code=404, detail="unknown round")
+    result = sessions.load_round(session_id, round_index)
+    if result is None:
+        raise HTTPException(status_code=404, detail="unknown or unavailable round")
+    return {
+        key: value
+        for key, value in result.items()
+        if key != "report_trials"
+    }
+
+
+@app.get("/sessions/{session_id}/finalizations")
+def get_session_finalizations(session_id: str) -> list[dict[str, Any]]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    return sessions.list_finalizations(session_id)
+
+
+@app.get("/sessions/{session_id}/finalizations/{evaluation_id}")
+def get_session_finalization(
+    session_id: str,
+    evaluation_id: str,
+) -> dict[str, Any]:
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    try:
+        payload = sessions.load_finalization(session_id, evaluation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="unknown finalization") from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="unknown finalization")
+    return payload
 
 
 @app.post("/sessions/{session_id}/stop")
@@ -4657,6 +5266,12 @@ def stop_session(session_id: str) -> dict[str, bool]:
     session = sessions.load_session(session_id)
     job = _live_session_job(session)
     if job is not None and _jobs.cancel(job.id):
+        return {"stopping": True}
+    finalization_id = str(session.get("active_finalization_job_id") or "")
+    if finalization_id and _jobs.cancel(finalization_id):
+        return {"stopping": True}
+    comparison_id = str(session.get("active_strategy_comparison_job_id") or "")
+    if comparison_id and _jobs.cancel(comparison_id):
         return {"stopping": True}
     return {"stopping": False}
 

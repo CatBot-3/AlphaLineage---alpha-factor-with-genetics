@@ -2,8 +2,9 @@
 
 Fitness is the cross-sectional IC of a factor against *forward* returns, not PnL
 (invariant 4). For each date we correlate the factor across symbols with the next
-period's return; the mean daily IC is the IC and mean/std is the IC IR. The GP maximizes
-mean ``|rank IC|`` (sign-indifferent), minus a small node-count penalty (anti-bloat).
+period's return.  Sign-indifference is applied once to the aggregate:
+``abs(mean(daily IC))``.  Applying ``abs`` per day rewards a directionless factor whose
+relationship continually flips, which is not a tradeable signal.
 """
 
 from __future__ import annotations
@@ -18,6 +19,71 @@ from alphalineage.core.evaluate import evaluate
 from alphalineage.core.extensions import expand_all
 from alphalineage.core.panel import Panel
 from alphalineage.core.tree import Node
+
+COMPLEXITY_PENALTY_MODES = frozenset({"per_node", "normalized_budget"})
+DEFAULT_NORMALIZED_COMPLEXITY_PENALTY = 0.005
+
+
+def complexity_penalty_rate(
+    *,
+    parsimony: float = 0.0,
+    complexity_penalty_mode: str = "per_node",
+    complexity_penalty_value: float | None = None,
+    max_nodes: int | None = None,
+) -> float:
+    """Return the per-expanded-node deduction for the configured penalty semantics.
+
+    ``parsimony`` remains the compatibility input for old callers and checkpoints. New
+    normalized-budget callers specify the maximum total deduction at ``max_nodes``.
+    """
+    if complexity_penalty_mode not in COMPLEXITY_PENALTY_MODES:
+        raise ValueError(
+            "complexity_penalty_mode must be 'per_node' or 'normalized_budget'"
+        )
+    value = (
+        float(complexity_penalty_value)
+        if complexity_penalty_value is not None
+        else (
+            DEFAULT_NORMALIZED_COMPLEXITY_PENALTY
+            if complexity_penalty_mode == "normalized_budget"
+            else float(parsimony)
+        )
+    )
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("complexity penalty must be a finite non-negative number")
+    if complexity_penalty_mode == "per_node":
+        return value
+    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes <= 0:
+        raise ValueError("max_nodes must be a positive integer for normalized_budget")
+    return value / float(max_nodes)
+
+
+def complexity_deduction(
+    complexity: int,
+    *,
+    parsimony: float = 0.0,
+    complexity_penalty_mode: str = "per_node",
+    complexity_penalty_value: float | None = None,
+    max_nodes: int | None = None,
+) -> float:
+    """Return the exact complexity deduction applied to one expanded expression."""
+    return float(complexity) * complexity_penalty_rate(
+        parsimony=parsimony,
+        complexity_penalty_mode=complexity_penalty_mode,
+        complexity_penalty_value=complexity_penalty_value,
+        max_nodes=max_nodes,
+    )
+
+
+def expanded_complexities(tree: Node) -> tuple[int, int]:
+    """Return expanded occurrence nodes and distinct executable computations.
+
+    Formula expansion memoizes repeated dependencies as a DAG for evaluation, but each textual
+    occurrence still contributes to search complexity. The distinct-computation count remains
+    useful for the hard feasibility budget and memory diagnostics.
+    """
+    expanded = expand_all(tree)
+    return expanded.size(), expanded.unique_computation_size()
 
 
 def forward_returns(panel: Panel, horizon: int = 1) -> pd.DataFrame:
@@ -130,7 +196,8 @@ def mean_ic(
     min_names: int = 2,
 ) -> float:
     ic = daily_ic(factor, fwd, method, min_names=min_names)
-    value = ic.abs().mean() if absolute else ic.mean()
+    signed = ic.mean()
+    value = abs(signed) if absolute else signed
     return float(value) if np.isfinite(value) else 0.0
 
 
@@ -149,26 +216,87 @@ def ic_ir(daily: pd.Series) -> float:
 _MIN_VALID_DATES = 5
 
 
+def _empty_metrics() -> dict[str, float]:
+    # Preserve the compact legacy shape for degenerate factors.  Valid factors carry the
+    # richer diagnostics below; consumers must already treat a missing metric as unavailable.
+    return {"ic": 0.0, "ic_ir": 0.0}
+
+
+def _ic_metrics(
+    ic: pd.Series,
+    active_names: pd.Series,
+    *,
+    absolute: bool,
+) -> dict[str, float]:
+    clean = ic.dropna()
+    signed = float(clean.mean())
+    mean_abs = float(clean.abs().mean())
+    polarity = -1.0 if signed < 0.0 else 1.0
+    oriented = abs(signed)
+    signed_ir = ic_ir(clean)
+    objective = oriented if absolute else signed
+    same_direction = (
+        (clean * polarity > 0.0).mean() if len(clean) else 0.0
+    )
+    breadth = active_names.reindex(clean.index).dropna()
+    return {
+        # ``ic`` remains the optimization metric for checkpoint/UI compatibility.
+        "ic": float(objective),
+        "signed_ic": signed,
+        "oriented_ic": oriented,
+        "mean_abs_ic": mean_abs,
+        "polarity": polarity,
+        "ic_ir": float(signed_ir),
+        "oriented_ic_ir": float(polarity * signed_ir),
+        "sign_consistency": float(same_direction),
+        "valid_dates": float(len(clean)),
+        "avg_active_names": float(breadth.mean()) if len(breadth) else 0.0,
+        "min_active_names": float(breadth.min()) if len(breadth) else 0.0,
+    }
+
+
 def _score_factor(
     complexity: int,
+    unique_complexity: int,
     factor: object,
     fwd: pd.DataFrame,
     *,
     method: str,
     absolute: bool,
     parsimony: float,
+    complexity_penalty_mode: str,
+    complexity_penalty_value: float | None,
+    max_nodes: int | None,
     min_names: int,
 ) -> tuple[float, dict[str, float]]:
     """Score an already-evaluated factor with the same contract as :func:`score_tree`."""
+    penalty = complexity_deduction(
+        complexity,
+        parsimony=parsimony,
+        complexity_penalty_mode=complexity_penalty_mode,
+        complexity_penalty_value=complexity_penalty_value,
+        max_nodes=max_nodes,
+    )
     if not isinstance(factor, pd.DataFrame):
-        return -parsimony * complexity, {"ic": 0.0, "ic_ir": 0.0}
-    ic = daily_ic(factor, fwd, method, min_names=min_names)
+        return -penalty, _empty_metrics()
+    aligned_factor, aligned_fwd = factor.align(fwd, join="inner")
+    paired = aligned_factor.notna() & aligned_fwd.notna()
+    active_names = paired.sum(axis=1).astype("float64")
+    ic = daily_ic(aligned_factor, aligned_fwd, method, min_names=min_names)
     if ic.notna().sum() < _MIN_VALID_DATES:
-        return -parsimony * complexity, {"ic": 0.0, "ic_ir": 0.0}
-    raw = ic.abs().mean() if absolute else ic.mean()
-    raw = float(raw) if np.isfinite(raw) else 0.0
-    fitness = raw - parsimony * complexity
-    return fitness, {"ic": raw, "ic_ir": ic_ir(ic)}
+        return -penalty, _empty_metrics()
+    metrics = _ic_metrics(ic, active_names, absolute=absolute)
+    raw = metrics["ic"]
+    metrics.update(
+        {
+            "raw_objective": float(raw),
+            "expanded_complexity": float(complexity),
+            "expanded_unique_nodes": float(unique_complexity),
+            "complexity_penalty": float(penalty),
+        }
+    )
+    fitness = raw - penalty
+    return fitness, metrics
 
 
 def score_tree(
@@ -179,21 +307,28 @@ def score_tree(
     method: str = "spearman",
     absolute: bool = True,
     parsimony: float = 0.0,
+    complexity_penalty_mode: str = "per_node",
+    complexity_penalty_value: float | None = None,
+    max_nodes: int | None = None,
     min_names: int = 5,
 ) -> tuple[float, dict[str, float]]:
-    """Return ``(fitness, metrics)`` for ``tree``: mean |IC| minus a node-count penalty.
+    """Return ``(fitness, metrics)``: ``abs(mean(IC))`` minus node penalty.
 
     ``min_names`` (the cross-section breadth floor) and a minimum number of valid dates guard
     against factors that earn a spuriously perfect IC on a near-empty cross-section.
     """
     expanded = expand_all(tree)
     return _score_factor(
-        expanded.unique_size(),
+        expanded.size(),
+        expanded.unique_computation_size(),
         evaluate(expanded, panel),
         fwd,
         method=method,
         absolute=absolute,
         parsimony=parsimony,
+        complexity_penalty_mode=complexity_penalty_mode,
+        complexity_penalty_value=complexity_penalty_value,
+        max_nodes=max_nodes,
         min_names=min_names,
     )
 
@@ -206,6 +341,9 @@ def score_trees(
     method: str = "spearman",
     absolute: bool = True,
     parsimony: float = 0.0,
+    complexity_penalty_mode: str = "per_node",
+    complexity_penalty_value: float | None = None,
+    max_nodes: int | None = None,
     min_names: int = 5,
     workers: int = 1,
     memory_budget_bytes: int | None = None,
@@ -229,18 +367,28 @@ def score_trees(
     score_many = getattr(cpp_backend, "score_many", None)
     supports_scoring = getattr(cpp_backend, "supports_native_scoring", None)
     if callable(score_many) and callable(supports_scoring) and supports_scoring(method):
-        native_results = score_many(
-            ordered,
-            panel,
-            fwd,
-            method=method,
-            absolute=absolute,
-            parsimony=parsimony,
-            min_names=min_names,
-            min_valid_dates=_MIN_VALID_DATES,
-            workers=workers,
-            memory_budget_bytes=memory_budget_bytes,
-        )
+        native_kwargs = {
+            "method": method,
+            "absolute": absolute,
+            "parsimony": parsimony,
+            "min_names": min_names,
+            "min_valid_dates": _MIN_VALID_DATES,
+            "workers": workers,
+            "memory_budget_bytes": memory_budget_bytes,
+        }
+        if (
+            complexity_penalty_mode != "per_node"
+            or complexity_penalty_value is not None
+            or max_nodes is not None
+        ):
+            native_kwargs.update(
+                {
+                    "complexity_penalty_mode": complexity_penalty_mode,
+                    "complexity_penalty_value": complexity_penalty_value,
+                    "max_nodes": max_nodes,
+                }
+            )
+        native_results = score_many(ordered, panel, fwd, **native_kwargs)
 
     if native_results is None or len(native_results) != len(ordered):
         native_results = [None] * len(ordered)
@@ -259,6 +407,9 @@ def score_trees(
                 method=method,
                 absolute=absolute,
                 parsimony=parsimony,
+                complexity_penalty_mode=complexity_penalty_mode,
+                complexity_penalty_value=complexity_penalty_value,
+                max_nodes=max_nodes,
                 min_names=min_names,
             )
         )

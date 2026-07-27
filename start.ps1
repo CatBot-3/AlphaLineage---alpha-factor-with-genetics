@@ -81,12 +81,17 @@ if (-not $NoOpen) {
 
 Write-Host ""
 Write-Host "AlphaLineage is starting at http://localhost:$Port"
-Write-Host "Quit from the in-app gear menu, or press Ctrl+C here."
+Write-Host "Quit from the in-app header, or press Ctrl+C here."
 Write-Host ""
 
 # --- run the server in the foreground (Quit / Ctrl+C ends it) ---------------------
 try {
-    & $Python -m uvicorn alphalineage.api.app:app --host 127.0.0.1 --port $Port
+    $ServerArgs = @("-m", "uvicorn", "alphalineage.api.app:app", "--host", "127.0.0.1", "--port", "$Port")
+    $EnvFile = Join-Path $PSScriptRoot ".env"
+    if (Test-Path -LiteralPath $EnvFile) {
+        $ServerArgs += @("--env-file", $EnvFile)
+    }
+    & $Python @ServerArgs
 }
 finally {
     # Best-effort: if this run's server is somehow still bound on exit, reclaim the port

@@ -21,8 +21,11 @@ export type SessionPhase = "idle" | "running" | "done" | "stopped" | "failed";
 
 const POLL_MS = 1000;
 
-export function useSession(onComplete?: (result: RunResult) => void) {
-  const [sessionId, setSessionId] = useState<string | null>(null);
+export function useSession(
+  onComplete?: (result: RunResult) => void,
+  initialSessionId: string | null = null,
+) {
+  const [sessionId, setSessionId] = useState<string | null>(initialSessionId);
   const [pollToken, setPollToken] = useState(0);
   const [state, setState] = useState<SessionState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -50,26 +53,33 @@ export function useSession(onComplete?: (result: RunResult) => void) {
         if (!active) return;
         setState(next);
         const status = next.job?.status;
+        const finalizationStatus = next.finalization_job?.status;
         if (status === "done") {
-          if (next.result?.report && !firedRef.current) {
+          // Completed searches now publish a validation round. A locked-holdout report is
+          // intentionally absent until the user explicitly finalizes a selected round.
+          if (next.result && !firedRef.current) {
             firedRef.current = true;
             onCompleteRef.current?.(next.result);
           }
-          return; // stop polling
-        }
-        if (status === "stopped") {
+        } else if (status === "stopped") {
           // A stop during research-only validation intentionally has no locked-test report.
           // Keep that session resumable without publishing an incomplete result to Dashboard.
-          if (next.result?.report && !firedRef.current) {
+          if (next.result && !firedRef.current) {
             firedRef.current = true;
             onCompleteRef.current?.(next.result);
           }
-          return;
-        }
-        if (status === "failed") {
+        } else if (status === "failed") {
           setError("the run failed; see the backend logs");
           return;
         }
+        if (finalizationStatus === "failed") {
+          setError(next.finalization_job?.error ?? "holdout finalization failed");
+          return;
+        }
+        const searchActive = status === "queued" || status === "running";
+        const finalizationActive =
+          finalizationStatus === "queued" || finalizationStatus === "running";
+        if (!searchActive && !finalizationActive) return;
       } catch (e) {
         if (!active) return;
         // A 404 means the session no longer exists (e.g. its data was cleared) - drop back to
@@ -141,9 +151,31 @@ export function useSession(onComplete?: (result: RunResult) => void) {
     setPollToken((t) => t + 1);
   }, []);
 
+  const refresh = useCallback(() => {
+    setPollToken((token) => token + 1);
+  }, []);
+
   const phase: SessionPhase = error
     ? "failed"
     : (state?.job?.status as SessionPhase | undefined) ?? (sessionId ? "running" : "idle");
+  const finalizationStatus = state?.finalization_job?.status ?? null;
+  const finalizing = finalizationStatus === "queued" || finalizationStatus === "running";
 
-  return { sessionId, state, error, notice, phase, start, cont, stop, attach, reset };
+  return {
+    sessionId,
+    state,
+    error,
+    notice,
+    phase,
+    finalizationStatus,
+    finalizing,
+    start,
+    cont,
+    stop,
+    attach,
+    refresh,
+    reset,
+  };
 }
+
+export type SessionController = ReturnType<typeof useSession>;

@@ -21,9 +21,9 @@ def release_smoke() -> dict[str, Any]:
     if not cpp.available():
         raise RuntimeError(f"native evaluator unavailable: {cpp.unavailable_reason()}")
     native_abi = cpp.native_abi_version()
-    if native_abi is None or native_abi < 5:
+    if native_abi is None or native_abi < 6:
         raise RuntimeError(
-            f"native evaluator ABI {native_abi!r} lacks the catalog-v2 cumulative kernel"
+            f"native evaluator ABI {native_abi!r} lacks directional scoring metrics"
         )
 
     specs = {str(item["id"]): item for item in bundled_snapshot_specs()}

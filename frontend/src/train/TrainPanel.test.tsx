@@ -24,6 +24,7 @@ vi.mock("../api/client", () => ({
   createSession: (req: SessionCreateRequest) => createSession(req),
   continueSession: (id: string, req: SessionContinueRequest) => continueSession(id, req),
   getSession: (id: string) => getSession(id),
+  listSessions: () => Promise.resolve([]),
   stopSession: (id: string) => stopSession(id),
   listUniverses: () => Promise.resolve([]),
   getUniverseCoverage: () =>
@@ -190,5 +191,40 @@ describe("TrainPanel (B2)", () => {
     fireEvent.click(screen.getByTestId("new-session"));
     // back to the form, ready to launch a fresh session
     expect(await screen.findByTestId("run-config-form")).toBeInTheDocument();
+  });
+
+  it("keeps an invalid legacy report viewable but restarts from copied settings", async () => {
+    getSession.mockResolvedValue({
+      ...DONE_SESSION,
+      name: "legacy run",
+      universe: "sp500-lite",
+      as_of: "2026-07-15",
+      config: { population_size: 44, generations: 7 },
+      seed_factor_ids: [],
+      rounds: [
+        {
+          index: 0,
+          segment_index: 0,
+          report_available: true,
+          test_read_index: 1,
+          evidence_status: "locked",
+          status: "done",
+          requested_generations: 7,
+          gen_start: 0,
+          gen_end: 7,
+          validity: "invalid_legacy_semantics",
+          restart_required: true,
+          invalid_reason: "Old price semantics.",
+        },
+      ],
+    });
+
+    render(<TrainPanel restoreSessionId="s1" />);
+    expect(await screen.findByText("Old price semantics.")).toBeInTheDocument();
+    expect(screen.queryByTestId("continue-run")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("restart-session"));
+    expect(await screen.findByTestId("run-config-form")).toBeInTheDocument();
+    expect(screen.getByLabelText("Session name")).toHaveValue("legacy run copy");
   });
 });

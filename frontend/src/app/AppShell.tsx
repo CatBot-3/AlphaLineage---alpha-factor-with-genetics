@@ -49,11 +49,11 @@ export function AppShell({
   return (
     <div className="app-shell" data-testid="app-shell">
       <header className="site-header">
+        <button className="nav__brand" type="button" onClick={() => onTabChange("dashboard")}>
+          <span className="nav__brand-mark" aria-hidden="true" />
+          <span>AlphaLineage</span>
+        </button>
         <nav className="nav" aria-label="Primary">
-          <button className="nav__brand" type="button" onClick={() => onTabChange("dashboard")}>
-            <span className="nav__brand-mark" aria-hidden="true" />
-            <span>AlphaLineage</span>
-          </button>
           <span className="nav__divider" aria-hidden="true" />
           <div className="nav__list" data-testid="main-nav">
             {TABS.map((item) =>
@@ -92,8 +92,16 @@ export function AppShell({
             onLoadLocal={onLoadLocal}
             onSaveBackend={onSaveBackend}
             onLoadBackend={onLoadBackend}
-            onQuit={onQuit}
           />
+          {backend && (
+            <button
+              type="button"
+              className="header-action header-action--quit"
+              onClick={onQuit}
+            >
+              Quit
+            </button>
+          )}
         </div>
       </header>
 

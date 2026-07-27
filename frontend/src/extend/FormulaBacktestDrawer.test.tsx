@@ -70,6 +70,10 @@ describe("FormulaBacktestDrawer", () => {
       bindings: {},
       universe: "sample",
       horizon: 1,
+      strategies: [
+        { id: "quantile_ls_20", scheme: "quantile_ls", quantile: 0.2 },
+        { id: "rank_proportional", scheme: "rank_proportional", quantile: null },
+      ],
       weighting_scheme: "quantile_ls",
       quantile: 0.2,
       commission_bps: 1,

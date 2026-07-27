@@ -20,6 +20,8 @@ def max_drawdown(returns: pd.Series) -> float:
     r = pd.Series(returns, dtype="float64").fillna(0.0)
     if r.empty:
         return 0.0
+    if r.le(-1.0).any():
+        return -1.0
     equity = (1.0 + r).cumprod()
     drawdown = equity / equity.cummax() - 1.0
     return float(drawdown.min())

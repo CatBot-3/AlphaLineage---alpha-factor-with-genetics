@@ -31,7 +31,7 @@
   --space-8: 64px;
 
   --edge-padding: clamp(18px, 4vw, 48px);
-  --header-height: 58px;
+  --header-height: 68px;
   --footer-height: 42px;
   --z-header: 50;
   --z-popover: 100;

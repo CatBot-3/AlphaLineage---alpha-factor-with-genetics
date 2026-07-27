@@ -1,118 +1,235 @@
 # AlphaLineage
 
-Evolutionary genetic-programming alpha-factor mining platform. Strategies are strongly typed
-expression trees, evolved via genetic programming, scored by information coefficient (IC), and
-validated with a built-in anti-overfitting suite. You drive the whole thing from a browser —
-define a universe, add custom operators, train, watch it evolve, save the factors you like, and
-seed new searches from them — without ever touching the backend directly.
+> A local-first visual research workbench for building, evolving, validating, and inspecting
+> quantitative formulas.
 
-The Python package is `alphalineage`. **New here?** Read [docs/TUTORIAL.md](docs/TUTORIAL.md) — it
-explains every component in plain language and walks through the UI step by step.
+AlphaLineage combines a reusable formula system, deterministic genetic programming, chronological
+validation, market-neutral backtesting, and lineage inspection in one browser interface. It is
+designed for researchers who want to understand **what was searched, why a formula was selected,
+and when holdout evidence was opened**—not just receive an unexplained backtest number.
 
-## Status
+The Python package is `alphalineage`. For a guided walkthrough, see
+[the tutorial](docs/TUTORIAL.md).
 
-V1: cached point-in-time data, typed factor trees, GP search, anti-overfitting validation,
-backtests with costs, a FastAPI + in-process-jobs backend, an optional C++ evaluator, and a React
-UI for training, iterating, the factor library, and an honest metrics/genealogy view.
+## What it provides
 
----
+| Area | Capabilities |
+| --- | --- |
+| Formula research | Strongly typed visual graphs, reusable formulas, pinned revisions, inline parameters, and a managed technical-indicator catalog |
+| Evolution | Deterministic genetic programming with protected stepping stones, parameter neighborhoods, formula composition, checkpoint continuation, and bounded multicore native scoring |
+| Validation | Three chronological folds, fixed training polarity, coverage and portfolio-feasibility gates, and explicit strategy comparison |
+| Backtesting | Quantile long/short and rank-proportional portfolios, transaction costs, benchmark overlays, and invalid/no-exposure detection |
+| Evidence control | Validation-only rounds, user-pinned finalization plans, immutable results, and clearly labelled repeated holdout reads |
+| Data | Prepared S&P 500, DJIA, and Nasdaq-100 snapshots, custom point-in-time memberships, incremental price synchronization, and data-integrity checks |
 
-## Run it (recipe)
+The research flow is deliberately staged:
 
-### 0. Windows one-command launcher
-
-Double-click **`start.cmd`** (or run `powershell -ExecutionPolicy Bypass -File start.ps1`). It builds
-the UI, runs one server that hosts both the API and the UI on **http://localhost:8000**, and opens a
-browser tab. Stop it from the in-app gear menu (⚙ → **Quit**) or with `Ctrl+C`.
-
-### 1. Docker — the one-command path (recommended)
-
-You need only [Docker](https://docs.docker.com/get-docker/) installed.
-
-```bash
-git clone <this-repo> && cd alphalineage
-cp .env.example .env          # optional: paste a free Tiingo key to download fresh data
-docker compose up             # builds the UI + backend into one image and serves it
+```text
+Universe + reusable formulas
+            ↓
+Deterministic evolutionary search
+            ↓
+Three chronological validation folds
+            ↓
+User-pinned portfolio strategy
+            ↓
+Explicit locked-holdout finalization
+            ↓
+Immutable result, formula graph, and genealogy
 ```
 
-Open **http://localhost:8000**. That is the whole app — the FastAPI backend serves the built UI
-on the same origin. The bundled `data_cache/` already contains a small `sp500-lite` universe, so
-you can train immediately without a data key. Your saved factors, sessions, and any downloaded
-data persist on the host under `./data_cache/`.
+## Product tour
 
-To stop: `Ctrl-C`, then `docker compose down`.
+### 1. Prepare a research universe
 
-### 2. No Docker — Python + Node fallback
+Load a bundled current snapshot for quick exploration, or import dated point-in-time membership
+history when survivorship bias matters. Price coverage and synchronization live beside the universe
+definition so readiness is visible before training begins.
 
-Requires Python 3.11+ and Node 20+. Any virtualenv tool works (`uv`, `venv`, or conda):
+<p align="center">
+  <img src="docs/images/readme/universe-editor.png" alt="AlphaLineage Universe Editor with prepared S&amp;P 500, DJIA, Nasdaq-100, and price synchronization controls" width="100%">
+</p>
 
-```bash
-# backend
-python -m venv .venv && . .venv/Scripts/activate   # (Linux/macOS: source .venv/bin/activate)
+### 2. Build formulas from formulas
+
+The Formula Builder uses the same typed expression model as training and backtesting. Market fields,
+built-in operators, starter indicators, and saved formulas are composable blocks. A formula can be
+saved, nested inside another formula, backtested as a draft, or opened as an editable copy.
+
+<p align="center">
+  <img src="docs/images/readme/formula-builder.png" alt="AlphaLineage Formula Builder showing a composed RSI formula as a typed node graph" width="100%">
+</p>
+
+### 3. Validate before opening the holdout
+
+Completed training rounds remain validation-only until the user explicitly finalizes one. The
+Metrics page explains why the candidate won, shows fold-by-fold stability and coverage, and compares
+up to four predeclared portfolio strategies without automatically selecting the best-looking curve.
+
+<p align="center">
+  <img src="docs/images/readme/validation-strategy-comparison.png" alt="AlphaLineage validation metrics with three folds and side-by-side portfolio strategy curves" width="100%">
+</p>
+
+<sub>Example research output only. The chart is validation evidence, not a claim of future or live
+investment performance.</sub>
+
+### 4. Inspect the exact selected formula
+
+The Best Formula Result page reuses the Formula Builder's graph language in read-only mode. It shows
+the oriented expression, inline values, managed-formula revisions, and node-level definitions while
+keeping the immutable result separate from editable copies.
+
+<p align="center">
+  <img src="docs/images/readme/best-formula-result.png" alt="AlphaLineage Best Formula Result displayed as an immutable visual formula graph" width="100%">
+</p>
+
+### 5. Trace how the formula evolved
+
+Genealogy connects the selected result to crossover, mutation, parameter-neighbor, composition, and
+retained-champion events. The generation list, ancestry canvas, and read-only formula inspector stay
+synchronized so a result can be audited from metric back to expression.
+
+<p align="center">
+  <img src="docs/images/readme/genealogy.png" alt="AlphaLineage Genealogy workspace with generation list, ancestry graph, and selected formula inspector" width="100%">
+</p>
+
+## Why AlphaLineage is different
+
+- **Formulas are reusable research objects.** A saved MACD, RSI, or custom expression can become a
+  building block in a larger formula while its dependency revisions remain pinned.
+- **Evolution can cross weak intermediate states.** Aggressive exploration protects diverse niches,
+  searches parameter frontiers, composes complete formulas, and occasionally applies two edits
+  before scoring.
+- **Validation and holdout have different jobs.** Training and chronological validation select the
+  candidate; the locked holdout is opened only through an explicit finalization plan.
+- **A flat line is not automatically evidence.** Constant factors, insufficient coverage,
+  nonfinite values, non-neutral portfolios, and cash-only paths are rejected or labelled
+  unavailable rather than presented as meaningful 0% performance.
+- **Runs are reproducible and inspectable.** Native worker counts do not change the evolutionary
+  trajectory, the pure-Python fallback remains deterministic and serial, completed rounds are
+  immutable, and continuation resumes the latest checkpoint.
+- **Research stays local.** The FastAPI backend, React UI, cached data, sessions, formulas, and
+  results run on the user's computer.
+
+## Quick start
+
+### Windows launcher
+
+Requires Python 3.11+, Node 20+, and the backend dependencies installed once:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-cp .env.example .env                                # optional Tiingo key
-uvicorn alphalineage.api.app:app --port 8000        # API on :8000
+.\start.cmd
 ```
 
+After that one-time setup, the launcher installs missing frontend packages, builds the UI, starts
+the API and web app at
+[http://localhost:8000](http://localhost:8000), and opens a browser. Use **Quit** in the application
+header or press `Ctrl+C` in the launcher terminal to stop it.
+
+### Docker
+
 ```bash
-# frontend (second terminal)
+git clone https://github.com/CatBot-3/AlphaLineage---alpha-factor-with-genetics.git
+cd AlphaLineage---alpha-factor-with-genetics
+cp .env.example .env       # optional: add a Tiingo API key
+docker compose up --build
+```
+
+Open [http://localhost:8000](http://localhost:8000). Cached market data, universes, formulas,
+sessions, and results persist under `./data_cache/`.
+
+### Development setup
+
+Backend:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+Copy-Item .env.example .env    # optional
+uvicorn alphalineage.api.app:app --env-file .env --port 8000
+```
+
+Frontend, in a second terminal:
+
+```powershell
 cd frontend
 npm install
-npm run dev:app                                     # UI on :5173, talks to the backend on :8000
+npm run dev:app
 ```
 
-Open **http://localhost:5173**.
+Open [http://localhost:5173](http://localhost:5173).
 
-> `uv venv && uv pip install -e ".[dev]"` is the fastest install when `uv` is available.
+For Linux or macOS, activate the environment with `source .venv/bin/activate` and copy the
+environment template with `cp .env.example .env`.
 
-### Zero-backend demo
+### Static demo
 
-A static snapshot of one finished run (metrics, factor tree, genealogy) — no backend, deploys to
-any static host:
+The demo build renders a bundled completed run without a backend:
 
 ```bash
-cd frontend && npm run build:demo      # outputs dist/, reads public/demo-run.json
-npm run preview                        # or serve dist/ anywhere
+cd frontend
+npm run build:demo
+npm run preview
 ```
 
-Regenerate the demo snapshot from a real run with
-`python scripts/export_demo.py --workspace run-<id> --out frontend/public/demo-run.json`.
+For a saved workspace that contains a finalized report, regenerate its demo data with:
 
----
+```bash
+python scripts/export_demo.py --workspace run-<id> --out frontend/public/demo-run.json
+```
 
-## First run, in the browser
+## A first research run
 
-1. **Train** tab → pick a universe (`sp500-lite` is bundled), set the GP knobs (or keep the
-   defaults), **Start training**. Watch the generation bar and fitness sparkline.
-2. **Metrics / Best factor / Genealogy** → inspect the result. Metrics default to out-of-sample,
-   deflated values (the honest numbers); the genealogy groups each generation by how individuals
-   were bred and lets you trace any factor's ancestry.
-3. **Continue** from the finished run with more generations or changed settings — or **save** a
-   factor to the Library and **seed** a brand-new session from it.
-4. **Extend** tab → define a custom point-in-time universe or compose a new typed operator.
+1. Open **Extend → Universe Editor**, load a prepared universe, and synchronize any missing prices.
+2. Optionally use **Extend → Formula Builder** to create or reuse a formula.
+3. Open **Train**, select the universe, search budget, enabled formulas, and resource profile.
+4. Review the completed validation round in **Metrics**.
+5. Compare portfolio strategies and explicitly pin the primary strategy.
+6. Finalize only when ready to open the locked holdout.
+7. Inspect the immutable result in **Best Formula Result** and its ancestry in **Genealogy**.
+8. Continue from the latest checkpoint or save it as a **Formula Result** in the **Library**.
 
-See [docs/TUTORIAL.md](docs/TUTORIAL.md) for the full walkthrough.
+## Architecture
+
+- **Research engine:** Python, NumPy, pandas, SciPy
+- **API and jobs:** FastAPI with persisted sessions, checkpoints, rounds, and finalizations
+- **Frontend:** React, TypeScript, Vite, React Flow
+- **Acceleration:** optional packaged C++ evaluator with deterministic bounded multicore scoring
+- **Storage:** local Parquet market-data caches and revisioned JSON artifacts
 
 ## Quality gates
 
 ```bash
-pytest -q                       # backend tests (synthetic-signal recovery + noise rejection are load-bearing)
-ruff check . && ruff format --check .
+pytest -q
+ruff check .
+ruff format --check .
 mypy src
-cd frontend && npm run typecheck && npm test
+
+cd frontend
+npm run typecheck
+npm test
+npm run build:app
 ```
 
-## Pull more data
+Release builds can additionally verify packaged resources and the native evaluator with:
 
 ```bash
-python scripts/download_universe.py --universe sp500-lite --years 15
+python -m alphalineage.smoke
 ```
 
-Data is cached under `data_cache/` (gitignored), fetched once and never called inside the GP loop.
-A free [Tiingo](https://www.tiingo.com) key in `.env` enables downloads; yfinance is the fallback.
+## Data notes
+
+Bundled current-index snapshots are convenient static universes: they apply one membership snapshot
+across the chosen period and are therefore survivorship-biased. For historically honest membership,
+import point-in-time entry and exit dates. Market data is cached under `data_cache/`; Tiingo can be
+configured in `.env`, with yfinance available as a fallback.
 
 ## Disclaimer
 
-This software is for research and educational use only. It is **not investment advice** and not a
-brokerage. Nothing here is a recommendation to buy or sell any security, and there is no promise
-of beating the market.
+AlphaLineage is for research and educational use only. It is **not investment advice**, a brokerage,
+or a recommendation to buy or sell any security. Backtests and validation results do not guarantee
+future performance.

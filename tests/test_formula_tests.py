@@ -101,6 +101,44 @@ def test_unsaved_draft_test_keep_and_formula_results_alias(client):
     assert client.delete(f"/formula-results/{saved['id']}").status_code == 200
 
 
+def test_formula_test_supports_ordered_strategy_set_with_primary_alias(client):
+    response = client.post(
+        "/formula-tests",
+        json={
+            "source": {
+                "kind": "draft",
+                "body": {"name": "rank", "children": [{"name": "close"}]},
+                "inputs": [],
+                "out_type": "signal",
+            },
+            "bindings": {},
+            "strategies": [
+                {"id": "q20", "scheme": "quantile_ls", "quantile": 0.2},
+                {"id": "rank", "scheme": "rank_proportional"},
+            ],
+            "primary_strategy_id": "rank",
+        },
+    )
+    assert response.status_code == 200, response.text
+    completed = _wait(client, response.json()["job_id"])
+    assert completed["status"] == "done", completed
+    result = completed["result"]
+    assert result["primary_strategy_id"] == "rank"
+    assert result["weighting_scheme"] == "rank_proportional"
+    assert result["quantile"] is None
+    assert result["configuration"]["weighting_scheme"] == "rank_proportional"
+    assert result["configuration"]["quantile"] is None
+    assert [item["strategy_id"] for item in result["strategy_results"]] == [
+        "q20",
+        "rank",
+    ]
+    primary = next(
+        item for item in result["strategy_results"] if item["role"] == "primary"
+    )
+    assert result["oos_backtest"] == primary["oos_backtest"]
+    assert result["metrics"] == primary["oos_backtest"]["metrics"]
+
+
 def test_formula_test_uses_pre_start_history_only_for_rolling_warmup(
     client, synthetic_panel, monkeypatch
 ):

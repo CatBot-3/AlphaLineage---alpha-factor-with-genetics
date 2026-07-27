@@ -61,6 +61,7 @@ def backtest_report(
 
     gross, net = tested.gross_returns.align(tested.net_returns, join="outer")
     realization_dates = tested.realization_dates.reindex(gross.index)
+    active_exposure = tested.active_exposure.reindex(gross.index).fillna(False)
     dated_returns = []
     for signal_date in gross.index:
         realization_date = realization_dates.loc[signal_date]
@@ -72,26 +73,48 @@ def backtest_report(
                 "date": pd.Timestamp(realization_date).date().isoformat(),
                 "gross": json_number(gross.loc[signal_date]),
                 "net": json_number(net.loc[signal_date]),
+                "active": bool(active_exposure.loc[signal_date]),
             }
         )
 
     normalized_equity: list[dict[str, Any]] = []
+    equity_terminated_reason: str | None = None
     if dated_returns:
         # The explicit pre-return baseline prevents the first realized return from disappearing
         # when the chart converts levels to cumulative percentage performance.
         normalized_equity.append({"date": dated_returns[0]["signal_date"], "value": 1.0})
         level = 1.0
-        for point in dated_returns:
+        # An all-cash path is not an equity curve. Keep only the explicit
+        # pre-return baseline and let portfolio_health explain why no evidence exists.
+        equity_points = (
+            dated_returns
+            if int(tested.portfolio_health["active_observations"]) > 0
+            else []
+        )
+        for point in equity_points:
             daily_net = point["net"]
-            if daily_net is not None:
-                level *= 1.0 + daily_net
+            if daily_net is None:
+                equity_terminated_reason = "missing_realized_return"
+                break
+            if daily_net <= -1.0:
+                # Equity cannot become negative and then resume compounding as if the
+                # strategy had received fresh capital.  Pin the terminal insolvency level.
+                level = 0.0
+                normalized_equity.append({"date": point["date"], "value": level})
+                equity_terminated_reason = "insolvent"
+                break
+            level *= 1.0 + daily_net
             normalized_equity.append({"date": point["date"], "value": json_number(level)})
     return {
         "start": (
             normalized_equity[0]["date"] if normalized_equity else None
         ),
         "end": normalized_equity[-1]["date"] if normalized_equity else None,
-        "observations": int(net.notna().sum()),
+        # Compatibility field now means observations with actual portfolio
+        # exposure. Calendar/cash observations remain explicit below.
+        "observations": int((net.notna() & active_exposure).sum()),
+        "calendar_observations": int(realization_dates.notna().sum()),
+        "active_observations": int(tested.portfolio_health["active_observations"]),
         "metrics": {
             "signed_ic": json_number(signed_ic),
             "mean_abs_ic": json_number(mean_abs_ic),
@@ -106,7 +129,21 @@ def backtest_report(
             "avg_positions": json_number(tested.position.get("avg_positions")),
             "max_position": json_number(tested.position.get("max_position")),
             "usable": tested.usable,
+            "insolvent": tested.insolvent,
+            "missing_return_observations": tested.missing_return_observations,
+            "exposure_coverage": json_number(
+                tested.portfolio_health["exposure_coverage"]
+            ),
+            "two_sided_coverage": json_number(
+                tested.portfolio_health["two_sided_coverage"]
+            ),
         },
         "returns": dated_returns,
         "normalized_equity": normalized_equity,
+        "integrity": {
+            "valid": not tested.integrity_issues,
+            "issues": list(tested.integrity_issues),
+            "equity_terminated_reason": equity_terminated_reason,
+        },
+        "portfolio_health": dict(tested.portfolio_health),
     }

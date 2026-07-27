@@ -127,10 +127,15 @@ if ($Mode -eq "app") {
         Set-ProcessEnv -Name "TMP" -Value $TempDir
         Set-ProcessEnv -Name "PYTHONPATH" -Value (Join-Path $RepoRoot "src")
         Clear-StaleBackendPort -Port $BackendPort
+        $BackendArgs = @("-m", "uvicorn", "alphalineage.api.app:app", "--reload", "--port", "$BackendPort")
+        $EnvFile = Join-Path $RepoRoot ".env"
+        if (Test-Path -LiteralPath $EnvFile) {
+            $BackendArgs += @("--env-file", $EnvFile)
+        }
         Start-LoggedCommand `
             -Name "backend" `
             -FilePath $Python `
-            -ArgumentList @("-m", "uvicorn", "alphalineage.api.app:app", "--reload", "--port", "$BackendPort") `
+            -ArgumentList $BackendArgs `
             -WorkingDirectory $RepoRoot
     } finally {
         Set-ProcessEnv -Name "TEMP" -Value $oldTemp

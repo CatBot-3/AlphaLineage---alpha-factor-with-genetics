@@ -65,7 +65,11 @@ def _to_frame(raw: pd.DataFrame) -> pd.DataFrame:
     if raw is None or raw.empty:
         empty = pd.DataFrame(columns=schema.PRICE_COLUMNS)
         empty.index = pd.DatetimeIndex([], name=schema.INDEX_NAME)
-        return schema.validate(empty.astype("float64"))
+        return schema.with_price_metadata(
+            schema.validate(empty.astype("float64")),
+            price_basis="split_adjusted",
+            provider="yfinance",
+        )
 
     mapped = pd.DataFrame(index=raw.index)
     for src, dst in _FIELD_MAP.items():
@@ -78,4 +82,12 @@ def _to_frame(raw: pd.DataFrame) -> pd.DataFrame:
         splits = pd.to_numeric(raw["Stock Splits"], errors="coerce").fillna(0.0)
         mapped["split_factor"] = splits.where(splits > 0.0, 1.0)
 
-    return schema.normalize(mapped)
+    # ``Ticker.history(auto_adjust=False)`` retains cash-dividend effects but Yahoo's
+    # historical OHLCV is already normalized for splits.  Keep the action ratio for
+    # provenance/auditing and declare the basis so the canonical adjuster does not apply
+    # that split a second time.
+    return schema.with_price_metadata(
+        schema.normalize(mapped),
+        price_basis="split_adjusted",
+        provider="yfinance",
+    )

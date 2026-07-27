@@ -371,6 +371,24 @@ def test_checkpoint_rescores_when_numerical_backend_changes(signal_panel, tmp_pa
     assert resumed.trial_count == previous_trials
 
 
+def test_checkpoint_rejects_incompatible_evolution_version(signal_panel, tmp_path):
+    import json
+
+    panel, _ = signal_panel
+    checkpoint = tmp_path / "old-evolution.json"
+    gp = GP(
+        GPConfig(population_size=12, generations=1, max_depth=3, max_nodes=12, seed=52),
+        panel,
+    )
+    gp.run(checkpoint_path=checkpoint)
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    state["evolution_version"] = EVOLUTION_VERSION - 1
+    checkpoint.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="restart with the same setup"):
+        GP.from_checkpoint(checkpoint, panel)
+
+
 def test_stop_callback_halts_early(signal_panel):
     panel, _ = signal_panel
     config = GPConfig(population_size=20, generations=50, max_depth=4, max_nodes=20, seed=6)

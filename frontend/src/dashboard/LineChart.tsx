@@ -27,6 +27,8 @@ export function LineChart({
   description,
   series,
   baseline,
+  domainFloor,
+  baselineAwarePadding = false,
   height = 230,
   formatValue = defaultFormat,
 }: {
@@ -34,6 +36,8 @@ export function LineChart({
   description: string;
   series: ChartSeries[];
   baseline?: number;
+  domainFloor?: number;
+  baselineAwarePadding?: boolean;
   height?: number;
   formatValue?: (value: number) => string;
 }) {
@@ -70,10 +74,22 @@ export function LineChart({
     minimum -= paddingValue;
     maximum += paddingValue;
   } else {
-    const paddingValue = (maximum - minimum) * 0.06;
-    minimum -= paddingValue;
-    maximum += paddingValue;
+    const range = maximum - minimum;
+    if (baselineAwarePadding && finite(baseline) && minimum <= baseline && baseline <= maximum) {
+      // Pad each side from its own distance to the baseline. A huge gain should not
+      // manufacture an impossible negative tick merely because the full range is large.
+      const lowerDistance = baseline - minimum;
+      const upperDistance = maximum - baseline;
+      minimum -= lowerDistance > 0 ? Math.max(lowerDistance * 0.08, 0.0025) : 0;
+      maximum += upperDistance > 0 ? Math.max(upperDistance * 0.06, 0.0025) : 0;
+    } else {
+      const paddingValue = range * 0.06;
+      minimum -= paddingValue;
+      maximum += paddingValue;
+    }
   }
+  if (finite(domainFloor)) minimum = Math.max(domainFloor, minimum);
+  if (minimum >= maximum) maximum = minimum + Math.max(Math.abs(minimum) * 0.05, 0.01);
   const xFor = (label: string | number) => {
     const index = labelIndex.get(String(label)) ?? 0;
     return padding.left + (index / Math.max(labels.length - 1, 1)) * (width - padding.left - padding.right);
@@ -89,7 +105,13 @@ export function LineChart({
         <strong id={titleId}>{title}</strong>
         <span id={descriptionId}>{description}</span>
       </figcaption>
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-labelledby={`${titleId} ${descriptionId}`}>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-labelledby={`${titleId} ${descriptionId}`}
+        data-domain-min={minimum}
+        data-domain-max={maximum}
+      >
         {yTicks.map((tick) => {
           const y = yFor(tick);
           return <g key={tick}><line className="chart-grid" x1={padding.left} x2={width - padding.right} y1={y} y2={y} /><text className="chart-axis-label" x={padding.left - 8} y={y + 4} textAnchor="end">{formatValue(tick)}</text></g>;

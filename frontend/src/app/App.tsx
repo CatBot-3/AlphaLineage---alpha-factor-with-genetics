@@ -1,13 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  finalizeSessionRound,
+  getSessionFinalization,
   getSessionLineage,
+  getSessionRound,
   getUniverse,
   getWorkspace,
+  listSessionFinalizations,
+  listSessionRounds,
   listWorkspaces,
   saveFactor,
   saveWorkspace,
   shutdown,
-  stopSession,
 } from "../api/client";
 import { loadRun } from "../api/dataSource";
 import {
@@ -16,6 +20,8 @@ import {
   type LineageNode,
   type OperatorComposerDraft,
   type RunResult,
+  type SessionFinalizationSummary,
+  type SessionRoundSummary,
   type SyncProgressSnapshot,
   type UniverseDraft,
   type WorkspaceSnapshot,
@@ -23,22 +29,47 @@ import {
 import { Dashboard } from "../dashboard/Dashboard";
 import { ExtendPanel, type ExtendPage } from "../extend/ExtendPanel";
 import { rowsFromUniverse } from "../extend/toUniversePayload";
-import { FactorDetail } from "../factor/FactorDetail";
-import { FactorTree } from "../factor/FactorTree";
+import { BestFormulaResultPage } from "../factor/BestFormulaResultPage";
 import type { TreeNodeData } from "../factor/treeToFlow";
 import { Genealogy } from "../genealogy/Genealogy";
-import { LineageDetail } from "../genealogy/LineageDetail";
 import { LibraryPanel } from "../library/LibraryPanel";
 import { TrainPanel } from "../train/TrainPanel";
+import { useSession } from "../train/useSession";
 import { AppShell, type Tab } from "./AppShell";
 import { ErrorBoundary } from "./ErrorBoundary";
+import { EvaluationNavigator } from "./EvaluationNavigator";
 import { getAppMode } from "./mode";
+import { PageHeader } from "./PageHeader";
+import { RoundNavigator } from "./RoundNavigator";
 import {
   makeWorkspaceSnapshot,
   migrateFormulaDrafts,
   readLocalWorkspace,
   writeLocalWorkspace,
 } from "./workspace";
+
+const PAGE_COPY: Record<Exclude<Tab, "extend">, { title: string; description: string }> = {
+  train: {
+    title: "Train",
+    description: "Configure a reproducible search, continue the latest checkpoint, and preserve every validation round.",
+  },
+  dashboard: {
+    title: "Metrics",
+    description: "Review validation robustness first, then explicitly evaluate a selected round on the locked holdout.",
+  },
+  factor: {
+    title: "Best Formula Result",
+    description: "Inspect the immutable formula selected by training and validation evidence for this round.",
+  },
+  genealogy: {
+    title: "Genealogy",
+    description: "Trace the selected formula through generations, operations, parents, and retained champions.",
+  },
+  library: {
+    title: "Formula Results",
+    description: "Review saved training and backtest evidence, or seed a new search from selected results.",
+  },
+};
 
 function tabFromWorkspace(snapshot: WorkspaceSnapshot | null, mode: string): Tab {
   if (snapshot?.ui.selectedTab) return snapshot.ui.selectedTab;
@@ -58,12 +89,31 @@ function defaultUniverseHistoryStart(universe: Awaited<ReturnType<typeof getUniv
     .sort()[0] ?? "2020-01-01";
 }
 
+function isSelectableRound(round: SessionRoundSummary): boolean {
+  return (
+    round.status === "done" ||
+    round.status === "completed" ||
+    round.report_available ||
+    round.finalization_available === true
+  );
+}
+
 export function App() {
   const mode = getAppMode();
   const [initialWorkspace] = useState(() => readLocalWorkspace());
   const [run, setRun] = useState<RunResult | null>(initialWorkspace?.run ?? null);
+  const [rounds, setRounds] = useState<SessionRoundSummary[]>([]);
+  const [evaluations, setEvaluations] = useState<SessionFinalizationSummary[]>([]);
+  const [selectedEvaluation, setSelectedEvaluation] = useState<string | null>(null);
+  const [selectedRound, setSelectedRound] = useState<number | null>(
+    initialWorkspace?.ui.selectedRound ??
+      initialWorkspace?.run?.round_index ??
+      initialWorkspace?.run?.segment ??
+      null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [finalizing, setFinalizing] = useState(false);
   const [tab, setTab] = useState<Tab>(tabFromWorkspace(initialWorkspace, mode));
   const [selectedNode, setSelectedNode] = useState<TreeNodeData | null>(
     applyNode(initialWorkspace?.ui.selectedFactorNode),
@@ -84,8 +134,6 @@ export function App() {
     () => migrateFormulaDrafts(initialWorkspace?.formulaDraft).recoveries,
   );
   const [seedIds, setSeedIds] = useState<string[]>([]);
-  const [searchRunning, setSearchRunning] = useState(false);
-  const [runningSessionId, setRunningSessionId] = useState<string | null>(null);
   const [bestFactorSaved, setBestFactorSaved] = useState(false);
   const [quitOpen, setQuitOpen] = useState(false);
   const [shutDown, setShutDown] = useState(false);
@@ -94,6 +142,13 @@ export function App() {
   const [status, setStatus] = useState<string | null>(
     initialWorkspace?.run ? "Loaded local workspace" : null,
   );
+  const handledFinalizationRef = useRef<string | null>(null);
+  const sessionController = useSession(
+    onRunComplete,
+    initialWorkspace?.ui.sessionId ?? initialWorkspace?.run?.session_id ?? null,
+  );
+  const searchRunning = sessionController.phase === "running";
+  const runningSessionId = sessionController.sessionId;
 
   const currentSnapshot = useCallback(
     () =>
@@ -109,7 +164,8 @@ export function App() {
             ? { name: selectedNode.name, value: selectedNode.value }
             : null,
           selectedLineage,
-          sessionId: run?.session_id ?? null,
+          sessionId: sessionController.sessionId ?? run?.session_id ?? null,
+          selectedRound,
         },
       }),
     [
@@ -119,6 +175,8 @@ export function App() {
       run,
       selectedLineage,
       selectedNode,
+      selectedRound,
+      sessionController.sessionId,
       tab,
       universeDraft,
     ],
@@ -134,8 +192,14 @@ export function App() {
     setFormulaDraft(migratedDrafts.active);
     setRecoveredFormulaDrafts(migratedDrafts.recoveries);
     setOperatorDraft(snapshot.operatorDraft);
+    setSelectedRound(
+      snapshot.ui.selectedRound ?? snapshot.run?.round_index ?? snapshot.run?.segment ?? null,
+    );
+    const restoredSessionId = snapshot.ui.sessionId ?? snapshot.run?.session_id ?? null;
+    if (restoredSessionId) sessionController.attach(restoredSessionId);
+    else sessionController.reset();
     setStatus(`Loaded ${snapshot.name}`);
-  }, []);
+  }, [sessionController]);
 
   // Demo mode auto-loads the static snapshot; app mode waits for the user to launch a run.
   const refreshDemo = useCallback(() => {
@@ -160,29 +224,254 @@ export function App() {
   }, [initialWorkspace?.run, mode, refreshDemo]);
 
   useEffect(() => {
+    const sessionId = sessionController.sessionId;
+    if (!sessionId) {
+      setRounds([]);
+      return;
+    }
+    let active = true;
+    listSessionRounds(sessionId)
+      .then((items) => {
+        if (!active) return;
+        setRounds(items);
+        const available = items.filter(isSelectableRound);
+        const latest = available[available.length - 1];
+        setSelectedRound((current) =>
+          current !== null && available.some((item) => item.index === current)
+            ? current
+            : latest?.index ?? null,
+        );
+      })
+      .catch(() => {
+        if (active) setRounds([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [sessionController.sessionId, sessionController.state?.segments.length]);
+
+  useEffect(() => {
     writeLocalWorkspace(currentSnapshot());
   }, [currentSnapshot]);
 
-  async function onRunComplete(result: RunResult) {
-    // GET /sessions/{id} strips the (large) lineage from the result; fetch it so the Genealogy
-    // view has data. Demo runs already carry lineage and have no session_id, so they skip this.
-    let full = result;
-    if (result.session_id && !result.lineage?.nodes?.length) {
-      try {
-        full = { ...result, lineage: await getSessionLineage(result.session_id) };
-      } catch {
-        // keep the stripped result; the genealogy view will show an empty state, not crash
-      }
+  useEffect(() => {
+    const job =
+      sessionController.state?.finalization_job ??
+      sessionController.state?.last_finalization_job;
+    if (!job) return;
+    if (job.status === "failed" || job.status === "stopped") {
+      setFinalizing(false);
+      return;
     }
-    setRun(full);
-    setBestFactorSaved(false); // a fresh best formula result is not yet in the library
-    setTab("dashboard");
-    setStatus("Run completed - showing out-of-sample metrics");
+    if (job.status !== "done") return;
+    const metadata = job.metadata ?? {};
+    const evaluationId =
+      (metadata.evaluation_id as string | undefined) ?? job.evaluation_id;
+    const roundIndex =
+      (metadata.round_index as number | undefined) ?? job.round_index;
+    const sessionId = sessionController.sessionId;
+    if (!sessionId || !evaluationId || roundIndex === undefined) return;
+    const handledKey = `${sessionId}:${evaluationId}`;
+    if (handledFinalizationRef.current === handledKey) return;
+    handledFinalizationRef.current = handledKey;
+
+    setFinalizing(true);
+    void loadRoundWithFinalization(sessionId, roundIndex, evaluationId)
+      .then(async (result) => {
+        setRun(result);
+        setSelectedRound(roundIndex);
+        setRounds(await listSessionRounds(sessionId));
+        setStatus(
+          result.evidence_status === "locked_first_read"
+            ? "Showing the first locked-holdout evaluation"
+            : "Showing exploratory repeated-holdout evidence",
+        );
+      })
+      .catch((reason) => {
+        setStatus(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => setFinalizing(false));
+  }, [
+    sessionController.sessionId,
+    sessionController.state?.finalization_job,
+    sessionController.state?.last_finalization_job,
+  ]);
+
+  async function resultWithLineage(result: RunResult, round?: number): Promise<RunResult> {
+    if (!result.session_id || (round === undefined && result.lineage?.nodes?.length)) {
+      return result;
+    }
+    try {
+      return {
+        ...result,
+        lineage:
+          round === undefined
+            ? await getSessionLineage(result.session_id)
+            : await getSessionLineage(result.session_id, round),
+      };
+    } catch {
+      return result;
+    }
   }
 
-  function onRunningChange(running: boolean, sessionId: string | null) {
-    setSearchRunning(running);
-    setRunningSessionId(sessionId);
+  async function loadRoundWithFinalization(
+    sessionId: string,
+    roundIndex: number,
+    preferredEvaluationId?: string | null,
+  ): Promise<RunResult> {
+    const validationRound = await getSessionRound(sessionId, roundIndex);
+    let merged = validationRound;
+    try {
+      const finalizations = await listSessionFinalizations(sessionId);
+      const matchingFinalizations = finalizations.filter(
+        (item) => item.round_index === roundIndex && item.report_available,
+      );
+      setEvaluations(matchingFinalizations);
+      const selected =
+        matchingFinalizations.find(
+          (item) => item.evaluation_id === preferredEvaluationId,
+        ) ??
+        matchingFinalizations.find((item) => item.evidence_status === "locked_first_read") ??
+        matchingFinalizations[0];
+      setSelectedEvaluation(selected?.evaluation_id ?? null);
+      if (selected) {
+        const detail = await getSessionFinalization(sessionId, selected.evaluation_id);
+        merged = {
+          ...validationRound,
+          best_factor: detail.best_factor ?? validationRound.best_factor,
+          report: detail.report,
+          oos_backtest: detail.oos_backtest ?? detail.report.oos_backtest ?? null,
+          context: detail.context ?? validationRound.context,
+          selection: detail.selection ?? validationRound.selection,
+          evidence_status: detail.evidence_status,
+          validation_only: false,
+          finalization: detail,
+          test_reads: detail.test_reads,
+          session_holdout_reads: detail.session_holdout_reads,
+          holdout_fingerprint: detail.holdout_fingerprint,
+          same_holdout_read_index: detail.same_holdout_read_index,
+          test_read_index: detail.same_holdout_read_index,
+          inherited_evidence_sources: detail.inherited_evidence_sources,
+          strategy_results: detail.strategy_results,
+          primary_strategy_id: detail.primary_strategy_id,
+          strategy_plan_id: detail.strategy_plan_id,
+          comparison_id: detail.comparison_id,
+        };
+      }
+    } catch {
+      // A validation round remains useful if an older backend has no finalization index yet.
+      setEvaluations([]);
+      setSelectedEvaluation(null);
+    }
+    return resultWithLineage(merged, roundIndex);
+  }
+
+  async function onRunComplete(result: RunResult) {
+    const roundIndex = result.round_index ?? result.segment;
+    const full =
+      result.session_id && roundIndex !== undefined
+        ? await loadRoundWithFinalization(result.session_id, roundIndex)
+        : await resultWithLineage(result, roundIndex);
+    setRun(full);
+    if (result.session_id) {
+      try {
+        const items = await listSessionRounds(result.session_id);
+        setRounds(items);
+        const available = items.filter(isSelectableRound);
+        const latest = available[available.length - 1];
+        setSelectedRound(latest?.index ?? roundIndex ?? null);
+      } catch {
+        setSelectedRound(roundIndex ?? null);
+      }
+    }
+    setBestFactorSaved(false); // a fresh best formula result is not yet in the library
+    setTab("dashboard");
+    setStatus("Validation round completed - the locked holdout remains unopened");
+  }
+
+  async function selectRound(roundIndex: number) {
+    const sessionId = sessionController.sessionId ?? run?.session_id;
+    if (!sessionId || roundIndex === selectedRound) return;
+    setLoading(true);
+    try {
+      setRun(await loadRoundWithFinalization(sessionId, roundIndex));
+      setSelectedRound(roundIndex);
+      setSelectedNode(null);
+      setSelectedLineage(null);
+      setBestFactorSaved(false);
+      setStatus(`Showing training round ${roundIndex + 1}`);
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function selectEvaluation(evaluationId: string) {
+    const sessionId = sessionController.sessionId ?? run?.session_id;
+    const roundIndex = selectedRound ?? run?.round_index ?? run?.segment;
+    if (!sessionId || roundIndex === undefined || evaluationId === selectedEvaluation) return;
+    setLoading(true);
+    try {
+      setRun(await loadRoundWithFinalization(sessionId, roundIndex, evaluationId));
+      setSelectedEvaluation(evaluationId);
+      setStatus(`Showing holdout evaluation ${evaluationId.slice(0, 8)}`);
+    } catch (reason) {
+      setStatus(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function finalizeSelectedRound(strategyPlanId?: string) {
+    const sessionId = sessionController.sessionId ?? run?.session_id;
+    const roundIndex = selectedRound ?? run?.round_index ?? run?.segment;
+    if (
+      !sessionId ||
+      roundIndex === undefined ||
+      finalizing ||
+      sessionController.finalizing
+    ) return;
+
+    setFinalizing(true);
+    setStatus("Checking locked-holdout evidence history...");
+    let submitted = false;
+    try {
+      const existing = await listSessionFinalizations(sessionId);
+      const repeat = existing.some((item) => item.report_available);
+      if (
+        repeat &&
+        !window.confirm(
+          "This frozen holdout has already been viewed in this session. A further read is " +
+            "exploratory and cannot be treated as fresh evidence. Finalize this round anyway?",
+        )
+      ) {
+        setStatus("Holdout finalization cancelled");
+        return;
+      }
+
+      const handle = await finalizeSessionRound(
+        sessionId,
+        roundIndex,
+        repeat,
+        strategyPlanId,
+      );
+      submitted = true;
+      handledFinalizationRef.current = null;
+      setSelectedEvaluation(handle.evaluation_id);
+      setStatus(
+        repeat
+          ? "Running an exploratory repeated-holdout finalization..."
+          : "Running the first locked-holdout finalization...",
+      );
+      // The application-level session controller owns polling. This survives tab
+      // changes and reloads, then the completion effect above attaches the artifact.
+      sessionController.refresh();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (!submitted) setFinalizing(false);
+    }
   }
 
   async function performShutdown() {
@@ -198,7 +487,7 @@ export function App() {
   async function stopRunningSearch() {
     if (runningSessionId) {
       try {
-        await stopSession(runningSessionId);
+        await sessionController.stop();
       } catch (e) {
         setStatus(String(e));
       }
@@ -274,7 +563,17 @@ export function App() {
       await saveFactor({
         name: "best formula result",
         tree: parseFactor(run.best_factor),
-        metrics: { oos_ic: run.report.oos_ic, deflated_sharpe: run.report.deflated_sharpe },
+        metrics: run.report
+          ? {
+              oos_ic: run.report.oos_ic,
+              deflated_sharpe: run.report.deflated_sharpe,
+            }
+          : {
+              validation_median_ic:
+                run.selection?.median_oriented_ic ?? run.selection?.validation_fitness ?? 0,
+              validation_objective:
+                run.selection?.final_objective ?? run.selection?.validation_fitness ?? 0,
+            },
         provenance: {
           session_id: run.session_id,
           cumulative_trials: run.cumulative_trials,
@@ -286,6 +585,27 @@ export function App() {
     } catch (e) {
       setStatus(String(e));
     }
+  }
+
+  function openBestFactorCopy() {
+    if (!run) return;
+    const round = (run.round_index ?? run.segment ?? 0) + 1;
+    setFormulaDraft({
+      name: `best_formula_round_${round}_copy`,
+      display_name: `Best Formula Result — Round ${round} copy`,
+      description: "Editable copy of the validation-selected formula snapshot.",
+      body: parseFactor(run.best_factor),
+      inputs: [],
+      arg_types: [],
+      out_type: "signal",
+      category: "custom",
+      activeMode: "visual",
+      loadedName: null,
+      loadedRevision: null,
+    });
+    setExtendPage("formula");
+    setTab("extend");
+    setStatus(`Opened an editable copy of the Round ${round} formula`);
   }
 
   function saveLocal() {
@@ -366,28 +686,39 @@ export function App() {
       }}
     >
       <section className="app-page">
-        <header className="view-head">
-          <div className="view-tag">
-            <span className="view-tag__mark" aria-hidden="true" />
-            <span>AlphaLineage</span>
-          </div>
-          <h1>Honest formula evolution</h1>
-          <p>Trace each generated formula from metrics to tree structure to genetic lineage.</p>
-          <div className="view-rule" aria-hidden="true" />
-        </header>
+        {tab !== "extend" && (
+          <PageHeader
+            title={PAGE_COPY[tab].title}
+            description={PAGE_COPY[tab].description}
+          />
+        )}
 
         {error && <p className="error surface-message">{error}</p>}
         {loading && !run && <p className="surface-message">Loading...</p>}
 
         <ErrorBoundary key={tab}>
+        {run && (tab === "dashboard" || tab === "factor" || tab === "genealogy") && (
+          <RoundNavigator
+            rounds={rounds}
+            selectedRound={selectedRound}
+            pending={searchRunning}
+            onSelect={(roundIndex) => void selectRound(roundIndex)}
+            onContinue={tab === "dashboard" && mode === "app" ? () => setTab("train") : undefined}
+          />
+        )}
+        {run && tab === "dashboard" && evaluations.length > 0 && (
+          <EvaluationNavigator
+            evaluations={evaluations}
+            selectedId={selectedEvaluation}
+            onSelect={(evaluationId) => void selectEvaluation(evaluationId)}
+          />
+        )}
         {tab === "train" && (
           <section className="view-card" data-view="train">
             <div className="view-body">
               <TrainPanel
                 seedIds={seedIds}
-                restoreSessionId={initialWorkspace?.ui.sessionId ?? null}
-                onComplete={onRunComplete}
-                onRunningChange={onRunningChange}
+                controller={sessionController}
                 onOpenDashboard={() => setTab("dashboard")}
                 onOpenUniverseEditor={openUniverseEditor}
                 onOpenDataSync={openUniverseEditor}
@@ -408,6 +739,12 @@ export function App() {
                 history={run.history}
                 extra={run}
                 enableBenchmarks={mode === "app"}
+                onFinalize={
+                  mode === "app" && run.session_id && selectedRound !== null
+                    ? (strategyPlanId) => void finalizeSelectedRound(strategyPlanId)
+                    : undefined
+                }
+                finalizing={finalizing || sessionController.finalizing}
               />
             </div>
           </section>
@@ -415,30 +752,23 @@ export function App() {
 
         {run && factor && tab === "factor" && (
           <section className="view-card" data-view="factor">
-            <div className="view-body split">
-              <FactorTree factor={factor} onSelect={setSelectedNode} />
-              <div>
-                <FactorDetail node={selectedNode} />
-                {mode === "app" && (
-                  <button
-                    type="button"
-                    className="ghost"
-                    data-testid="save-best-factor"
-                    onClick={saveBestFactor}
-                  >
-                    Save Best Formula Result to library
-                  </button>
-                )}
-              </div>
+            <div className="view-body">
+              <BestFormulaResultPage
+                factor={factor}
+                canSave={mode === "app"}
+                saved={bestFactorSaved}
+                onSave={() => void saveBestFactor()}
+                onOpenCopy={openBestFactorCopy}
+                onLegacySelection={setSelectedNode}
+              />
             </div>
           </section>
         )}
 
         {run && tab === "genealogy" && (
           <section className="view-card" data-view="genealogy">
-            <div className="view-body split">
-              <Genealogy lineage={run.lineage} onSelect={setSelectedLineage} />
-              <LineageDetail
+            <div className="view-body">
+              <Genealogy
                 lineage={run.lineage}
                 selectedId={selectedLineage}
                 onSelect={setSelectedLineage}

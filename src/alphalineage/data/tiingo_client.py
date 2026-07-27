@@ -125,7 +125,11 @@ def _to_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
         # Empty but schema-valid frame.
         empty = pd.DataFrame(columns=schema.PRICE_COLUMNS)
         empty.index = pd.DatetimeIndex([], name=schema.INDEX_NAME)
-        return schema.validate(empty.astype("float64"))
+        return schema.with_price_metadata(
+            schema.validate(empty.astype("float64")),
+            price_basis="raw",
+            provider="tiingo",
+        )
 
     frame = pd.DataFrame(rows)
     if "date" not in frame.columns:
@@ -133,4 +137,9 @@ def _to_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
     frame = frame.set_index("date")
     renamed = frame.rename(columns=_FIELD_MAP)
     keep = [c for c in _FIELD_MAP.values() if c in renamed.columns]
-    return schema.normalize(renamed[keep])
+    # Tiingo's EOD fields are raw OHLCV plus explicit split/dividend actions.
+    return schema.with_price_metadata(
+        schema.normalize(renamed[keep]),
+        price_basis="raw",
+        provider="tiingo",
+    )

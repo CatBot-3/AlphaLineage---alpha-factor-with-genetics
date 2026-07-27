@@ -96,7 +96,14 @@ This subsystem produces the honest verdict and is non-negotiable.
   **train / validation / test** with an **embargo** gap of *E* trading days between adjacent
   segments — the embargo prevents a trailing-window factor or a forward-return label from straddling
   a boundary and leaking. The **test** segment is wrapped in a `LockedTestSet`: any attempt to read
-  it before final reporting raises. It is unlocked exactly once, to compute the out-of-sample IC.
+  it during training or validation raises.
+- **Robust validation selection (`selection.py`).** Candidate polarity is fixed from training data.
+  Daily validation IC is split into three chronological, embargo-separated folds. A candidate needs
+  adequate breadth and at least 60 valid dates in every fold, with positive oriented IC in at least
+  two folds. Candidates rank by median fold IC minus normalized expanded-expression complexity.
+- **Explicit finalization.** Each completed search is an immutable validation round. The user may
+  explicitly finalize any selected round against the frozen holdout. The first finalization is the
+  locked read; confirmed repeats and any rounds trained after viewing it are exploratory evidence.
 - **Deflated Sharpe ratio (`deflated_sharpe.py`, `trials.py`).** Selecting the best of many trials
   inflates the winner's apparent Sharpe. The DSR discounts the observed Sharpe by the expected
   maximum under the null, given the number of trials *N* and the variance of the trials' Sharpe
@@ -107,10 +114,10 @@ This subsystem produces the honest verdict and is non-negotiable.
   cross-validation: across folds, the frequency with which the in-sample-best configuration
   underperforms out-of-sample.
 
-A factor is reported **significant** only when `DSR > 0.95` **and** `PBO < 0.5`. The dashboard
-presents OOS IC, deflated Sharpe, PBO, and a plain-language verdict as the headline; in-sample (train)
-figures are demoted to a collapsed "for reference only" section. The ordering is deliberate — the
-flattering number is never the default (invariant 1).
+A freshly finalized factor is reported **significant** only when validation qualifies,
+`DSR > 0.95`, and `PBO < 0.5`. Repeated or post-holdout-adaptive evidence never receives a passing
+verdict. Before finalization, the dashboard presents fold robustness and the selection objective;
+after finalization it adds OOS IC, deflated Sharpe, PBO, and the net equity path.
 
 ### 1.5 Backtest with costs
 Source: [`backtest/`](../src/alphalineage/backtest/)
@@ -120,17 +127,17 @@ neutralized, with **transaction costs and slippage** (in basis points) deducted.
 survives only gross of costs is not counted. Reported metrics include Sharpe, maximum drawdown,
 turnover, and IC decay.
 
-### 1.6 Factor library & lineage
+### 1.6 Formula Results library & lineage
 Source: [`library/store.py`](../src/alphalineage/library/store.py),
 [`library/factors.py`](../src/alphalineage/library/factors.py)
 
 - **Lineage (`store.py`).** Each individual the GP produces is recorded with its id, generation, the
   variation operator that created it, its parent ids, and its fitness. The record is replayable
   generation by generation and is the data behind the Genealogy view.
-- **Saved factors (`factors.py`).** A kept factor is written as a self-contained JSON document: the
+- **Formula Results (`factors.py`).** A kept result is written as a self-contained JSON document: the
   tree, its metrics, its **provenance** (originating session, generation, and universe, plus the
   cumulative trial and out-of-sample-read counts at save time), and the **specifications of any user
-  operators the tree references**. Because the operator definitions travel with the factor, seeding a
+  operators the tree references**. Because the operator definitions travel with the result, seeding a
   new search from it is reproducible on a fresh machine. The storage directory is configurable
   (§3.13).
 
@@ -144,7 +151,7 @@ Source: [`api/`](../src/alphalineage/api/)
 - **Sessions (`sessions.py`).** A **session** is a search grown over **segments**. After the initial
   segment, a session may be **continued** — warm-starting from the evolved population with changed
   hyperparameters, a changed universe, or newly registered operators — or a fresh session may be
-  **seeded** from previously saved factors. Three honesty invariants hold across segments:
+  **seeded** from previously saved Formula Results. Three honesty invariants hold across segments:
   - **The time boundary is frozen at creation.** The split dates `train_end`, `valid_start`,
     `valid_end`, `test_start` (and the embargo) are recorded once. Every later segment rebuilds its
     split by filtering the *current* panel against those frozen dates — `train = {t ≤ train_end}`,
@@ -153,8 +160,9 @@ Source: [`api/`](../src/alphalineage/api/)
   - **Trial counts are cumulative and monotone.** They are carried through the GP checkpoint and
     summed across segments and across the provenance of any seed factors; the deflation only ever
     tightens.
-  - **Each segment is one out-of-sample read.** The session counts reads and surfaces the count, so
-    repeated peeking at the locked set is visible rather than silent.
+  - **Segments do not read the holdout.** Each initial or continued search commits a validation-only
+    round. Holdout reads are separate immutable finalizations, counted by frozen-holdout fingerprint;
+    repeats require explicit confirmation.
 
 ### 1.8 Frontend
 Source: [`frontend/src/`](../frontend/src/)
@@ -166,8 +174,8 @@ A React + Vite application with two build targets:
 - **`demo`** is a static, backend-free snapshot of one finished run (metrics, factor tree,
   genealogy), suitable for deployment to a static host.
 
-The UI is organized into tabs — **Train, Metrics, Best factor, Genealogy, Library, Extend** — which
-§3 covers in turn.
+The UI is organized into tabs — **Train, Metrics, Best Formula Result, Genealogy, Library,
+Extend** — which §3 covers in turn.
 
 ### 1.9 Optional C++ accelerator
 Source: [`cpp/`](../cpp/), [`core/cpp.py`](../src/alphalineage/core/cpp.py)
@@ -192,15 +200,16 @@ The sequence triggered by **Start training**, traced through the components:
 4. **Train slice → GP.** A population of typed trees is evolved over the *train* dates only — scored
    by IC, selected, recombined — for the configured number of generations. Every individual is
    written to the lineage with its fitness, and progress streams to the UI.
-5. **GP → judgment.** The best factor is scored on the **validation** dates; the **deflated Sharpe**
-   is computed against the cumulative (effective) trial count and the **PBO** across folds; then the
-   **test** segment is unlocked exactly once and the out-of-sample IC is read.
-6. **Judgment → dashboard.** The headline is the out-of-sample / deflated verdict, alongside the
-   factor's tree and its genealogy. Nothing observed during the search touched the test segment until
-   step 5.
-7. **Iterate.** Continue the session from the evolved population, or save the best factor and seed a
-   new session from it. Trial and out-of-sample-read counts carry forward, so the honesty accounting
-   only tightens.
+5. **GP → validation round.** Every distinct searched tree is evaluated on validation. Three
+   chronological folds select the most stable candidate with training-fixed polarity; the holdout
+   remains unopened.
+6. **Compare or iterate.** Compare the fixed Quantile Long/Short 20% and Rank Proportional
+   strategies on validation (optionally adding 10% or 30% quantiles), pin one viable primary, or
+   continue from the latest checkpoint. Continuation adds trials but does not increment holdout
+   reads.
+7. **Finalize deliberately.** Finalize the pinned strategy bundle only when ready. Every predeclared
+   strategy is evaluated atomically in one holdout read; only the primary controls the verdict and
+   secondary curves remain sensitivity diagnostics.
 
 ---
 
@@ -263,13 +272,18 @@ a graph, never as code.
 2. **Universe** — select from the dropdown (custom universes appear here).
 3. Set the core hyperparameters: **Population**, **Generations**, **Max depth**, **Max nodes**,
    **Seed**. The defaults are a fast interactive preset; **Advanced GP parameters** exposes
-   crossover/mutation rates, parsimony, and tournament size.
-4. Optionally select factors under **Seed from saved factors** to initialize from kept formulas.
+   crossover/mutation rates, normalized complexity deduction, parameter-neighbor allocation,
+   validation folds, exploration profile, and tournament size. New UI sessions default to
+   **Aggressive valley crossing**, which protects diverse stepping stones and permits coordinated
+   edits while keeping validation and holdout evidence out of breeding.
+4. Optionally select results under **Seed training from Formula Results** to initialize from kept
+   formulas.
 5. Click **Start training**.
 
 ### 3.5 Monitor progress
 On start, the Train tab shows a live progress view: a `generation X / Y` bar, a best-fitness
-sparkline, and counters for **segments**, **cumulative trials**, and **OOS reads**, refreshed each
+sparkline, and counters for **completed rounds**, **cumulative trials**, and **explicit holdout
+reads**, refreshed each
 second until completion.
 
 ### 3.6 Stop a run
@@ -283,17 +297,20 @@ When a segment completes, a **Continue training from this generation** panel app
    segment. A changed universe is re-scored against the **frozen** boundary, so the locked test
    segment does not move.
 3. Click **Continue**. The evolved population is warm-started rather than reinitialized. The
-   cumulative trial count grows and the **OOS reads** counter increments (§3.11).
+   cumulative trial count grows while the explicit holdout-read counter stays unchanged (§3.11).
 
 **Open dashboard** jumps to the metrics for the latest segment.
 
 ### 3.8 Read the results
-- **Metrics** tab — the headline is **OOS rank IC, Deflated Sharpe, PBO, Verdict** (the
-  out-of-sample / deflated figures). Train metrics and the trial count are under the collapsible
-  "In-sample (train) metrics — for reference only."
-- **Best factor** tab — the winning expression as a tree; click a node for its details, or **Save
-  best factor to library**.
-- **Genealogy** tab — see §3.9.
+- **Metrics** tab — before finalization, the headline is validation robustness and “Why this formula
+  won,” including every fold, complexity deduction, and explored parameter variants. Compare
+  portfolio strategies and pin a viable primary before finalization. A cash-only result is labelled
+  “No tradable cross-sectional variation”; it has no Sharpe, drawdown, or performance curve.
+- **Best Formula Result** tab — the winning expression in the same read-only graph workspace used
+  by Formula Builder, with pinned dependencies, inline parameters, Visual/Expression views,
+  inspection, and explicit save/open-copy actions.
+- **Genealogy** tab — a resizable generation list, ancestry canvas, and read-only formula inspector;
+  see §3.9.
 
 ### 3.9 Explore the genealogy
 The default **Generations** view is a collapsible list, newest generation first. Expanding a
@@ -306,14 +323,16 @@ best first**. Each row can be selected (details appear on the right), **Save**d 
 closure — typically a few dozen nodes — which keeps the graph legible where a full-population DAG
 would not be.
 
-### 3.10 Save factors and seed new sessions
-- **Save** from the Best factor tab (**Save best factor to library**) or from any Genealogy member
-  (**Save**). The factor is stored with its tree, metrics, provenance, and any operators it uses.
-- **Library** tab — saved factors with their research IC and source universe; **Rename** or
+### 3.10 Save Formula Results and seed new sessions
+- **Save** from the Best Formula Result tab (**Save Formula Result**) or from any Genealogy member
+  (**Save**). The Formula Result is stored with its tree, metrics, provenance, and any operators it
+  uses.
+- **Library** tab — saved Formula Results with their research IC and source universe; **Rename** or
   **Delete** as needed.
-- **Seed a new search** — select one or more factors and click **Start seeded session (N)**. The
-  Train tab opens with those factors preselected as seeds; choose a universe and parameters and
-  **Start training**. The initial population begins from the selected factors (recorded as `seed` in
+- **Seed a new search** — select one or more results and click
+  **Seed training from Formula Results (N)**. The Train tab opens with those results preselected as
+  seeds; choose a universe and parameters and **Start training**. The initial population begins
+  from the selected results (recorded as `seed` in
   the lineage), which is how earlier results are combined into a new search.
 
 ### 3.11 On honest metrics
@@ -321,9 +340,10 @@ would not be.
   the boundary.
 - **Trials accumulate** across segments and seeded sessions; the deflated Sharpe cannot be reset by
   continuing.
-- Each completed segment is **one out-of-sample read**. The dashboard shows the read count and raises
-  a warning once it exceeds one: a result selected on after repeated readings is, in effect,
-  in-sample, and the verdict should be treated with corresponding caution.
+- Completed training rounds are **validation-only** and never increment the holdout counter.
+- Finalizing a selected round increments the matching frozen-holdout counter exactly once. Further
+  reads require confirmation, and any decision made after viewing the first result is labelled
+  exploratory rather than fresh evidence.
 
 ### 3.12 Save and load your work (workspaces)
 The header provides **Save local / Load local** (browser storage) and, in app mode, **Save backend /
@@ -353,10 +373,11 @@ The **⚙** button in the top-right opens the control menu (backend/app mode onl
   factors, saved workspaces) with a **Clear** button each. Clearing deletes that category's files on
   disk (confirmed first) to reclaim space; it cannot be undone. Cleared market data must be
   re-downloaded; cleared sessions/factors/workspaces are gone.
-- **Quit AlphaLineage** — shuts the app down. If a search is still running or the best factor isn't
-  saved to the library, the confirmation lists the warning and offers to **Save best factor** and/or
-  **Stop search** first. Confirming **Quit now** stops the single server process (the API and the
-  served UI together); the tab then shows a shutdown notice you can close. (Training sessions are
+- **Quit AlphaLineage** — shuts the app down. If a search is still running or the best formula
+  result is not saved to the library, the confirmation lists the warning and offers to **Save
+  Formula Result** and/or **Stop search** first. Confirming **Quit now** stops the single server
+  process (the API and the served UI together); the tab then shows a shutdown notice you can close.
+  (Training sessions are
   always persisted to disk after every segment, so quitting never loses a completed segment.)
 
 ---

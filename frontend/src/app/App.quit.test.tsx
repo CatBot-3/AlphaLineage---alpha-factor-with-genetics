@@ -53,6 +53,10 @@ vi.mock("../api/client", () => ({
   createSession: vi.fn(),
   continueSession: vi.fn(),
   getSession: vi.fn(),
+  getSessionRound: vi.fn(),
+  getSessionLineage: vi.fn(),
+  listSessionRounds: () => Promise.resolve([]),
+  listSessions: () => Promise.resolve([]),
 }));
 
 import { App } from "./App";
@@ -64,9 +68,7 @@ describe("Quit flow (L7)", () => {
     shutdown.mockResolvedValue({ shutting_down: true });
     render(<App />);
 
-    fireEvent.click(screen.getByLabelText("Settings menu"));
-    fireEvent.click(await screen.findByRole("button", { name: /Quit/ }));
-    fireEvent.click(await screen.findByTestId("quit"));
+    fireEvent.click(screen.getByRole("button", { name: "Quit" }));
     expect(await screen.findByTestId("quit-dialog")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("quit-confirm"));

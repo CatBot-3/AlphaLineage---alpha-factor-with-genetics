@@ -14,6 +14,7 @@ from alphalineage.backtest.engine import (
     comparison_frame,
     net_return_fn,
     net_returns_for_factor,
+    portfolio_health,
 )
 from alphalineage.backtest.metrics import (
     annualized_sharpe,
@@ -23,19 +24,25 @@ from alphalineage.backtest.metrics import (
     turnover,
 )
 from alphalineage.backtest.portfolio import (
+    PORTFOLIO_SCHEMA_VERSION,
     SCHEMES,
+    PortfolioStrategySpec,
     QuantileLongShort,
     RankProportional,
     WeightingScheme,
+    default_strategy_spec,
     get_scheme,
     neutralize,
+    validate_portfolio_weights,
 )
 from alphalineage.backtest.reporting import backtest_report, json_number
 
 __all__ = [
     "SCHEMES",
+    "PORTFOLIO_SCHEMA_VERSION",
     "BacktestResult",
     "QuantileLongShort",
+    "PortfolioStrategySpec",
     "RankProportional",
     "TransactionCostModel",
     "WeightingScheme",
@@ -44,6 +51,7 @@ __all__ = [
     "backtest_report",
     "compare_schemes",
     "comparison_frame",
+    "default_strategy_spec",
     "get_scheme",
     "ic_decay",
     "json_number",
@@ -52,6 +60,8 @@ __all__ = [
     "net_returns_for_factor",
     "neutralize",
     "position_magnitude",
+    "portfolio_health",
     "turnover",
     "turnover_series",
+    "validate_portfolio_weights",
 ]

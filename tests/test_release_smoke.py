@@ -5,7 +5,7 @@ def test_release_smoke_sees_native_evaluator_and_packaged_catalogs() -> None:
     result = release_smoke()
 
     assert result["native_evaluator"] is True
-    assert result["native_abi"] >= 5
+    assert result["native_abi"] >= 6
     assert result["bundled_universes"] == {
         "builtin-sp500-current": 503,
         "builtin-djia-current": 30,

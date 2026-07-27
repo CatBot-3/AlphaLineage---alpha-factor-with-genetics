@@ -2,15 +2,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearData,
   continueSession,
+  createFinalizationPlan,
   createSession,
+  createStrategyComparison,
   fetchRun,
+  finalizeSessionRound,
   getBenchmarkSeries,
   getMembershipSync,
   getSession,
+  getSessionFinalization,
+  getStrategyComparison,
   getTrainingCapabilities,
   getUniverse,
   listDataSyncs,
   listBenchmarks,
+  listSessionFinalizations,
+  listFinalizationPlans,
+  listStrategyComparisons,
   listUniversePresets,
   listUniverses,
   putCategories,
@@ -119,6 +127,120 @@ describe("session client", () => {
     await expect(continueSession("s1", { generations: 1 })).rejects.toThrow(
       "a segment is already running",
     );
+  });
+
+  it("finalizes a selected round explicitly and lists immutable evaluations", async () => {
+    let fetchSpy = mockFetch({
+      session_id: "s1",
+      round_index: 1,
+      evaluation_id: "eval-2",
+      job_id: "j-final",
+      status: "queued",
+    });
+    await finalizeSessionRound("s1", 1, true);
+    let [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/sessions\/s1\/rounds\/1\/finalize$/);
+    expect(JSON.parse(init.body as string)).toEqual({ confirm_repeat: true });
+
+    fetchSpy = mockFetch([
+      {
+        evaluation_id: "eval-2",
+        round_index: 1,
+        evidence_status: "repeated_same_holdout",
+      },
+    ]);
+    const evaluations = await listSessionFinalizations("s1");
+    expect(evaluations[0].round_index).toBe(1);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/sessions\/s1\/finalizations$/);
+
+    fetchSpy = mockFetch({
+      evaluation_id: "eval-2",
+      round_index: 1,
+      report: { oos_ic: 0.02 },
+    });
+    const detail = await getSessionFinalization("s1", "eval-2");
+    expect(detail.evaluation_id).toBe("eval-2");
+    [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/sessions\/s1\/finalizations\/eval-2$/);
+    expect(init).toBeUndefined();
+  });
+
+  it("compares validation strategies and pins a primary plan before finalization", async () => {
+    const strategies = [
+      { id: "quantile_ls_20", scheme: "quantile_ls" as const, quantile: 0.2 },
+      { id: "rank_proportional", scheme: "rank_proportional" as const, quantile: null },
+    ];
+    let fetchSpy = mockFetch({
+      session_id: "s1",
+      round_index: 1,
+      comparison_id: "cmp-1",
+      job_id: "job-cmp",
+      status: "queued",
+    });
+    await createStrategyComparison("s1", 1, strategies);
+    let [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/sessions\/s1\/rounds\/1\/strategy-comparisons$/);
+    expect(JSON.parse(init.body as string)).toEqual({ strategies });
+
+    fetchSpy = mockFetch({
+      session_id: "s1",
+      round_index: 1,
+      comparison_id: "cmp-repeat",
+      job_id: "job-repeat",
+      status: "queued",
+    });
+    await createStrategyComparison("s1", 1, strategies, true);
+    [, init] = fetchSpy.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({
+      strategies,
+      confirm_repeat: true,
+    });
+
+    fetchSpy = mockFetch([{ comparison_id: "cmp-1", status: "done" }]);
+    await listStrategyComparisons("s1", 1);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/strategy-comparisons$/);
+
+    fetchSpy = mockFetch({
+      comparison_id: "cmp-1",
+      status: "done",
+      strategy_results: [],
+    });
+    await getStrategyComparison("s1", 1, "cmp-1");
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/strategy-comparisons\/cmp-1$/);
+
+    fetchSpy = mockFetch({
+      strategy_plan_id: "plan-1",
+      session_id: "s1",
+      round_index: 1,
+      comparison_id: "cmp-1",
+      primary_strategy_id: "quantile_ls_20",
+      strategies,
+    });
+    await createFinalizationPlan("s1", 1, "cmp-1", "quantile_ls_20");
+    [url, init] = fetchSpy.mock.calls[0];
+    expect(String(url)).toMatch(/\/sessions\/s1\/rounds\/1\/finalization-plans$/);
+    expect(JSON.parse(init.body as string)).toEqual({
+      comparison_id: "cmp-1",
+      primary_strategy_id: "quantile_ls_20",
+    });
+
+    fetchSpy = mockFetch([]);
+    await listFinalizationPlans("s1", 1);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/finalization-plans$/);
+
+    fetchSpy = mockFetch({
+      session_id: "s1",
+      round_index: 1,
+      evaluation_id: "eval-1",
+      job_id: "job-final",
+      status: "queued",
+    });
+    await finalizeSessionRound("s1", 1, false, "plan-1");
+    [, init] = fetchSpy.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({
+      confirm_repeat: false,
+      strategy_plan_id: "plan-1",
+    });
   });
 });
 

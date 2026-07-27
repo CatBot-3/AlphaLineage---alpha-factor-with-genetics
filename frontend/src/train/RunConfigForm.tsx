@@ -14,6 +14,7 @@ import type {
   GpConfig,
   PrimitiveInfo,
   SavedFactor,
+  SessionState,
   TrainingResourcesRequest,
   UniverseCacheCoverage,
   UniverseInfo,
@@ -57,6 +58,7 @@ function numberField(key: keyof GpConfig, value: number, onChange: (v: number) =
 
 export function RunConfigForm({
   initialSeedIds = NO_SEEDS,
+  initialSession,
   onStart,
   disabled,
   onEditUniverse,
@@ -64,6 +66,7 @@ export function RunConfigForm({
   onOpenFormulaEditor,
 }: {
   initialSeedIds?: string[];
+  initialSession?: SessionState | null;
   onStart: (req: RunRequestForm) => void;
   disabled?: boolean;
   onEditUniverse?: (universeName: string) => void;
@@ -92,6 +95,10 @@ export function RunConfigForm({
   const [disabledCats, setDisabledCats] = useState<Set<string>>(
     new Set(["condition", "technical_indicators"]),
   );
+  const [previousEnabledCategories, setPreviousEnabledCategories] =
+    useState<string[] | null | undefined>(undefined);
+  const [previousEnabledFormulaNames, setPreviousEnabledFormulaNames] =
+    useState<string[] | null | undefined>(undefined);
 
   useEffect(() => {
     listUniverses({ summary: true }).then(setUniverses).catch(() => setUniverses([]));
@@ -123,6 +130,20 @@ export function RunConfigForm({
   }, [universe, asOf]);
 
   useEffect(() => setSeedIds(initialSeedIds), [initialSeedIds]);
+
+  useEffect(() => {
+    if (!initialSession) return;
+    if (initialSession.name) setName(`${initialSession.name} copy`);
+    if (initialSession.universe) setUniverse(initialSession.universe);
+    if (initialSession.as_of) setAsOf(initialSession.as_of);
+    const storedConfig = initialSession.config ?? {};
+    const previousConfig = { ...DEFAULT_CONFIG, ...storedConfig } as GpConfig;
+    setConfig(previousConfig);
+    setResources(initialSession.resources ?? { profile: "auto", cpu_budget_percent: null });
+    setSeedIds(initialSession.seed_factor_ids ?? []);
+    setPreviousEnabledCategories(storedConfig.enabled_categories);
+    setPreviousEnabledFormulaNames(storedConfig.enabled_formula_names);
+  }, [initialSession?.id]);
 
   const set = (key: keyof GpConfig) => (v: number) =>
     setConfig((prev) => ({ ...prev, [key]: v }));
@@ -187,6 +208,32 @@ export function RunConfigForm({
     formula.status !== "retired" && formula.registered !== false && !formula.error
   )), [formulas]);
 
+  useEffect(() => {
+    if (previousEnabledCategories === undefined || functionsByCategory.size === 0) return;
+    setDisabledCats(
+      previousEnabledCategories === null
+        ? new Set()
+        : new Set(
+          [...functionsByCategory.keys()].filter(
+            (category) => !previousEnabledCategories.includes(category),
+          ),
+        ),
+    );
+  }, [functionsByCategory, previousEnabledCategories]);
+
+  useEffect(() => {
+    if (previousEnabledFormulaNames === undefined || formulas === null) return;
+    setDisabledFormulaNames(
+      previousEnabledFormulaNames === null
+        ? new Set()
+        : new Set(
+          selectableFormulas
+            .map((formula) => formula.name)
+            .filter((name) => !previousEnabledFormulaNames.includes(name)),
+        ),
+    );
+  }, [formulas, previousEnabledFormulaNames, selectableFormulas]);
+
   const formulasByCategory = useMemo(() => {
     const groups = new Map<string, FormulaSpec[]>();
     for (const formula of selectableFormulas) {
@@ -204,6 +251,12 @@ export function RunConfigForm({
 
   const selectedUniverse = universes.find((item) => item.name === universe);
   const trainingReady = coverage?.complete === true;
+  const missingSeedIds = seedIds.filter((id) => !factors.some((factor) => factor.id === id));
+  const knownFormulaNames = new Set(selectableFormulas.map((formula) => formula.name));
+  const missingFormulaNames = (previousEnabledFormulaNames ?? []).filter(
+    (name) => !knownFormulaNames.has(name),
+  );
+  const missingDependencies = missingSeedIds.length > 0 || missingFormulaNames.length > 0;
 
   return (
     <form
@@ -211,7 +264,7 @@ export function RunConfigForm({
       data-testid="run-config-form"
       onSubmit={(e) => {
         e.preventDefault();
-        if (disabled || coverageLoading || !trainingReady) return;
+        if (disabled || coverageLoading || !trainingReady || missingDependencies) return;
         const enabled = [...functionsByCategory.keys()].filter((c) => !disabledCats.has(c));
         const enabledFormulaNames = formulas === null
           ? null
@@ -247,6 +300,9 @@ export function RunConfigForm({
             <span className="universe-field-row">
               <select value={universe} aria-label="Universe" onChange={(e) => setUniverse(e.target.value)}>
                 {universes.length === 0 && <option value="sp500-lite">sp500-lite</option>}
+                {universes.length > 0 && !selectedUniverse && (
+                  <option value={universe}>{universe} (unavailable)</option>
+                )}
                 {universes.map((u) => (
                   <option key={u.name} value={u.name}>
                     {u.display_name ?? u.name} ({u.symbol_count ?? u.definition?.member_count ?? u.symbols.length})
@@ -278,6 +334,13 @@ export function RunConfigForm({
             <small className="hint">Membership and available data are evaluated on this date.</small>
           </label>
         </div>
+        {missingDependencies && (
+          <p className="error surface-message" role="alert" data-testid="missing-run-dependencies">
+            The previous setup cannot start until these dependencies are restored:
+            {missingSeedIds.length > 0 ? ` Formula Results ${missingSeedIds.join(", ")}.` : ""}
+            {missingFormulaNames.length > 0 ? ` Formulas ${missingFormulaNames.join(", ")}.` : ""}
+          </p>
+        )}
         <div
           className={`run-readiness ${trainingReady ? "run-readiness--ready" : "run-readiness--attention"}`}
           role="status"
@@ -323,6 +386,54 @@ export function RunConfigForm({
 
       <details className="advanced">
         <summary>Advanced GP parameters</summary>
+        <div className="field-grid">
+          <label className="field">
+            <span className="field-label">Exploration profile</span>
+            <select
+              aria-label="Exploration profile"
+              value={config.exploration_profile ?? "aggressive"}
+              onChange={(event) =>
+                setConfig((previous) => ({
+                  ...previous,
+                  exploration_profile: event.target.value as
+                    | "classic"
+                    | "balanced"
+                    | "aggressive",
+                }))
+              }
+            >
+              <option value="aggressive">Aggressive valley crossing</option>
+              <option value="balanced">Balanced exploration</option>
+              <option value="classic">Classic tournament search</option>
+            </select>
+            <small className="hint">
+              Aggressive mode protects structurally novel stepping stones and evaluates
+              multi-edit endpoints without scoring weak intermediate formulas.
+            </small>
+          </label>
+          <label className="field">
+            <span className="field-label">Complexity penalty</span>
+            <select
+              aria-label="Complexity penalty"
+              value={config.complexity_penalty_mode ?? "normalized_budget"}
+              onChange={(event) =>
+                setConfig((previous) => ({
+                  ...previous,
+                  complexity_penalty_mode: event.target.value as
+                    | "per_node"
+                    | "normalized_budget",
+                }))
+              }
+            >
+              <option value="normalized_budget">Normalized to max nodes</option>
+              <option value="per_node">Per node (legacy)</option>
+            </select>
+            <small className="hint">
+              Normalized mode caps the total deduction at the configured value when an
+              expression reaches the node budget.
+            </small>
+          </label>
+        </div>
         <div className="field-grid">
           {ADVANCED_FIELDS.map((f) =>
             numberField(f.key, config[f.key] as number, set(f.key), f.label),
@@ -452,7 +563,7 @@ export function RunConfigForm({
       <button
         type="submit"
         className="primary-action"
-        disabled={disabled || coverageLoading || !trainingReady}
+        disabled={disabled || coverageLoading || !trainingReady || missingDependencies}
       >
         Start training
       </button>

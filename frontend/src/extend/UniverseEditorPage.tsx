@@ -566,7 +566,7 @@ export function UniverseEditorPage({
     <section className="panel universe-editor-page" data-testid="universe-editor-page">
       <header className="panel-head">
         <div>
-          <h3>Universe editor</h3>
+          <h1>Universe Editor</h1>
           <p className="panel-note">
             Resolve tickers, maintain point-in-time memberships, and keep entry/exit dates honest.
           </p>

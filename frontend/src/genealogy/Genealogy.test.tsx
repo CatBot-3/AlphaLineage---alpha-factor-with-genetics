@@ -26,17 +26,20 @@ describe("Genealogy (B4)", () => {
 
   it("expands a generation then a group to reveal fitness-sorted members", () => {
     render(<Genealogy lineage={lineage} />);
-    fireEvent.click(screen.getByText("Generation 1"));
+    fireEvent.click(screen.getByRole("button", { name: /Generation 1.*best 0\.5000/ }));
     // the most-promising method (elite, 0.5) leads
     const groups = screen.getAllByTestId("method-group");
     fireEvent.click(within(groups[0]).getByText("elite"));
     expect(screen.getAllByTestId("member-row").length).toBeGreaterThan(0);
   });
 
-  it("switches to the focused ancestry trace", () => {
+  it("shows the generation list, focused ancestry, and formula inspector together", () => {
     render(<Genealogy lineage={lineage} />);
-    fireEvent.click(screen.getByTestId("mode-ancestry"));
+    expect(screen.getByTestId("generation-list")).toBeInTheDocument();
     expect(screen.getByTestId("ancestry-view")).toBeInTheDocument();
     expect(screen.getByTestId("ancestry-view")).toHaveTextContent(/ancestor/i);
+    expect(screen.getByTestId("lineage-detail")).toHaveTextContent("node #2");
+    expect(screen.getByTestId("genealogy-formula-preview")).toHaveTextContent("close");
+    expect(screen.getAllByRole("separator", { name: /resize/i })).toHaveLength(2);
   });
 });

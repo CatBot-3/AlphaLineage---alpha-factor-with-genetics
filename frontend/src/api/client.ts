@@ -15,6 +15,7 @@ import type {
   FormulaValidation,
   FormulaTestJob,
   FormulaTestRequest,
+  FinalizationPlan,
   Lineage,
   MembershipSyncJob,
   MembershipSyncRequest,
@@ -24,13 +25,21 @@ import type {
   SavedFactor,
   SessionContinueRequest,
   SessionCreateRequest,
+  SessionFinalizationDetail,
+  SessionFinalizationHandle,
+  SessionFinalizationSummary,
   SessionState,
   SessionSummary,
+  SessionRoundSummary,
   Settings,
   SettingsUpdate,
   SymbolCandidate,
   SymbolValidation,
   TrainingCapabilities,
+  PortfolioStrategySpec,
+  StrategyComparisonDetail,
+  StrategyComparisonHandle,
+  StrategyComparisonSummary,
   UniverseInfo,
   UniverseCacheCoverage,
   UniversePreset,
@@ -420,8 +429,153 @@ export async function listSessions(): Promise<SessionSummary[]> {
   return jsonOrThrow(await fetch(`${BASE}/sessions`), "list sessions");
 }
 
-export async function getSessionLineage(sessionId: string): Promise<Lineage> {
-  return jsonOrThrow(await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/lineage`), "load lineage");
+export async function listSessionRounds(sessionId: string): Promise<SessionRoundSummary[]> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/rounds`),
+    "list session rounds",
+  );
+}
+
+export async function getSessionRound(sessionId: string, round: number): Promise<RunResult> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/rounds/${round}`),
+    "load session round",
+  );
+}
+
+export async function createStrategyComparison(
+  sessionId: string,
+  round: number,
+  strategies: PortfolioStrategySpec[],
+  confirmRepeat = false,
+): Promise<StrategyComparisonHandle> {
+  return jsonOrThrow(
+    await POST(
+      `/sessions/${encodeURIComponent(sessionId)}/rounds/${round}/strategy-comparisons`,
+      {
+        strategies,
+        ...(confirmRepeat ? { confirm_repeat: true } : {}),
+      },
+    ),
+    "compare validation strategies",
+  );
+}
+
+export async function listStrategyComparisons(
+  sessionId: string,
+  round: number,
+): Promise<StrategyComparisonSummary[]> {
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/sessions/${encodeURIComponent(sessionId)}/rounds/${round}/strategy-comparisons`,
+    ),
+    "list validation strategy comparisons",
+  );
+}
+
+export async function getStrategyComparison(
+  sessionId: string,
+  round: number,
+  comparisonId: string,
+): Promise<StrategyComparisonDetail> {
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/sessions/${encodeURIComponent(sessionId)}/rounds/${round}/strategy-comparisons/${encodeURIComponent(comparisonId)}`,
+    ),
+    "load validation strategy comparison",
+  );
+}
+
+export async function createFinalizationPlan(
+  sessionId: string,
+  round: number,
+  comparisonId: string,
+  primaryStrategyId: string,
+): Promise<FinalizationPlan> {
+  return jsonOrThrow(
+    await POST(
+      `/sessions/${encodeURIComponent(sessionId)}/rounds/${round}/finalization-plans`,
+      {
+        comparison_id: comparisonId,
+        primary_strategy_id: primaryStrategyId,
+      },
+    ),
+    "pin finalization strategy",
+  );
+}
+
+export async function listFinalizationPlans(
+  sessionId: string,
+  round: number,
+): Promise<FinalizationPlan[]> {
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/sessions/${encodeURIComponent(sessionId)}/rounds/${round}/finalization-plans`,
+    ),
+    "list finalization plans",
+  );
+}
+
+export async function getFinalizationPlan(
+  sessionId: string,
+  round: number,
+  planId: string,
+): Promise<FinalizationPlan> {
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/sessions/${encodeURIComponent(sessionId)}/rounds/${round}/finalization-plans/${encodeURIComponent(planId)}`,
+    ),
+    "load finalization plan",
+  );
+}
+
+export async function finalizeSessionRound(
+  sessionId: string,
+  round: number,
+  confirmRepeat = false,
+  strategyPlanId?: string | null,
+): Promise<SessionFinalizationHandle> {
+  return jsonOrThrow(
+    await POST(
+      `/sessions/${encodeURIComponent(sessionId)}/rounds/${round}/finalize`,
+      {
+        confirm_repeat: confirmRepeat,
+        ...(strategyPlanId ? { strategy_plan_id: strategyPlanId } : {}),
+      },
+    ),
+    "finalize training round",
+  );
+}
+
+export async function listSessionFinalizations(
+  sessionId: string,
+): Promise<SessionFinalizationSummary[]> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/finalizations`),
+    "list holdout finalizations",
+  );
+}
+
+export async function getSessionFinalization(
+  sessionId: string,
+  evaluationId: string,
+): Promise<SessionFinalizationDetail> {
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/sessions/${encodeURIComponent(sessionId)}/finalizations/${encodeURIComponent(
+        evaluationId,
+      )}`,
+    ),
+    "load holdout finalization",
+  );
+}
+
+export async function getSessionLineage(sessionId: string, round?: number): Promise<Lineage> {
+  const suffix = round === undefined ? "" : `?round=${encodeURIComponent(String(round))}`;
+  return jsonOrThrow(
+    await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/lineage${suffix}`),
+    "load lineage",
+  );
 }
 
 export async function stopSession(sessionId: string): Promise<{ stopping: boolean }> {

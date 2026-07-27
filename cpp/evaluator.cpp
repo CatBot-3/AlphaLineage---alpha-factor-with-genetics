@@ -28,8 +28,9 @@ namespace py = pybind11;
 
 using Vec = std::vector<double>;
 static const double NA = std::numeric_limits<double>::quiet_NaN();
-static constexpr int ABI_VERSION = 5;
+static constexpr int ABI_VERSION = 8;
 static constexpr int MAX_NATIVE_WORKERS = 32;
+static constexpr ssize_t SCORE_COLUMNS = 12;
 
 enum Opcode : int32_t {
   OP_LOAD = 0,
@@ -942,11 +943,13 @@ static void score_plan(const double* fields, ssize_t n_fields, ssize_t t_count,
   compute_plan(fields, n_fields, t_count, n_symbols, plan, factor.data());
 
   std::vector<double> factor_values, target_values, factor_ranks, target_ranks, daily;
+  std::vector<int> active_names;
   factor_values.reserve(n_symbols);
   target_values.reserve(n_symbols);
   factor_ranks.reserve(n_symbols);
   target_ranks.reserve(n_symbols);
   daily.reserve(t_count);
+  active_names.reserve(t_count);
   const int required_names = std::max(2, min_names);
   for (ssize_t t = 0; t < t_count; ++t) {
     factor_values.clear();
@@ -969,35 +972,64 @@ static void score_plan(const double* fields, ssize_t n_fields, ssize_t t_count,
       y_values = &target_ranks;
     }
     const double correlation = row_correlation(*x_values, *y_values);
-    if (!std::isnan(correlation)) daily.push_back(correlation);
+    if (!std::isnan(correlation)) {
+      daily.push_back(correlation);
+      active_names.push_back(static_cast<int>(factor_values.size()));
+    }
   }
 
-  double raw = 0.0, information_ratio = 0.0;
+  double raw = 0.0, information_ratio = 0.0, signed_mean = 0.0, oriented_mean = 0.0;
+  double mean_absolute = 0.0, polarity = 1.0, oriented_information_ratio = 0.0;
+  double sign_consistency = 0.0, average_active_names = 0.0, minimum_active_names = 0.0;
   if (static_cast<int>(daily.size()) >= min_valid_dates) {
-    double signed_sum = 0.0, objective_sum = 0.0;
+    double signed_sum = 0.0, absolute_sum = 0.0;
     for (const double value : daily) {
       signed_sum += value;
-      objective_sum += absolute ? std::fabs(value) : value;
+      absolute_sum += std::fabs(value);
     }
     const double count = static_cast<double>(daily.size());
-    raw = objective_sum / count;
-    const double mean = signed_sum / count;
+    signed_mean = signed_sum / count;
+    oriented_mean = std::fabs(signed_mean);
+    mean_absolute = absolute_sum / count;
+    polarity = signed_mean < 0.0 ? -1.0 : 1.0;
+    raw = absolute ? oriented_mean : signed_mean;
     if (daily.size() >= 2) {
       double squared = 0.0;
       for (const double value : daily) {
-        const double delta = value - mean;
+        const double delta = value - signed_mean;
         squared += delta * delta;
       }
       const double standard_deviation = std::sqrt(squared / (count - 1.0));
       if (standard_deviation != 0.0 && std::isfinite(standard_deviation)) {
-        information_ratio = mean / standard_deviation;
+        information_ratio = signed_mean / standard_deviation;
       }
     }
+    oriented_information_ratio = polarity * information_ratio;
+    size_t consistent = 0;
+    int minimum_names_observed = std::numeric_limits<int>::max();
+    double names_sum = 0.0;
+    for (size_t index = 0; index < daily.size(); ++index) {
+      if (daily[index] * polarity > 0.0) ++consistent;
+      names_sum += active_names[index];
+      minimum_names_observed = std::min(minimum_names_observed, active_names[index]);
+    }
+    sign_consistency = static_cast<double>(consistent) / count;
+    average_active_names = names_sum / count;
+    minimum_active_names = static_cast<double>(minimum_names_observed);
     if (!std::isfinite(raw)) raw = 0.0;
   }
   destination[0] = raw - parsimony * tree_size;
   destination[1] = raw;
   destination[2] = information_ratio;
+  destination[3] = signed_mean;
+  destination[4] = oriented_mean;
+  destination[5] = mean_absolute;
+  destination[6] = polarity;
+  destination[7] = oriented_information_ratio;
+  destination[8] = sign_consistency;
+  destination[9] = static_cast<double>(daily.size());
+  destination[10] = average_active_names;
+  destination[11] = minimum_active_names;
 }
 
 static py::array_t<double> score_many(Arr<double> fields, py::iterable plan_values,
@@ -1026,7 +1058,7 @@ static py::array_t<double> score_many(Arr<double> fields, py::iterable plan_valu
   const std::vector<int32_t> sizes = copy_1d(tree_sizes, "tree_sizes");
   if (sizes.size() != plans.size()) throw std::runtime_error("tree_sizes length mismatch");
   py::array_t<double> result(
-      std::vector<ssize_t>{static_cast<ssize_t>(plans.size()), static_cast<ssize_t>(3)});
+      std::vector<ssize_t>{static_cast<ssize_t>(plans.size()), SCORE_COLUMNS});
   double* destination = result.mutable_data();
   if (plans.empty()) return result;
 
@@ -1047,7 +1079,7 @@ static py::array_t<double> score_many(Arr<double> fields, py::iterable plan_valu
           if (index >= plans.size()) return;
           score_plan(field_data, n_fields, t_count, n_symbols, plans[index], forward_data,
                      sizes[index], method, absolute, parsimony, min_names, min_valid_dates,
-                     destination + index * 3);
+                     destination + index * SCORE_COLUMNS);
         }
       } catch (...) {
         std::lock_guard<std::mutex> lock(failure_mutex);

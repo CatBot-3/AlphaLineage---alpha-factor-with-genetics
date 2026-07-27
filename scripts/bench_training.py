@@ -31,7 +31,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -133,8 +133,37 @@ def _exact_float(value: float | int) -> str:
     return float(value).hex()
 
 
+def _canonical_hash_value(value: Any) -> Any:
+    """Recursively make mixed diagnostics deterministic and JSON-safe for hashing."""
+    if isinstance(value, np.generic):
+        return _canonical_hash_value(value.item())
+    if isinstance(value, float):
+        return {"__float_hex__": _exact_float(value)}
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("trajectory mappings must use string keys")
+        return {
+            key: _canonical_hash_value(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_hash_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _canonical_hash_value(value.tolist())
+    raise TypeError(
+        f"unsupported trajectory value {type(value).__module__}."
+        f"{type(value).__qualname__}"
+    )
+
+
 def _hash(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(
+        _canonical_hash_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -143,16 +172,11 @@ def _trajectory(gp: GP, recorder: _LineageRecorder) -> dict[str, Any]:
         {
             "tree": to_json(individual.tree),
             "fitness": _exact_float(individual.fitness),
-            "metrics": {
-                name: _exact_float(value) for name, value in sorted(individual.metrics.items())
-            },
+            "metrics": _canonical_hash_value(individual.metrics),
         }
         for individual in gp.population
     ]
-    history = [
-        {name: _exact_float(value) for name, value in sorted(row.items())}
-        for row in gp.history
-    ]
+    history = [_canonical_hash_value(row) for row in gp.history]
     components = {
         "population": population,
         "history": history,

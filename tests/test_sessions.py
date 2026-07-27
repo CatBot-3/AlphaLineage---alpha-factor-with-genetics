@@ -67,6 +67,61 @@ def _create(client: TestClient, **overrides) -> tuple[str, dict]:
     return payload["session_id"], final
 
 
+def _finalize(
+    client: TestClient,
+    session_id: str,
+    round_index: int = 0,
+    *,
+    confirm_repeat: bool = False,
+) -> dict:
+    response = client.post(
+        f"/sessions/{session_id}/rounds/{round_index}/finalize",
+        json={"confirm_repeat": confirm_repeat},
+    )
+    assert response.status_code == 200, response.text
+    final = _poll_job(client, response.json()["job_id"])
+    assert final["status"] == "done", final
+    return final
+
+
+def _downgrade_to_legacy_embedded_report(
+    client: TestClient,
+    session_id: str,
+) -> dict:
+    import json
+
+    finalized = _finalize(client, session_id)["result"]
+    legacy = client.get(f"/sessions/{session_id}/rounds/0").json()
+    legacy["report"] = finalized["report"]
+    legacy["oos_backtest"] = finalized["oos_backtest"]
+    legacy["test_reads"] = finalized["test_reads"]
+    legacy["test_read_index"] = 1
+    legacy.pop("round_index", None)
+    metadata = dict(legacy.pop("round_metadata", {}))
+    metadata.update(
+        {
+            "report_available": True,
+            "test_read_index": 1,
+            "evidence_status": "locked",
+        }
+    )
+    legacy["round_metadata"] = metadata
+
+    state = api_app.sessions.load_session(session_id)
+    state.pop("rounds", None)
+    state.pop("finalizations", None)
+    api_app.sessions.save_session(state)
+    result_path = api_app.sessions.session_dir(session_id) / "result.json"
+    result_path.write_text(json.dumps(legacy), encoding="utf-8")
+    api_app.sessions.round_path(session_id, 0).unlink()
+    finalization_path = api_app.sessions.finalization_path(
+        session_id,
+        finalized["evaluation_id"],
+    )
+    finalization_path.unlink()
+    return legacy
+
+
 # --- pure helpers (P1: lock the time boundary) -----------------------------------
 def test_split_from_boundaries_excludes_test_dates():
     from alphalineage.api.sessions import derive_boundaries, split_from_boundaries
@@ -95,13 +150,292 @@ def test_session_create_run_complete(client):
     state = client.get(f"/sessions/{session_id}").json()
     assert state["boundaries"]["test_start"]
     assert state["cumulative_trials"] > 0
-    assert state["test_reads"] == 1
+    assert state["test_reads"] == 0
     assert len(state["segments"]) == 1 and state["segments"][0]["status"] == "done"
 
     result = final["result"]
-    assert "deflated_sharpe" in result["report"]
+    assert result["report"] is None
+    assert result["validation_only"] is True
     assert result["session_id"] == session_id
-    assert result["test_reads"] == 1
+    assert result["test_reads"] == 0
+
+    finalized = _finalize(client, session_id)
+    assert "deflated_sharpe" in finalized["result"]["report"]
+    assert finalized["result"]["evidence_status"] == "locked_first_read"
+    compatibility_plan_id = finalized["result"]["strategy_plan_id"]
+    assert compatibility_plan_id.startswith("compat-q20-r0-")
+    compatibility_plan = client.get(
+        f"/sessions/{session_id}/rounds/0/finalization-plans/"
+        f"{compatibility_plan_id}"
+    ).json()
+    assert compatibility_plan["source"] == "compatibility_default"
+    assert compatibility_plan["strategies"] == [
+        {"id": "quantile-20", "scheme": "quantile_ls", "quantile": 0.2}
+    ]
+    reloaded = client.get(f"/sessions/{session_id}").json()
+    assert reloaded["test_reads"] == 1
+    assert reloaded["finalization_job"]["id"] == finalized["job_id"]
+    assert (
+        reloaded["finalization_job"]["metadata"]["evaluation_id"]
+        == finalized["result"]["evaluation_id"]
+    )
+    assert reloaded["finalization_job"]["metadata"]["round_index"] == 0
+
+
+def test_completed_validation_rounds_are_immutable_with_latest_alias(client):
+    session_id, first = _create(client)
+
+    summaries = client.get(f"/sessions/{session_id}/rounds")
+    assert summaries.status_code == 200
+    assert len(summaries.json()) == 1
+    summary = summaries.json()[0]
+    assert summary["index"] == 0
+    assert summary["segment_index"] == 0
+    assert summary["report_available"] is False
+    assert summary["validation_only"] is True
+    assert summary["test_read_index"] is None
+    assert summary["evidence_status"] == "validation_only"
+    assert summary["legacy"] is False
+    first_round = client.get(f"/sessions/{session_id}/rounds/0").json()
+    assert first_round["round_index"] == 0
+    assert first_round["segment"] == 0
+    assert first_round["report"] is None
+    assert first_round["selection"] == first["result"]["selection"]
+
+    continued = client.post(
+        f"/sessions/{session_id}/continue", json={"generations": 1}
+    ).json()
+    second = _poll_job(client, continued["job_id"])
+    assert second["status"] == "done", second
+
+    rounds = client.get(f"/sessions/{session_id}/rounds").json()
+    assert [item["index"] for item in rounds] == [0, 1]
+    assert [item["evidence_status"] for item in rounds] == [
+        "validation_only",
+        "validation_only",
+    ]
+    assert [item["test_read_index"] for item in rounds] == [None, None]
+    assert client.get(f"/sessions/{session_id}/rounds/0").json() == first_round
+
+    latest = client.get(f"/sessions/{session_id}").json()["result"]
+    assert latest["round_index"] == 1
+    assert latest["report"] is None
+    assert client.get(f"/sessions/{session_id}/finalizations").json() == []
+
+    _finalize(client, session_id, 0)
+    repeat = client.post(f"/sessions/{session_id}/rounds/1/finalize", json={})
+    assert repeat.status_code == 409
+    _finalize(client, session_id, 1, confirm_repeat=True)
+    finalizations = client.get(f"/sessions/{session_id}/finalizations").json()
+    assert [item["evidence_status"] for item in finalizations] == [
+        "locked_first_read",
+        "repeated_same_holdout",
+    ]
+    assert [item["same_holdout_read_index"] for item in finalizations] == [1, 2]
+
+
+def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
+    client, monkeypatch
+):
+    session_id, _ = _create(client)
+    real_compare = api_app.sessions.compare_validation_strategies
+
+    def eligible_fixture(*args, **kwargs):
+        results = real_compare(*args, **kwargs)
+        for result in results:
+            result["eligible"] = True
+            for fold in result["folds"]:
+                fold["adequate_coverage"] = True
+                fold["coverage_failures"] = []
+        return results
+
+    # The compact 180-date session fixture intentionally cannot supply three
+    # 60-date validation folds. This test isolates artifact pinning; fold-gate
+    # behavior is covered independently.
+    monkeypatch.setattr(
+        api_app.sessions,
+        "compare_validation_strategies",
+        eligible_fixture,
+    )
+    comparison = client.post(
+        f"/sessions/{session_id}/rounds/0/strategy-comparisons",
+        json={
+            "strategies": [
+                {"id": "q20", "scheme": "quantile_ls", "quantile": 0.2},
+                {"id": "rank", "scheme": "rank_proportional"},
+            ]
+        },
+    )
+    assert comparison.status_code == 200, comparison.text
+    handle = comparison.json()
+    completed = _poll_job(client, handle["job_id"])
+    assert completed["status"] == "done", completed
+    detail = client.get(
+        f"/sessions/{session_id}/rounds/0/strategy-comparisons/"
+        f"{handle['comparison_id']}"
+    ).json()
+    assert detail["status"] == "done"
+    assert [item["strategy_id"] for item in detail["strategy_results"]] == [
+        "q20",
+        "rank",
+    ]
+    assert all(item["oos_backtest"] is None for item in detail["strategy_results"])
+    assert all("validation_backtest" in item for item in detail["strategy_results"])
+
+    plan_response = client.post(
+        f"/sessions/{session_id}/rounds/0/finalization-plans",
+        json={
+            "comparison_id": handle["comparison_id"],
+            "primary_strategy_id": "rank",
+        },
+    )
+    assert plan_response.status_code == 200, plan_response.text
+    plan = plan_response.json()
+    assert plan["primary_strategy_id"] == "rank"
+    loaded_plan = client.get(
+        f"/sessions/{session_id}/rounds/0/finalization-plans/"
+        f"{plan['strategy_plan_id']}"
+    ).json()
+    assert loaded_plan == plan
+
+    queued = client.post(
+        f"/sessions/{session_id}/rounds/0/finalize",
+        json={"strategy_plan_id": plan["strategy_plan_id"]},
+    )
+    assert queued.status_code == 200, queued.text
+    assert queued.json()["comparison_id"] == handle["comparison_id"]
+    finalized = _poll_job(client, queued.json()["job_id"])
+    assert finalized["status"] == "done", finalized
+    artifact = finalized["result"]
+    assert artifact["strategy_plan_id"] == plan["strategy_plan_id"]
+    assert artifact["comparison_id"] == handle["comparison_id"]
+    assert artifact["primary_strategy_id"] == "rank"
+    assert [item["strategy_id"] for item in artifact["strategy_results"]] == [
+        "q20",
+        "rank",
+    ]
+    primary = next(
+        item for item in artifact["strategy_results"] if item["role"] == "primary"
+    )
+    assert artifact["oos_backtest"] == primary["oos_backtest"]
+    assert artifact["report"]["n_trials"] % 2 == 0
+
+    round_summary = client.get(f"/sessions/{session_id}/rounds").json()[0]
+    assert round_summary["latest_strategy_comparison_id"] == handle["comparison_id"]
+    assert round_summary["latest_strategy_plan_id"] == plan["strategy_plan_id"]
+
+    blocked = client.post(
+        f"/sessions/{session_id}/rounds/0/strategy-comparisons",
+        json={
+            "strategies": [
+                {"id": "q25", "scheme": "quantile_ls", "quantile": 0.25}
+            ]
+        },
+    )
+    assert blocked.status_code == 409
+    assert "confirm_repeat=true" in blocked.text
+    confirmed = client.post(
+        f"/sessions/{session_id}/rounds/0/strategy-comparisons",
+        json={
+            "strategies": [
+                {"id": "q25", "scheme": "quantile_ls", "quantile": 0.25}
+            ],
+            "confirm_repeat": True,
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    confirmed_job = _poll_job(client, confirmed.json()["job_id"])
+    assert confirmed_job["status"] == "done", confirmed_job
+    confirmed_detail = client.get(
+        f"/sessions/{session_id}/rounds/0/strategy-comparisons/"
+        f"{confirmed.json()['comparison_id']}"
+    ).json()
+    assert confirmed_detail["evidence_status"] == "post_holdout_adaptive"
+    assert confirmed_detail["prior_holdout_reads"] == 1
+
+
+def test_round_lineage_is_truncated_at_its_generation_boundary(client):
+    session_id, _ = _create(client)
+    continued = client.post(
+        f"/sessions/{session_id}/continue", json={"generations": 1}
+    ).json()
+    assert _poll_job(client, continued["job_id"])["status"] == "done"
+
+    first = client.get(f"/sessions/{session_id}/lineage?round=0")
+    assert first.status_code == 200
+    payload = first.json()
+    boundary = payload["metadata"]["generation_boundary"]
+    assert boundary == _SMALL["generations"]
+    assert max(node["generation"] for node in payload["nodes"]) == boundary
+    assert payload["metadata"]["selected_lineage_node_id"] is not None
+
+    assert client.get(f"/sessions/{session_id}/lineage?round=99").status_code == 404
+    assert client.get(f"/sessions/{session_id}/rounds/99").status_code == 404
+
+
+def test_session_summary_exposes_resume_metadata(client):
+    session_id, _ = _create(client)
+    summary = next(item for item in client.get("/sessions").json() if item["id"] == session_id)
+    assert summary["updated_at"] >= summary["created_at"]
+    assert summary["current_generation"] == _SMALL["generations"]
+    assert summary["last_status"] == "done"
+    assert summary["has_checkpoint"] is True
+    assert summary["has_report"] is False
+    assert summary["latest_completed_round"] == 0
+    assert summary["requested_generations"] == _SMALL["generations"]
+    _finalize(client, session_id)
+    updated = next(item for item in client.get("/sessions").json() if item["id"] == session_id)
+    assert updated["has_report"] is True
+    assert updated["finalizations"] == 1
+
+
+def test_legacy_latest_result_is_exposed_and_pinned_before_continue(client):
+    session_id, _ = _create(client)
+    _downgrade_to_legacy_embedded_report(client, session_id)
+
+    before = client.get(f"/sessions/{session_id}/rounds").json()
+    assert len(before) == 1 and before[0]["index"] == 0
+    assert before[0]["legacy"] is True
+    assert client.get(f"/sessions/{session_id}/rounds/0").json()["round_index"] == 0
+
+    continued = client.post(
+        f"/sessions/{session_id}/continue", json={"generations": 1}
+    ).json()
+    assert _poll_job(client, continued["job_id"])["status"] == "done"
+    after = client.get(f"/sessions/{session_id}/rounds").json()
+    assert [item["index"] for item in after] == [0, 1]
+    assert api_app.sessions.round_path(session_id, 0).exists()
+    legacy_evidence = client.get(f"/sessions/{session_id}/finalizations").json()
+    assert legacy_evidence[0]["evaluation_id"] == "legacy-round-0"
+
+
+def test_contaminated_legacy_report_is_viewable_but_requires_restart(client):
+    import json
+
+    session_id, _ = _create(client)
+    _downgrade_to_legacy_embedded_report(client, session_id)
+    state = api_app.sessions.load_session(session_id)
+    for key in ("scorer_version", "evolution_version", "adjustment_version"):
+        state["segments"][-1].pop(key, None)
+    api_app.sessions.save_session(state)
+
+    result_path = api_app.sessions.session_dir(session_id) / "result.json"
+    legacy = json.loads(result_path.read_text(encoding="utf-8"))
+    for key in ("scorer_version", "evolution_version", "adjustment_version"):
+        legacy["round_metadata"].pop(key, None)
+    result_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    summary = client.get(f"/sessions/{session_id}/rounds").json()[0]
+    assert summary["validity"] == "invalid_legacy_semantics"
+    assert summary["restart_required"] is True
+    detail = client.get(f"/sessions/{session_id}/rounds/0").json()
+    assert detail["validity"] == "invalid_legacy_semantics"
+
+    continued = client.post(
+        f"/sessions/{session_id}/continue", json={"generations": 1}
+    )
+    assert continued.status_code == 409
+    assert "Restart with the same setup" in continued.json()["detail"]
 
 
 def test_session_pins_active_formula_revisions(client):
@@ -151,8 +485,12 @@ def test_session_seeded_from_saved_factor(client):
     lineage = client.get(f"/sessions/{session_id}/lineage").json()
     seeds = [n for n in lineage["nodes"] if n["op"] == "seed"]
     assert any(to_json(from_dict(n["tree"])) == to_json(from_dict(seed_tree)) for n in seeds)
-    # inherited the prior session's trial baseline (deflation never softens)
-    assert final["result"]["report"]["n_trials"] >= 500
+    # Inherited research/evidence baselines remain separate until explicit finalization.
+    assert final["result"]["searched_trials"] >= 500
+    state = client.get(f"/sessions/{session_id}").json()
+    assert state["inherited_test_reads"] == 1
+    assert state["session_holdout_reads"] == 0
+    assert state["test_reads"] == 1
 
 
 def test_unknown_session_is_404(client):
@@ -251,7 +589,7 @@ def test_continue_warm_start_carries_population(client):
     assert state["segments"][1]["gen_start"] == gens_after_first
 
 
-def test_continue_trials_increase_and_oos_read_flagged(client):
+def test_continue_trials_increase_without_reading_holdout(client):
     session_id, first = _create(client)
     trials_after_first = first["result"]["cumulative_trials"]
 
@@ -260,8 +598,38 @@ def test_continue_trials_increase_and_oos_read_flagged(client):
     assert final["status"] == "done", final
 
     assert final["result"]["cumulative_trials"] >= trials_after_first  # monotone (P2)
-    assert final["result"]["test_reads"] == 2  # second OOS read
-    assert final["result"]["repeated_oos_warning"] is True  # surfaced (P3)
+    assert final["result"]["test_reads"] == 0
+    assert final["result"]["repeated_oos_warning"] is False
+    assert client.get(f"/sessions/{session_id}/finalizations").json() == []
+
+
+def test_rounds_after_first_holdout_read_are_post_holdout_adaptive(client):
+    session_id, _ = _create(client)
+    _finalize(client, session_id)
+
+    continued = client.post(
+        f"/sessions/{session_id}/continue",
+        json={"generations": 1},
+    ).json()
+    assert _poll_job(client, continued["job_id"])["status"] == "done"
+    second_round = client.get(f"/sessions/{session_id}/rounds/1").json()
+    assert second_round["evidence_status"] == "post_holdout_adaptive"
+    assert second_round["round_metadata"]["evidence_status"] == "post_holdout_adaptive"
+
+    unconfirmed = client.post(
+        f"/sessions/{session_id}/rounds/1/finalize",
+        json={},
+    )
+    assert unconfirmed.status_code == 409
+    repeated = _finalize(
+        client,
+        session_id,
+        1,
+        confirm_repeat=True,
+    )["result"]
+    assert repeated["evidence_status"] == "repeated_same_holdout"
+    assert repeated["source_round_evidence_status"] == "post_holdout_adaptive"
+    assert repeated["report"]["significant"] is False
 
 
 def test_continue_changed_universe_keeps_locked_boundary(client):
@@ -280,8 +648,9 @@ def test_continue_changed_universe_keeps_locked_boundary(client):
 
 
 def test_continue_added_operator_deflates_harder(client):
-    session_id, first = _create(client)
-    base_trials = first["result"]["report"]["n_trials"]
+    session_id, _ = _create(client)
+    base_report = _finalize(client, session_id)["result"]["report"]
+    base_trials = base_report["n_trials"]
 
     cont = client.post(
         f"/sessions/{session_id}/continue",
@@ -290,7 +659,13 @@ def test_continue_added_operator_deflates_harder(client):
     final = _poll_job(client, cont.json()["job_id"])
     assert final["status"] == "done", final
     # a larger operator palette inflates the effective trial count (invariant 1, P7-T3)
-    assert final["result"]["report"]["n_trials"] > base_trials
+    repeated_report = _finalize(
+        client,
+        session_id,
+        1,
+        confirm_repeat=True,
+    )["result"]["report"]
+    assert repeated_report["n_trials"] > base_trials
 
 
 def test_continue_while_running_is_409(client):
@@ -349,6 +724,54 @@ def test_active_job_is_persisted_blocks_continue_and_can_stop(client, monkeypatc
 
 def test_continue_unknown_session_is_404(client):
     assert client.post("/sessions/nope/continue", json={"generations": 1}).status_code == 404
+
+
+def test_cancelled_finalization_does_not_publish_partial_evidence(client, monkeypatch):
+    from alphalineage.core.gp import TrainingCancelled
+
+    def cancel_report(*args, **kwargs):
+        raise TrainingCancelled()
+
+    monkeypatch.setattr("alphalineage.api.sessions.build_report", cancel_report)
+    body = {"name": "cancel-report", "universe": "sp500-lite", "config": _SMALL}
+    created = client.post("/sessions", json=body).json()
+    final = _poll_job(client, created["job_id"])
+    assert final["status"] == "done"
+    assert final["result"]["report"] is None
+
+    session_id = created["session_id"]
+    request = client.post(
+        f"/sessions/{session_id}/rounds/0/finalize",
+        json={},
+    )
+    stopped = _poll_job(client, request.json()["job_id"])
+    assert stopped["status"] == "stopped"
+    assert client.get(f"/sessions/{session_id}/rounds").json()
+    assert client.get(f"/sessions/{session_id}/finalizations").json() == []
+    state_payload = client.get(f"/sessions/{session_id}").json()
+    assert state_payload["result"]["round_index"] == 0
+    assert state_payload["test_reads"] == 0
+    state = api_app.sessions.load_session(session_id)
+    assert state["active_finalization_job_id"] is None
+
+
+def test_failed_attempt_is_retained_without_a_round(client, monkeypatch):
+    def fail_segment(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(api_app.sessions, "run_segment", fail_segment)
+    created = client.post(
+        "/sessions",
+        json={"name": "failed-round", "universe": "sp500-lite", "config": _SMALL},
+    ).json()
+    final = _poll_job(client, created["job_id"])
+    assert final["status"] == "failed"
+
+    session_id = created["session_id"]
+    state = api_app.sessions.load_session(session_id)
+    assert state["segments"][-1]["status"] == "failed"
+    assert state["segments"][-1]["report_available"] is False
+    assert client.get(f"/sessions/{session_id}/rounds").json() == []
 
 
 def test_report_summary_cache_roundtrip_and_context_invalidation(signal_panel, tmp_path):

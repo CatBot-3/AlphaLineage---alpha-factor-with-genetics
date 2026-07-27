@@ -15,6 +15,7 @@ import pandas as pd
 from alphalineage.core.primitives import OPERAND_FIELDS
 from alphalineage.data.adjust import adjust
 from alphalineage.data.cache import ParquetCache
+from alphalineage.data.integrity import require_price_integrity
 
 # Operand field -> adjusted source column produced by adjust().
 _PRICE_SOURCE = {
@@ -99,7 +100,9 @@ class Panel:
         for symbol in symbols:
             if not store.has(symbol):
                 continue
-            adjusted[symbol] = adjust(store.load(symbol))
+            raw = store.load(symbol)
+            require_price_integrity(symbol, raw)
+            adjusted[symbol] = adjust(raw)
         if not adjusted:
             raise ValueError("no cached symbols found to build a panel")
 
