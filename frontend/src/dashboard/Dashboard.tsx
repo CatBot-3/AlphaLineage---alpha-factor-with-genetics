@@ -1,4 +1,5 @@
 import type { HistoryPoint, Report, RunResult } from "../api/types";
+import { BenchmarkComparison } from "./BenchmarkComparison";
 import { LineChart } from "./LineChart";
 
 function decimal(value: number | null | undefined, digits = 3): string {
@@ -55,16 +56,17 @@ export function Dashboard({
   report,
   history,
   extra,
+  enableBenchmarks = false,
 }: {
   report: Report;
   history: HistoryPoint[];
   extra?: RunResult;
+  enableBenchmarks?: boolean;
 }) {
   const testReads = extra?.test_reads;
   const repeatedOos = (testReads ?? 0) > 1;
   const holdout = extra?.oos_backtest ?? report.oos_backtest;
   const holdoutMetrics = holdout?.metrics;
-  const equity = holdout?.normalized_equity ?? [];
   const resources = extra?.resources;
 
   return (
@@ -126,16 +128,11 @@ export function Dashboard({
           <div><h3>Locked holdout performance</h3><p>Portfolio evidence calculated once during finalization, after costs.</p></div>
           {holdout && <span>{holdout.observations} observations</span>}
         </header>
-        {equity.length > 0 ? (
-          <LineChart
-            title="Normalized net equity"
-            description="Compounded locked-holdout returns after commission and slippage. The dashed baseline is the starting value of one."
-            baseline={1}
-            series={[{ label: "Net equity", color: "#2563eb", points: equity.map((point) => ({ x: point.date, value: point.value })) }]}
-          />
-        ) : (
-          <p className="chart-empty">Equity history is unavailable for this legacy result.</p>
-        )}
+        <BenchmarkComparison
+          equity={holdout?.normalized_equity}
+          returns={holdout?.returns}
+          enabled={enableBenchmarks}
+        />
         <div className="metric-grid metric-grid--secondary">
           <Metric label="Net Sharpe" value={decimal(holdoutMetrics?.net_sharpe)} />
           <Metric label="Gross Sharpe" value={decimal(holdoutMetrics?.gross_sharpe)} />

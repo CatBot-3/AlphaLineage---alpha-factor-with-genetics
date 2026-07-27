@@ -1,5 +1,11 @@
 import type { Connection, ReactFlowInstance } from "@xyflow/react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+} from "react";
 import {
   addFormula,
   deleteFormula,
@@ -75,8 +81,291 @@ interface PendingInsert {
   inputIndex: number;
 }
 
+type FormulaPanelSide = "library" | "inspector";
+
+interface FormulaPanelLayout {
+  libraryWidth: number;
+  inspectorWidth: number;
+  libraryCollapsed: boolean;
+  inspectorCollapsed: boolean;
+}
+
+interface FormulaPanelResize {
+  side: FormulaPanelSide;
+  startX: number;
+  startWidth: number;
+  startedCollapsed: boolean;
+}
+
+const FORMULA_PANEL_LAYOUT_STORAGE_KEY = "alphalineage.formula-builder.panel-layout.v1";
+const FORMULA_PANEL_HANDLE_WIDTH = 8;
+const FORMULA_STAGE_MIN_WIDTH = 420;
+const FORMULA_PANEL_COLLAPSE_OVERSHOOT = 64;
+const FORMULA_PANEL_REOPEN_DISTANCE = 48;
+const FORMULA_PANEL_KEYBOARD_STEP = 20;
+const FORMULA_PANEL_LIMITS: Record<FormulaPanelSide, { min: number; max: number; defaultWidth: number }> = {
+  library: { min: 240, max: 440, defaultWidth: 300 },
+  inspector: { min: 260, max: 480, defaultWidth: 320 },
+};
+
+const DEFAULT_FORMULA_PANEL_LAYOUT: FormulaPanelLayout = {
+  libraryWidth: FORMULA_PANEL_LIMITS.library.defaultWidth,
+  inspectorWidth: FORMULA_PANEL_LIMITS.inspector.defaultWidth,
+  libraryCollapsed: false,
+  inspectorCollapsed: false,
+};
+
+function clampPanelWidth(side: FormulaPanelSide, value: number): number {
+  const { min, max } = FORMULA_PANEL_LIMITS[side];
+  return Math.min(max, Math.max(min, value));
+}
+
+function readFormulaPanelLayout(): FormulaPanelLayout {
+  if (typeof window === "undefined") return DEFAULT_FORMULA_PANEL_LAYOUT;
+  try {
+    const raw = window.sessionStorage.getItem(FORMULA_PANEL_LAYOUT_STORAGE_KEY);
+    if (!raw) return DEFAULT_FORMULA_PANEL_LAYOUT;
+    const parsed = JSON.parse(raw) as Partial<FormulaPanelLayout>;
+    return {
+      libraryWidth: clampPanelWidth(
+        "library",
+        typeof parsed.libraryWidth === "number" && Number.isFinite(parsed.libraryWidth)
+          ? parsed.libraryWidth
+          : DEFAULT_FORMULA_PANEL_LAYOUT.libraryWidth,
+      ),
+      inspectorWidth: clampPanelWidth(
+        "inspector",
+        typeof parsed.inspectorWidth === "number" && Number.isFinite(parsed.inspectorWidth)
+          ? parsed.inspectorWidth
+          : DEFAULT_FORMULA_PANEL_LAYOUT.inspectorWidth,
+      ),
+      libraryCollapsed: parsed.libraryCollapsed === true,
+      inspectorCollapsed: parsed.inspectorCollapsed === true,
+    };
+  } catch {
+    return DEFAULT_FORMULA_PANEL_LAYOUT;
+  }
+}
+
+function updateFormulaPanel(
+  layout: FormulaPanelLayout,
+  side: FormulaPanelSide,
+  width: number,
+  collapsed: boolean,
+): FormulaPanelLayout {
+  return side === "library"
+    ? { ...layout, libraryWidth: width, libraryCollapsed: collapsed }
+    : { ...layout, inspectorWidth: width, inspectorCollapsed: collapsed };
+}
+
+function fitFormulaPanelLayout(
+  layout: FormulaPanelLayout,
+  workspaceWidth: number,
+  constrainedPriority: FormulaPanelSide | null = null,
+): FormulaPanelLayout {
+  const fitted: FormulaPanelLayout = {
+    ...layout,
+    libraryWidth: clampPanelWidth("library", layout.libraryWidth),
+    inspectorWidth: clampPanelWidth("inspector", layout.inspectorWidth),
+  };
+  if (!Number.isFinite(workspaceWidth) || workspaceWidth <= 0) return fitted;
+
+  const panelBudget = Math.max(
+    0,
+    Math.floor(workspaceWidth) - FORMULA_STAGE_MIN_WIDTH - (FORMULA_PANEL_HANDLE_WIDTH * 2),
+  );
+  const visibleSides = (["library", "inspector"] as FormulaPanelSide[]).filter((side) => (
+    side === "library" ? !fitted.libraryCollapsed : !fitted.inspectorCollapsed
+  ));
+  if (visibleSides.length === 0) return fitted;
+
+  const widthFor = (side: FormulaPanelSide) => (
+    side === "library" ? fitted.libraryWidth : fitted.inspectorWidth
+  );
+  const totalWidth = visibleSides.reduce((total, side) => total + widthFor(side), 0);
+  if (totalWidth <= panelBudget) return fitted;
+
+  const minimumWidth = visibleSides.reduce(
+    (total, side) => total + FORMULA_PANEL_LIMITS[side].min,
+    0,
+  );
+  if (panelBudget >= minimumWidth) {
+    const requestedExtra = visibleSides.reduce(
+      (total, side) => total + widthFor(side) - FORMULA_PANEL_LIMITS[side].min,
+      0,
+    );
+    const availableExtra = panelBudget - minimumWidth;
+    const scale = requestedExtra > 0 ? Math.min(1, availableExtra / requestedExtra) : 0;
+    return visibleSides.reduce((next, side) => {
+      const limits = FORMULA_PANEL_LIMITS[side];
+      const width = Math.floor(limits.min + ((widthFor(side) - limits.min) * scale));
+      return updateFormulaPanel(next, side, width, false);
+    }, fitted);
+  }
+
+  if (visibleSides.length === 2) {
+    const priority = constrainedPriority === "inspector" ? "inspector" : "library";
+    const other = priority === "library" ? "inspector" : "library";
+    if (panelBudget >= FORMULA_PANEL_LIMITS[priority].min) {
+      const priorityWidth = constrainedPriority
+        ? Math.min(widthFor(priority), panelBudget)
+        : FORMULA_PANEL_LIMITS[priority].min;
+      return updateFormulaPanel(
+        updateFormulaPanel(fitted, priority, priorityWidth, false),
+        other,
+        widthFor(other),
+        true,
+      );
+    }
+    return { ...fitted, libraryCollapsed: true, inspectorCollapsed: true };
+  }
+
+  const side = visibleSides[0];
+  const limits = FORMULA_PANEL_LIMITS[side];
+  if (panelBudget < limits.min) {
+    return updateFormulaPanel(fitted, side, widthFor(side), true);
+  }
+  return updateFormulaPanel(fitted, side, Math.floor(Math.min(widthFor(side), panelBudget)), false);
+}
+
+function desktopFormulaPanelLayoutActive(): boolean {
+  return typeof window !== "undefined" && window.innerWidth > 1100;
+}
+
+const CATEGORY_LABELS: Record<string, string> = {
+  data: "Market Data",
+  arithmetic: "Arithmetic",
+  scalar: "Scalar Operations",
+  unary_math: "Unary Math",
+  time_series: "Time Series",
+  cross_sectional: "Cross-Sectional",
+  condition: "Conditions",
+  constant: "Constants",
+  technical_indicators: "Technical Indicators",
+  custom: "Custom",
+  uncategorized: "Other",
+};
+
+const STARTER_FAMILY_ORDER = [
+  "moving_averages",
+  "macd",
+  "rsi",
+  "kdj",
+  "bollinger_bands",
+  "momentum",
+  "range_volatility",
+  "donchian",
+  "directional_movement",
+  "volume",
+  // Backward-compatible family keys used by catalog revision 1.
+  "volatility",
+  "other_indicators",
+] as const;
+
+const STARTER_FAMILY_LABELS: Record<string, string> = {
+  moving_averages: "Moving Averages",
+  macd: "MACD",
+  rsi: "RSI",
+  kdj: "KDJ",
+  bollinger_bands: "Bollinger Bands",
+  momentum: "Momentum",
+  range_volatility: "Range and Volatility",
+  donchian: "Donchian Channels",
+  directional_movement: "Directional Movement",
+  volume: "Volume",
+  volatility: "Volatility",
+  other_indicators: "Other indicators",
+};
+
+const STARTER_FORMULA_ORDER = [
+  "ta_sma", "ta_ema", "ta_rma", "ta_wma", "ta_dema", "ta_tema",
+  "ta_dif", "ta_dea", "ta_macd_histogram", "ta_ppo",
+  "ta_rsi_wilder",
+  "ta_kdj_rsv", "ta_kdj_k", "ta_kdj_d", "ta_kdj_j",
+  "ta_boll_middle", "ta_boll_upper", "ta_boll_lower", "ta_boll_percent_b", "ta_boll_bandwidth",
+  "ta_roc", "ta_williams_r",
+  "ta_true_range", "ta_atr", "ta_natr",
+  "ta_donchian_upper", "ta_donchian_middle", "ta_donchian_lower", "ta_donchian_position",
+  "ta_plus_di", "ta_minus_di", "ta_dx", "ta_adx",
+  "ta_obv", "ta_mfi", "ta_cmf",
+] as const;
+
 function humanCategory(value: string): string {
-  return value.replace(/_/g, " ");
+  return CATEGORY_LABELS[value] ?? value
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1).toLowerCase()}`)
+    .join(" ");
+}
+
+function starterFamilyLabel(value: string): string {
+  return STARTER_FAMILY_LABELS[value] ?? humanCategory(value);
+}
+
+function orderRank(order: readonly string[], value: string): number {
+  const index = order.indexOf(value);
+  return index < 0 ? Number.MAX_SAFE_INTEGER : index;
+}
+
+const CONSTRAINT_OPERATORS: Record<string, string> = {
+  lt: "<",
+  le: "≤",
+  gt: ">",
+  ge: "≥",
+  ne: "≠",
+};
+
+function formulaInputSummary(formula: FormulaSpec): string {
+  const formulaInputs = formula.inputs ?? [];
+  if (!formulaInputs.length) return "Fixed market inputs";
+  return formulaInputs.map((input) => (
+    typeof input.default === "number" && Number.isFinite(input.default)
+      ? `${input.name} ${input.default}`
+      : input.name
+  )).join(", ");
+}
+
+function formulaConstraintSummary(formula: FormulaSpec): string {
+  return (formula.constraints ?? []).map((constraint) => (
+    `${constraint.left} ${CONSTRAINT_OPERATORS[constraint.operator] ?? constraint.operator} ${constraint.right}`
+  )).join(", ");
+}
+
+function PaletteSection({
+  sectionKey,
+  label,
+  meta,
+  searchActive,
+  rememberedOpen,
+  onRememberOpen,
+  nested = false,
+  children,
+}: {
+  sectionKey: string;
+  label: string;
+  meta: ReactNode;
+  searchActive: boolean;
+  rememberedOpen: boolean;
+  onRememberOpen: (key: string, open: boolean) => void;
+  nested?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <details
+      className={nested ? "formula-library__family" : undefined}
+      open={searchActive || rememberedOpen}
+      onToggle={(event) => {
+        if (!searchActive && event.currentTarget.open !== rememberedOpen) {
+          onRememberOpen(sectionKey, event.currentTarget.open);
+        }
+      }}
+    >
+      <summary onClick={(event) => { if (searchActive) event.preventDefault(); }}>
+        {label} <span>{meta}</span>
+      </summary>
+      {children}
+    </details>
+  );
 }
 
 function draftGraph(draft: FormulaDraft | undefined, inputs: FormulaInputSpec[], outType: string): FormulaGraph {
@@ -137,6 +426,39 @@ function editableCopyName(value: string): string {
   return `${stem}_copy`;
 }
 
+function materializeNumericDefaults(body: FactorNode, inputs: FormulaInputSpec[]): {
+  body: FactorNode;
+  inputs: FormulaInputSpec[];
+} {
+  const retainedInputs: FormulaInputSpec[] = [];
+  const retainedIndexes = new Map<number, number>();
+  const literals = new Map<number, FactorNode>();
+
+  inputs.forEach((input, index) => {
+    if (isInlineInputType(input.type) && typeof input.default === "number" && Number.isFinite(input.default)) {
+      literals.set(index, { name: input.type === "window" ? "window" : "const", value: input.default });
+      return;
+    }
+    retainedIndexes.set(index, retainedInputs.length);
+    retainedInputs.push({ ...input });
+  });
+
+  const visit = (node: FactorNode): FactorNode => {
+    if (node.name === "$arg" && typeof node.value === "number") {
+      const literal = literals.get(node.value);
+      if (literal) return { ...literal };
+      const retainedIndex = retainedIndexes.get(node.value);
+      return retainedIndex == null ? { ...node } : { ...node, value: retainedIndex };
+    }
+    return {
+      ...node,
+      ...(node.children ? { children: node.children.map(visit) } : {}),
+    };
+  };
+
+  return { body: visit(body), inputs: retainedInputs };
+}
+
 export function FormulaEditorPage({
   formulaDraft,
   onFormulaDraftChange,
@@ -177,8 +499,12 @@ export function FormulaEditorPage({
   const [expression, setExpression] = useState(formulaDraft?.expression ?? "");
   const [activeMode, setActiveMode] = useState<"visual" | "expression">(formulaDraft?.activeMode ?? "visual");
   const [mobilePane, setMobilePane] = useState<"library" | "canvas" | "inspector">("canvas");
-  const [libraryCollapsed, setLibraryCollapsed] = useState(false);
-  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [panelLayout, setPanelLayout] = useState<FormulaPanelLayout>(readFormulaPanelLayout);
+  const [workspaceWidth, setWorkspaceWidth] = useState<number | null>(null);
+  const [desktopPanelLayout, setDesktopPanelLayout] = useState(desktopFormulaPanelLayoutActive);
+  const [constrainedPanelPriority, setConstrainedPanelPriority] =
+    useState<FormulaPanelSide | null>(null);
+  const [resizingPanel, setResizingPanel] = useState<FormulaPanelSide | null>(null);
   const [canvasRevision, setCanvasRevision] = useState(0);
   const [loadedName, setLoadedName] = useState<string | null>(formulaDraft?.loadedName ?? null);
   const [loadedRevision, setLoadedRevision] = useState<number | null>(formulaDraft?.loadedRevision ?? null);
@@ -189,6 +515,7 @@ export function FormulaEditorPage({
   const [selectedSlot, setSelectedSlot] = useState<{ nodeId: string; index: number } | null>(null);
   const [selectedSource, setSelectedSource] = useState<PrimitiveInfo | FormulaResult | null>(null);
   const [search, setSearch] = useState("");
+  const [openPaletteSections, setOpenPaletteSections] = useState<Record<string, boolean>>({});
   const [parseError, setParseError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -200,7 +527,9 @@ export function FormulaEditorPage({
   const [backtestOpen, setBacktestOpen] = useState(false);
   const [backtestSource, setBacktestSource] = useState<FormulaTestSource | null>(null);
   const flowRef = useRef<ReactFlowInstance | null>(null);
+  const workspaceGridRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLElement | null>(null);
+  const panelResize = useRef<FormulaPanelResize | null>(null);
   const clipboard = useRef<FormulaGraph | null>(null);
   const dragStart = useRef<FormulaGraph | null>(null);
   const inlineEditStart = useRef<FormulaGraph | null>(null);
@@ -217,6 +546,215 @@ export function FormulaEditorPage({
       (formula.revision ?? 1) > (selectedData.revision ?? 1)
     )) ?? null
     : null;
+  const selectedSourceFormula = selectedSource && isPrimitive(selectedSource) &&
+    (selectedSource.origin === "user_formula" || selectedSource.origin === "catalog_formula")
+    ? formulas.find((formula) => formula.name === (selectedSource.logical_name ?? selectedSource.name)) ?? null
+    : null;
+  const fittedPanelLayout = useMemo(
+    () => desktopPanelLayout && workspaceWidth
+      ? fitFormulaPanelLayout(panelLayout, workspaceWidth, constrainedPanelPriority)
+      : panelLayout,
+    [constrainedPanelPriority, desktopPanelLayout, panelLayout, workspaceWidth],
+  );
+  const {
+    libraryWidth,
+    inspectorWidth,
+    libraryCollapsed,
+    inspectorCollapsed,
+  } = fittedPanelLayout;
+
+  const maximumPanelWidth = useCallback((
+    side: FormulaPanelSide,
+    layout: FormulaPanelLayout,
+    constrainedPriority: FormulaPanelSide | null = constrainedPanelPriority,
+  ): number => {
+    const limits = FORMULA_PANEL_LIMITS[side];
+    if (!desktopPanelLayout) return limits.max;
+    const bounds = workspaceGridRef.current?.getBoundingClientRect();
+    const availableWorkspaceWidth = workspaceWidth ?? workspaceGridRef.current?.clientWidth ?? bounds?.width;
+    if (!availableWorkspaceWidth) return limits.max;
+    const visibleLayout = fitFormulaPanelLayout(
+      layout,
+      availableWorkspaceWidth,
+      constrainedPriority,
+    );
+    const otherWidth = side === "library"
+      ? (visibleLayout.inspectorCollapsed ? 0 : visibleLayout.inspectorWidth)
+      : (visibleLayout.libraryCollapsed ? 0 : visibleLayout.libraryWidth);
+    const available = Math.floor(
+      availableWorkspaceWidth - otherWidth - FORMULA_STAGE_MIN_WIDTH - (FORMULA_PANEL_HANDLE_WIDTH * 2),
+    );
+    return available < limits.min ? 0 : Math.min(limits.max, available);
+  }, [constrainedPanelPriority, desktopPanelLayout, workspaceWidth]);
+
+  const resizePanelFromPointer = useCallback((clientX: number) => {
+    const active = panelResize.current;
+    if (!active) return;
+    const limits = FORMULA_PANEL_LIMITS[active.side];
+    const direction = active.side === "library" ? 1 : -1;
+    const travel = direction * (clientX - active.startX);
+    const reopening = active.startedCollapsed && travel >= FORMULA_PANEL_REOPEN_DISTANCE;
+    if (!active.startedCollapsed || reopening) {
+      setConstrainedPanelPriority(active.side);
+    }
+
+    setPanelLayout((current) => {
+      if (active.startedCollapsed) {
+        if (!reopening) return current;
+        const desiredWidth = limits.min + travel - FORMULA_PANEL_REOPEN_DISTANCE;
+        const candidate = updateFormulaPanel(current, active.side, desiredWidth, false);
+        const maximum = maximumPanelWidth(active.side, candidate, active.side);
+        return maximum >= limits.min
+          ? updateFormulaPanel(
+              candidate,
+              active.side,
+              Math.min(maximum, Math.max(limits.min, desiredWidth)),
+              false,
+            )
+          : current;
+      }
+
+      const rawWidth = active.startWidth + travel;
+      if (rawWidth < limits.min - FORMULA_PANEL_COLLAPSE_OVERSHOOT) {
+        const retainedWidth = active.side === "library"
+          ? current.libraryWidth
+          : current.inspectorWidth;
+        return updateFormulaPanel(current, active.side, retainedWidth, true);
+      }
+      const candidate = updateFormulaPanel(current, active.side, rawWidth, false);
+      const maximum = maximumPanelWidth(active.side, candidate, active.side);
+      if (maximum < limits.min) return current;
+      return updateFormulaPanel(
+        candidate,
+        active.side,
+        Math.min(maximum, Math.max(limits.min, rawWidth)),
+        false,
+      );
+    });
+  }, [maximumPanelWidth]);
+
+  const startPanelResize = useCallback((
+    side: FormulaPanelSide,
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.focus();
+    const collapsed = side === "library"
+      ? fittedPanelLayout.libraryCollapsed
+      : fittedPanelLayout.inspectorCollapsed;
+    if (!collapsed) setConstrainedPanelPriority(side);
+    panelResize.current = {
+      side,
+      startX: event.clientX,
+      startWidth: collapsed
+        ? 0
+        : (side === "library" ? fittedPanelLayout.libraryWidth : fittedPanelLayout.inspectorWidth),
+      startedCollapsed: collapsed,
+    };
+    setResizingPanel(side);
+  }, [fittedPanelLayout]);
+
+  const resizePanelWithKeyboard = useCallback((
+    side: FormulaPanelSide,
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) => {
+    const handled = ["ArrowLeft", "ArrowRight", "Home", "End", "Enter", " "].includes(event.key);
+    if (!handled) return;
+    event.preventDefault();
+    const currentlyCollapsed = side === "library"
+      ? fittedPanelLayout.libraryCollapsed
+      : fittedPanelLayout.inspectorCollapsed;
+    const growsWithArrow = side === "library"
+      ? event.key === "ArrowRight"
+      : event.key === "ArrowLeft";
+    if (
+      event.key === "End" ||
+      ((event.key === "Enter" || event.key === " ") && currentlyCollapsed) ||
+      (!["Home", "Enter", " "].includes(event.key) && (!currentlyCollapsed || growsWithArrow))
+    ) {
+      setConstrainedPanelPriority(side);
+    }
+    setPanelLayout((current) => {
+      const base = desktopPanelLayout && workspaceWidth
+        ? fitFormulaPanelLayout(current, workspaceWidth, constrainedPanelPriority)
+        : current;
+      const limits = FORMULA_PANEL_LIMITS[side];
+      const collapsed = side === "library" ? base.libraryCollapsed : base.inspectorCollapsed;
+      const width = side === "library" ? base.libraryWidth : base.inspectorWidth;
+      const storedWidth = side === "library" ? current.libraryWidth : current.inspectorWidth;
+
+      if (event.key === "Home") return updateFormulaPanel(current, side, storedWidth, true);
+      if (event.key === "End") {
+        const candidate = updateFormulaPanel(current, side, limits.max, false);
+        const maximum = maximumPanelWidth(side, candidate, side);
+        return maximum >= limits.min
+          ? updateFormulaPanel(candidate, side, maximum, false)
+          : current;
+      }
+      if (event.key === "Enter" || event.key === " ") {
+        if (!collapsed) return updateFormulaPanel(current, side, storedWidth, true);
+        const candidate = updateFormulaPanel(current, side, storedWidth, false);
+        const maximum = maximumPanelWidth(side, candidate, side);
+        return maximum >= limits.min
+          ? updateFormulaPanel(
+              candidate,
+              side,
+              Math.min(maximum, Math.max(limits.min, storedWidth)),
+              false,
+            )
+          : current;
+      }
+
+      const grows = side === "library" ? event.key === "ArrowRight" : event.key === "ArrowLeft";
+      if (collapsed) {
+        if (!grows) return current;
+        const candidate = updateFormulaPanel(current, side, storedWidth, false);
+        const maximum = maximumPanelWidth(side, candidate, side);
+        return grows && maximum >= limits.min
+          ? updateFormulaPanel(
+              candidate,
+              side,
+              Math.max(limits.min, Math.min(maximum, storedWidth)),
+              false,
+            )
+          : current;
+      }
+      const nextWidth = width + (grows ? FORMULA_PANEL_KEYBOARD_STEP : -FORMULA_PANEL_KEYBOARD_STEP);
+      if (nextWidth < limits.min) return updateFormulaPanel(current, side, storedWidth, true);
+      const candidate = updateFormulaPanel(current, side, nextWidth, false);
+      const maximum = maximumPanelWidth(side, candidate, side);
+      return maximum >= limits.min
+        ? updateFormulaPanel(candidate, side, Math.min(maximum, nextWidth), false)
+        : current;
+    });
+  }, [
+    constrainedPanelPriority,
+    desktopPanelLayout,
+    fittedPanelLayout,
+    maximumPanelWidth,
+    workspaceWidth,
+  ]);
+
+  const rememberPaletteSection = useCallback((key: string, open: boolean) => {
+    setOpenPaletteSections((current) => current[key] === open ? current : { ...current, [key]: open });
+  }, []);
+
+  const inspectSource = useCallback((source: PrimitiveInfo | FormulaResult) => {
+    setSelectedSource(source);
+    setSelectedSlot(null);
+    setSelectedNodeId(null);
+    setSelectedNodeIds([]);
+    setSelectedEdgeIds([]);
+    setConstrainedPanelPriority("inspector");
+    setPanelLayout((current) => updateFormulaPanel(
+      current,
+      "inspector",
+      current.inspectorWidth,
+      false,
+    ));
+    setMobilePane("inspector");
+  }, []);
 
   const handleSelectionChange = useCallback((nodeIds: string[], edgeIds: string[]) => {
     setSelectedNodeIds((current) => sameIds(current, nodeIds) ? current : nodeIds);
@@ -241,6 +779,74 @@ export function FormulaEditorPage({
   }
 
   useEffect(refresh, [canSubmit]);
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(FORMULA_PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(panelLayout));
+    } catch {
+      // Storage can be unavailable in privacy-restricted embedded browsers.
+    }
+  }, [panelLayout]);
+
+  useLayoutEffect(() => {
+    const grid = workspaceGridRef.current;
+    if (!grid) return;
+
+    const recordWidth = (width: number) => {
+      setDesktopPanelLayout(desktopFormulaPanelLayoutActive());
+      if (Number.isFinite(width) && width > 0) {
+        const roundedWidth = Math.floor(width);
+        setWorkspaceWidth((current) => current === roundedWidth ? current : roundedWidth);
+      }
+    };
+    const measure = () => {
+      const bounds = grid.getBoundingClientRect();
+      recordWidth(grid.clientWidth || bounds.width);
+    };
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries.find((candidate) => candidate.target === grid);
+      recordWidth(entry?.contentRect.width || grid.clientWidth || grid.getBoundingClientRect().width);
+    });
+
+    observer.observe(grid);
+    window.addEventListener("resize", measure);
+    measure();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!resizingPanel) return;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const move = (event: PointerEvent) => resizePanelFromPointer(event.clientX);
+    const finish = (event: PointerEvent) => {
+      resizePanelFromPointer(event.clientX);
+      panelResize.current = null;
+      setResizingPanel(null);
+    };
+    const cancel = () => {
+      panelResize.current = null;
+      setResizingPanel(null);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("blur", cancel);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("blur", cancel);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+  }, [resizePanelFromPointer, resizingPanel]);
 
   useEffect(() => {
     if (shouldSeedGraph.current && primitives.length && edges.length === 0) {
@@ -522,6 +1128,12 @@ export function FormulaEditorPage({
     setSelectedNodeId(node.id);
     setSelectedNodeIds([node.id]);
     setSelectedEdgeIds([]);
+  }
+
+  function addSourceToFormula(key: string) {
+    setSelectedSource(null);
+    setMobilePane("canvas");
+    insertOnCanvas(key);
   }
 
   function insertIntoSlot(nodeId: string, inputIndex: number, key: string) {
@@ -943,6 +1555,11 @@ export function FormulaEditorPage({
     if (canSubmit) getFormula(spec.name).then(setFormulaDetail).catch(() => setFormulaDetail(null));
   }
 
+  function openUserFormula(spec: FormulaSpec) {
+    if (dirty && !window.confirm("Discard the current unsaved draft and open this formula?")) return;
+    loadFormula(spec);
+  }
+
   function newFormula() {
     if (dirty && !window.confirm("Discard the current unsaved draft?")) return;
     const graph = blankFormulaGraph(DEFAULT_INPUTS, "signal");
@@ -1003,21 +1620,22 @@ export function FormulaEditorPage({
 
   function openFormulaAsEditableCopy(spec: FormulaSpec) {
     if (dirty && !window.confirm("Discard the current unsaved draft and open this starter as a copy?")) return;
-    const nextInputs = spec.inputs?.length
+    const sourceInputs = spec.inputs?.length
       ? spec.inputs.map((input) => ({ ...input }))
       : spec.arg_types.map((type, index) => ({ name: `input_${index + 1}`, type, description: "Formula input." }));
-    const graph = bodyToFormulaGraph(spec.body, nextInputs, primitives, spec.out_type);
+    const materialized = materializeNumericDefaults(spec.body, sourceInputs);
+    const graph = bodyToFormulaGraph(materialized.body, materialized.inputs, primitives, spec.out_type);
     const baseName = spec.name.replace(/^ta_/, "");
     const nextName = editableCopyName(baseName);
     setName(nextName);
     setDisplayName(`${spec.display_name || baseName.replace(/_/g, " ")} copy`);
     setDescription(`Editable copy of the managed starter ${spec.display_name || spec.name}.`);
-    setInputs(nextInputs);
+    setInputs(materialized.inputs);
     setOutType(spec.out_type);
     setCategory(spec.category || "technical_indicators");
     setNodes(graph.nodes);
     setEdges(graph.edges);
-    setExpression(serializeFormula(spec.body, nextInputs));
+    setExpression(serializeFormula(materialized.body, materialized.inputs));
     setActiveMode("visual");
     setLoadedName(null);
     setLoadedRevision(null);
@@ -1083,8 +1701,9 @@ export function FormulaEditorPage({
     return primitives.filter((primitive) => matchesSearch(query, primitive.name, primitive.display_name, primitive.description, primitive.category));
   }, [primitives, search]);
 
-  const dataPrimitives = useMemo(() => filteredPrimitives.filter((primitive) => (
-    primitive.origin === "data" || (primitive.kind === "operand" && primitive.origin !== "user_formula" && primitive.origin !== "catalog_formula")
+  const marketDataPrimitives = useMemo(() => filteredPrimitives.filter((primitive) => (
+    primitive.origin === "data" ||
+    (primitive.kind === "operand" && primitive.origin !== "user_formula" && primitive.origin !== "catalog_formula")
   )), [filteredPrimitives]);
 
   const grouped = useMemo(() => {
@@ -1092,7 +1711,9 @@ export function FormulaEditorPage({
     for (const primitive of filteredPrimitives) {
       if (primitive.origin === "data" || primitive.origin === "value" || primitive.origin === "user_formula" || primitive.origin === "catalog_formula") continue;
       if (primitive.kind === "operand" || primitive.kind === "ephemeral") continue;
-      const key = primitive.category ?? "uncategorized";
+      // Old category overrides could put operators such as z-score in `data`. Market Data is
+      // reserved for actual fields/operands; keep legacy operators visible without duplicating it.
+      const key = primitive.category === "data" ? "uncategorized" : primitive.category ?? "uncategorized";
       (groups.get(key) ?? groups.set(key, []).get(key)!).push(primitive);
     }
     const order = [...categories, ...[...groups.keys()].filter((key) => !categories.includes(key)).sort()];
@@ -1111,8 +1732,26 @@ export function FormulaEditorPage({
   )), [formulas, query]);
 
   const starterFormulas = useMemo(() => visibleFormulas.filter((formula) => (
-    formula.origin === "catalog_formula"
+    formula.origin === "catalog_formula" && formula.status !== "retired" && formula.name !== "ta_macd_histogram_2x"
   )), [visibleFormulas]);
+
+  const starterFormulaGroups = useMemo(() => {
+    const families = new Map<string, FormulaSpec[]>();
+    for (const formula of starterFormulas) {
+      const family = formula.family?.trim() || "other_indicators";
+      (families.get(family) ?? families.set(family, []).get(family)!).push(formula);
+    }
+    return [...families.entries()]
+      .sort(([left], [right]) => {
+        const rankDifference = orderRank(STARTER_FAMILY_ORDER, left) - orderRank(STARTER_FAMILY_ORDER, right);
+        return rankDifference || starterFamilyLabel(left).localeCompare(starterFamilyLabel(right));
+      })
+      .map(([family, familyFormulas]) => [family, [...familyFormulas].sort((left, right) => {
+        const rankDifference = (left.family_order ?? orderRank(STARTER_FORMULA_ORDER, left.name)) -
+          (right.family_order ?? orderRank(STARTER_FORMULA_ORDER, right.name));
+        return rankDifference || (left.display_name || left.name).localeCompare(right.display_name || right.name);
+      })] as const);
+  }, [starterFormulas]);
 
   const userFormulas = useMemo(() => visibleFormulas.filter((formula) => (
     formula.origin !== "catalog_formula"
@@ -1166,27 +1805,45 @@ export function FormulaEditorPage({
         ))}
       </nav>
 
-      <div className={`formula-workspace__grid formula-pane--${mobilePane}${libraryCollapsed ? " is-library-collapsed" : ""}${inspectorCollapsed ? " is-inspector-collapsed" : ""}`}>
-        <aside className="formula-library" data-testid="formula-library">
+      <div
+        ref={workspaceGridRef}
+        className={`formula-workspace__grid formula-pane--${mobilePane}${libraryCollapsed ? " is-library-collapsed" : ""}${inspectorCollapsed ? " is-inspector-collapsed" : ""}${resizingPanel ? ` is-resizing-${resizingPanel}` : ""}`}
+        style={{
+          "--formula-library-width": `${libraryCollapsed ? 0 : libraryWidth}px`,
+          "--formula-inspector-width": `${inspectorCollapsed ? 0 : inspectorWidth}px`,
+        } as CSSProperties}
+      >
+        <aside id="formula-building-blocks-panel" className="formula-library" data-testid="formula-library">
           <header className="formula-panel-header">
             <h4>Building blocks</h4>
-            <button type="button" aria-label={libraryCollapsed ? "Expand building blocks" : "Collapse building blocks"} onClick={() => setLibraryCollapsed((value) => !value)}>{libraryCollapsed ? "›" : "‹"}</button>
           </header>
           <label className="field">
             <span className="field-label">Find a building block</span>
             <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search functions and fields" />
           </label>
-          <details open>
-            <summary>Formula contract <span>required</span></summary>
+          <PaletteSection
+            sectionKey="formula-contract"
+            label="Formula Contract"
+            meta="Required"
+            searchActive={false}
+            rememberedOpen={Boolean(openPaletteSections["formula-contract"])}
+            onRememberOpen={rememberPaletteSection}
+          >
             <div className="formula-library__items">
               <article className="formula-library__item formula-library__item--contract">
-                <button type="button" className="formula-library__insert" onClick={() => {
+                <button type="button" className="formula-library__insert" aria-label="Inspect Formula output" onClick={() => {
                   setSelectedSource(null);
                   setSelectedSlot(null);
                   setSelectedNodeId(OUTPUT_NODE_ID);
                   setSelectedNodeIds([OUTPUT_NODE_ID]);
                   setSelectedEdgeIds([]);
-                  setInspectorCollapsed(false);
+                  setConstrainedPanelPriority("inspector");
+                  setPanelLayout((current) => updateFormulaPanel(
+                    current,
+                    "inspector",
+                    current.inspectorWidth,
+                    false,
+                  ));
                 }}>
                   <strong>Formula output</strong>
                   <span>Every formula returns the block connected here.</span>
@@ -1194,69 +1851,108 @@ export function FormulaEditorPage({
                 </button>
               </article>
             </div>
-          </details>
+          </PaletteSection>
 
-          {dataPrimitives.length > 0 && (
-            <details open>
-              <summary>Data <span>{dataPrimitives.length}</span></summary>
+          {marketDataPrimitives.length > 0 && (
+            <PaletteSection
+              sectionKey="market-data"
+              label="Market Data"
+              meta={marketDataPrimitives.length}
+              searchActive={Boolean(query)}
+              rememberedOpen={Boolean(openPaletteSections["market-data"])}
+              onRememberOpen={rememberPaletteSection}
+            >
               <div className="formula-library__items">
-                {dataPrimitives.map((item) => (
+                {marketDataPrimitives.map((item) => (
                   <article key={item.name} className="formula-library__item formula-library__item--data" draggable onDragStart={(event) => event.dataTransfer.setData("application/x-alphalineage-primitive", item.name)}>
-                    <button type="button" className="formula-library__insert" onClick={() => insertOnCanvas(item.name)}><strong>{item.display_name ?? item.name}</strong><span>{item.description ?? "Market data field."}</span><code>Data {"->"} {item.out_type}</code></button>
-                    <button type="button" className="ghost" onClick={() => { setSelectedSource(item); setSelectedSlot(null); }}>Inspect</button>
+                    <button type="button" className="formula-library__insert" aria-label={`Inspect ${item.display_name ?? item.name}`} onClick={() => inspectSource(item)}><strong>{item.display_name ?? item.name}</strong><span>{item.description ?? "Market data field."}</span><code>Market data {"->"} {item.out_type}</code></button>
                   </article>
                 ))}
               </div>
-            </details>
+            </PaletteSection>
           )}
 
           {starterFormulas.length > 0 && (
-            <details open>
-              <summary>Starter formulas <span>{starterFormulas.length}</span></summary>
-              <div className="formula-library__items">
-                {starterFormulas.map((formula) => {
-                  const usable = formula.registered !== false && !formula.error;
-                  return (
-                    <article key={formula.name} className={`formula-library__item formula-library__item--catalog_formula${usable ? "" : " is-broken"}`} draggable={usable} onDragStart={(event) => { if (usable) event.dataTransfer.setData("application/x-alphalineage-primitive", `formula:${formula.name}`); }}>
-                      <button type="button" className="formula-library__insert" disabled={!usable} onClick={() => insertOnCanvas(`formula:${formula.name}`)}>
-                        <strong>{formula.display_name || formula.name}</strong>
-                        <span>{formula.error ? `Unavailable: ${formula.error}` : formula.description || "Managed, reusable starter formula."}</span>
-                        <code>{formula.inputs?.map((input) => input.name).join(", ") || "No inputs"} {"->"} {formula.out_type} · v{formula.revision ?? 1}</code>
-                      </button>
-                      <button type="button" className="ghost" onClick={() => openFormulaAsEditableCopy(formula)}>Open as editable copy</button>
-                    </article>
-                  );
-                })}
+            <PaletteSection
+              sectionKey="starter-formulas"
+              label="Starter Formulas"
+              meta={starterFormulas.length}
+              searchActive={Boolean(query)}
+              rememberedOpen={Boolean(openPaletteSections["starter-formulas"])}
+              onRememberOpen={rememberPaletteSection}
+            >
+              <div className="formula-library__families">
+                {starterFormulaGroups.map(([family, familyFormulas]) => (
+                  <PaletteSection
+                    key={family}
+                    sectionKey={`starter-family:${family}`}
+                    label={starterFamilyLabel(family)}
+                    meta={familyFormulas.length}
+                    searchActive={Boolean(query)}
+                    rememberedOpen={Boolean(openPaletteSections[`starter-family:${family}`])}
+                    onRememberOpen={rememberPaletteSection}
+                    nested
+                  >
+                    <div className="formula-library__items">
+                      {familyFormulas.map((formula) => {
+                        const usable = formula.registered !== false && !formula.error;
+                        const title = formula.display_name || formula.name;
+                        return (
+                          <article key={formula.name} className={`formula-library__item formula-library__item--catalog_formula${usable ? "" : " is-broken"}`} draggable={usable} onDragStart={(event) => { if (usable) event.dataTransfer.setData("application/x-alphalineage-primitive", `formula:${formula.name}`); }}>
+                            <button type="button" className="formula-library__insert" aria-label={`Inspect ${title}`} onClick={() => inspectSource(formulaAsPrimitive(formula))}>
+                              <strong>{title}</strong>
+                              <span>{formula.error ? `Unavailable: ${formula.error}` : formula.description || "Managed, reusable starter formula."}</span>
+                              <code>{formulaInputSummary(formula)}{formulaConstraintSummary(formula) ? ` · ${formulaConstraintSummary(formula)}` : ""} {"->"} {formula.out_type} · v{formula.revision ?? 1}</code>
+                            </button>
+                            <button type="button" className="ghost" disabled={!usable} onClick={() => openFormulaAsEditableCopy(formula)}>Open</button>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </PaletteSection>
+                ))}
               </div>
-            </details>
+            </PaletteSection>
           )}
 
           {userFormulas.length > 0 && (
-            <details open>
-              <summary>My formulas <span>{userFormulas.length}</span></summary>
+            <PaletteSection
+              sectionKey="my-formulas"
+              label="My Formulas"
+              meta={userFormulas.length}
+              searchActive={Boolean(query)}
+              rememberedOpen={Boolean(openPaletteSections["my-formulas"])}
+              onRememberOpen={rememberPaletteSection}
+            >
               <div className="formula-library__items">
                 {userFormulas.map((formula) => {
                   const usable = formula.registered !== false && !formula.error && formula.name !== loadedName;
+                  const title = formula.display_name || formula.name;
                   return (
                     <article key={formula.name} className={`formula-library__item formula-library__item--user_formula${usable ? "" : " is-broken"}`} draggable={usable} onDragStart={(event) => { if (usable) event.dataTransfer.setData("application/x-alphalineage-primitive", `formula:${formula.name}`); }}>
-                      <button type="button" className="formula-library__insert" disabled={!usable} onClick={() => insertOnCanvas(`formula:${formula.name}`)}>
-                        <strong>{formula.display_name || formula.name}</strong>
+                      <button type="button" className="formula-library__insert" aria-label={`Inspect ${title}`} onClick={() => inspectSource(formulaAsPrimitive(formula))}>
+                        <strong>{title}</strong>
                         <span>{formula.name === loadedName ? "Currently open; a formula cannot contain itself." : formula.error ? `Needs repair: ${formula.error}` : formula.description || "Reusable saved formula."}</span>
                         <code>{formula.inputs?.map((input) => input.name).join(", ") || "No inputs"} {"->"} {formula.out_type} · v{formula.revision ?? 1}</code>
                       </button>
-                      <button type="button" className="ghost" onClick={() => {
-                        loadFormula(formula);
-                      }}>{formula.error ? "Repair" : "Edit"}</button>
+                      <button type="button" className="ghost" disabled={formula.name === loadedName} onClick={() => openUserFormula(formula)}>Open</button>
                     </article>
                   );
                 })}
               </div>
-            </details>
+            </PaletteSection>
           )}
 
           {grouped.map(([group, items]) => (
-            <details key={group} open>
-              <summary>{humanCategory(group)} <span>{items.length}</span></summary>
+            <PaletteSection
+              key={group}
+              sectionKey={`builtin:${group}`}
+              label={humanCategory(group)}
+              meta={items.length}
+              searchActive={Boolean(query)}
+              rememberedOpen={Boolean(openPaletteSections[`builtin:${group}`])}
+              onRememberOpen={rememberPaletteSection}
+            >
               <div className="formula-library__items">
                 {items.map((item) => (
                   <article
@@ -1265,21 +1961,26 @@ export function FormulaEditorPage({
                     draggable
                     onDragStart={(event) => event.dataTransfer.setData("application/x-alphalineage-primitive", item.name)}
                   >
-                    <button type="button" className="formula-library__insert" onClick={() => insertOnCanvas(item.name)}>
+                    <button type="button" className="formula-library__insert" aria-label={`Inspect ${item.display_name ?? item.logical_name ?? item.name}`} onClick={() => inspectSource(item)}>
                       <strong>{item.display_name ?? item.logical_name ?? item.name}</strong>
                       <span>{item.description ?? "Typed calculation block."}</span>
                       <code>{(item.inputs ?? []).map((input) => input.name).join(", ")} {"->"} {item.out_type}</code>
                     </button>
-                    <button type="button" className="ghost" onClick={() => { setSelectedSource(item); setSelectedSlot(null); }}>Inspect</button>
                   </article>
                 ))}
               </div>
-            </details>
+            </PaletteSection>
           ))}
 
           {visibleResults.length > 0 && (
-            <details open>
-              <summary>Formula Results <span>{visibleResults.length}</span></summary>
+            <PaletteSection
+              sectionKey="formula-results"
+              label="Formula Results"
+              meta={visibleResults.length}
+              searchActive={Boolean(query)}
+              rememberedOpen={Boolean(openPaletteSections["formula-results"])}
+              onRememberOpen={rememberPaletteSection}
+            >
               <div className="formula-library__items">
                 {visibleResults.map((result) => (
                   <article
@@ -1288,18 +1989,34 @@ export function FormulaEditorPage({
                     draggable
                     onDragStart={(event) => event.dataTransfer.setData("application/x-alphalineage-primitive", `result:${result.id}`)}
                   >
-                    <button type="button" className="formula-library__insert" onClick={() => insertOnCanvas(`result:${result.id}`)}>
+                    <button type="button" className="formula-library__insert" aria-label={`Inspect ${result.name}`} onClick={() => inspectSource(result)}>
                       <strong>{result.name}</strong>
                       <span>{result.notes || `Kept from ${result.provenance?.universe ?? result.universe ?? "a research run"}.`}</span>
                       <code>{result.kind === "backtest" ? "Backtest" : "Training"} snapshot {"->"} {resultOutputType(result, primitives)}</code>
                     </button>
-                    <button type="button" className="ghost" onClick={() => { setSelectedSource(result); setSelectedSlot(null); }}>Inspect</button>
                   </article>
                 ))}
               </div>
-            </details>
+            </PaletteSection>
           )}
         </aside>
+
+        <div
+          className={`formula-panel-resizer formula-panel-resizer--library${resizingPanel === "library" ? " is-active" : ""}`}
+          data-testid="formula-library-resizer"
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize building blocks panel"
+          aria-controls="formula-building-blocks-panel"
+          aria-orientation="vertical"
+          aria-valuemin={0}
+          aria-valuemax={maximumPanelWidth("library", fittedPanelLayout)}
+          aria-valuenow={libraryCollapsed ? 0 : Math.round(libraryWidth)}
+          aria-valuetext={libraryCollapsed ? "Collapsed" : `${Math.round(libraryWidth)} pixels`}
+          title="Drag to resize. Drag past the minimum to collapse; press Enter to toggle."
+          onPointerDown={(event) => startPanelResize("library", event)}
+          onKeyDown={(event) => resizePanelWithKeyboard("library", event)}
+        />
 
         <main className="formula-stage" ref={stageRef}>
           {activeMode === "visual" ? (
@@ -1347,33 +2064,84 @@ export function FormulaEditorPage({
           )}
         </main>
 
-        <aside className="formula-inspector" data-testid="formula-inspector">
+        <div
+          className={`formula-panel-resizer formula-panel-resizer--inspector${resizingPanel === "inspector" ? " is-active" : ""}`}
+          data-testid="formula-inspector-resizer"
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize inspector panel"
+          aria-controls="formula-inspector-panel"
+          aria-orientation="vertical"
+          aria-valuemin={0}
+          aria-valuemax={maximumPanelWidth("inspector", fittedPanelLayout)}
+          aria-valuenow={inspectorCollapsed ? 0 : Math.round(inspectorWidth)}
+          aria-valuetext={inspectorCollapsed ? "Collapsed" : `${Math.round(inspectorWidth)} pixels`}
+          title="Drag to resize. Drag past the minimum to collapse; press Enter to toggle."
+          onPointerDown={(event) => startPanelResize("inspector", event)}
+          onKeyDown={(event) => resizePanelWithKeyboard("inspector", event)}
+        />
+
+        <aside id="formula-inspector-panel" className="formula-inspector" data-testid="formula-inspector">
           <header className="formula-panel-header">
             <h4>Inspector</h4>
-            <button type="button" aria-label={inspectorCollapsed ? "Expand inspector" : "Collapse inspector"} onClick={() => setInspectorCollapsed((value) => !value)}>{inspectorCollapsed ? "‹" : "›"}</button>
           </header>
           {selectedSource && isPrimitive(selectedSource) ? (
             <section>
-              <span className="mode-chip">{selectedSource.origin?.replace("_", " ") ?? "built in"}</span>
+              <span className="mode-chip">{{
+                catalog_formula: "Starter Formula",
+                user_formula: "My Formula",
+                data: "Market Data",
+                builtin: "Built-In",
+                value: "Value",
+              }[selectedSource.origin ?? "builtin"] ?? "Building Block"}</span>
               <h3>{selectedSource.display_name ?? selectedSource.name}</h3>
               <p>{selectedSource.description}</p>
               <dl className="formula-inspector__signature">
-                {(selectedSource.inputs ?? []).map((input) => <div key={input.name}><dt>{input.name}: {input.type}</dt><dd>{input.description}</dd></div>)}
+                {(selectedSourceFormula?.inputs ?? selectedSource.inputs ?? []).map((input) => (
+                  <div key={input.name}>
+                    <dt>{input.name}: {input.type}</dt>
+                    <dd>
+                      <span>{input.description}</span>
+                      {typeof input.default === "number" && Number.isFinite(input.default) && <small>Default: {input.default}</small>}
+                      {input.tuning?.enabled && <small>Training range: {input.tuning.min}–{input.tuning.max}, step {input.tuning.step}, local radius {input.tuning.radius}</small>}
+                    </dd>
+                  </div>
+                ))}
+                {(selectedSourceFormula?.constraints ?? []).map((constraint, index) => (
+                  <div key={`${constraint.left}-${constraint.operator}-${constraint.right}-${index}`}>
+                    <dt>Constraint</dt>
+                    <dd>{constraint.left} {CONSTRAINT_OPERATORS[constraint.operator] ?? constraint.operator} {constraint.right}</dd>
+                  </div>
+                ))}
                 <div><dt>Output</dt><dd>{selectedSource.out_type}</dd></div>
               </dl>
-              {selectedSource.user ? (
-                <button type="button" className="primary-action" onClick={() => {
-                  const spec = formulas.find((formula) => formula.name === selectedSource.logical_name);
-                  if (spec) loadFormula(spec);
-                }}>Open formula</button>
+              {selectedSourceFormula ? (
+                <div className="actions">
+                  <button
+                    type="button"
+                    onClick={() => addSourceToFormula(`formula:${selectedSourceFormula.name}`)}
+                    disabled={selectedSourceFormula.registered === false || Boolean(selectedSourceFormula.error) || selectedSourceFormula.name === loadedName}
+                  >Add to formula</button>
+                  <button
+                    type="button"
+                    className="primary-action"
+                    disabled={(selectedSourceFormula.origin === "catalog_formula" && (selectedSourceFormula.registered === false || Boolean(selectedSourceFormula.error))) || selectedSourceFormula.name === loadedName}
+                    onClick={() => selectedSourceFormula.origin === "catalog_formula" || selectedSourceFormula.editable === false
+                      ? openFormulaAsEditableCopy(selectedSourceFormula)
+                      : openUserFormula(selectedSourceFormula)}
+                  >Open</button>
+                </div>
               ) : (
                 <>
-                  <label className="field"><span className="field-label">Category</span><select value={selectedSource.category ?? "uncategorized"} onChange={async (event) => {
+                  {selectedSource.kind === "operator" && <label className="field"><span className="field-label">Category</span><select value={selectedSource.category ?? "uncategorized"} onChange={async (event) => {
                     if (!canSubmit) return;
                     await setPrimitiveCategory(selectedSource.name, event.target.value);
                     refresh();
-                  }}>{[...new Set([selectedSource.category ?? "uncategorized", ...categories])].map((item) => <option key={item} value={item}>{humanCategory(item)}</option>)}</select></label>
-                  {selectedSource.kind === "operator" && <button type="button" className="primary-action" onClick={() => useBuiltin(selectedSource)}>Use as starting point</button>}
+                  }}>{[...new Set([selectedSource.category ?? "uncategorized", ...categories])].map((item) => <option key={item} value={item}>{humanCategory(item)}</option>)}</select></label>}
+                  <div className="actions">
+                    <button type="button" className="primary-action" onClick={() => addSourceToFormula(selectedSource.name)}>Add to formula</button>
+                    {selectedSource.kind === "operator" && <button type="button" onClick={() => useBuiltin(selectedSource)}>Use as starting point</button>}
+                  </div>
                 </>
               )}
             </section>
@@ -1384,8 +2152,8 @@ export function FormulaEditorPage({
               <p>{selectedSource.notes || "Immutable calculation and research evidence."}</p>
               <dl className="formula-inspector__signature"><div><dt>Saved</dt><dd>{selectedSource.saved_at}</dd></div><div><dt>Universe</dt><dd>{selectedSource.provenance?.universe ?? selectedSource.universe ?? "Unknown"}</dd></div><div><dt>Research IC</dt><dd>{formatMetric(selectedSource.metrics?.oos_ic ?? selectedSource.metrics?.ic)}</dd></div></dl>
               <div className="actions">
-                <button type="button" onClick={() => insertOnCanvas(`result:${selectedSource.id}`)}>Use tested snapshot</button>
-                <button type="button" className="primary-action" onClick={() => openResultAsEditableCopy(selectedSource)}>Open as editable copy</button>
+                <button type="button" onClick={() => addSourceToFormula(`result:${selectedSource.id}`)}>Add to formula</button>
+                <button type="button" className="primary-action" onClick={() => openResultAsEditableCopy(selectedSource)}>Open</button>
               </div>
             </section>
           ) : selectedNode ? (

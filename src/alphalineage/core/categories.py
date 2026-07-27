@@ -81,6 +81,7 @@ BUILTIN_CATEGORIES: dict[str, str] = {
     "ts_rma": TIME_SERIES,
     "ts_recursive_smooth": TIME_SERIES,
     "ts_sum": TIME_SERIES,
+    "ts_cumsum": TIME_SERIES,
     "ts_min": TIME_SERIES,
     "ts_max": TIME_SERIES,
     "ts_rank": TIME_SERIES,

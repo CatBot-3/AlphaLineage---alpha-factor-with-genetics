@@ -29,6 +29,21 @@ def test_forward_returns_alignment(synthetic_panel):
     assert fwd.iloc[-1].isna().all()  # last date has no forward return
 
 
+def test_forward_returns_compounds_the_complete_horizon(synthetic_panel):
+    horizon = 3
+    fwd = forward_returns(synthetic_panel, horizon=horizon)
+    expected = (
+        synthetic_panel["close"].shift(-horizon).div(synthetic_panel["close"]).sub(1.0)
+    )
+
+    pd.testing.assert_frame_equal(fwd, expected)
+    assert fwd.iloc[-horizon:].isna().all().all()
+
+    symbol = synthetic_panel.symbols[0]
+    daily = synthetic_panel["returns"][symbol].iloc[1 : horizon + 1]
+    assert fwd[symbol].iloc[0] == np.prod(1.0 + daily) - 1.0
+
+
 def test_daily_ic_perfect_and_inverse():
     factor = _frame([[1.0, 2.0, 3.0], [3.0, 1.0, 2.0]])
     fwd = factor.copy()

@@ -7,7 +7,6 @@ import type { ExtendPage } from "../extend/ExtendPanel";
 const PAGES: Array<{ id: ExtendPage; label: string }> = [
   { id: "formula", label: "Formula Builder" },
   { id: "universe", label: "Universe Editor" },
-  { id: "sync", label: "Sync Data" },
 ];
 
 export function ExtendMenu({

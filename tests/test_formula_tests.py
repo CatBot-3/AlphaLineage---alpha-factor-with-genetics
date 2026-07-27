@@ -62,7 +62,11 @@ def test_unsaved_draft_test_keep_and_formula_results_alias(client):
     assert result["kind"] == "backtest"
     assert result["exploratory"] is True
     assert result["metrics"]["net_sharpe"] is not None
-    assert len(result["returns"]) == 60
+    assert len(result["returns"]) == 59
+    assert len(result["normalized_equity"]) == 60
+    assert result["normalized_equity"][0]["value"] == 1.0
+    assert result["returns"][0]["signal_date"] == result["normalized_equity"][0]["date"]
+    assert result["returns"][0]["date"] == result["normalized_equity"][1]["date"]
     assert result["dependency_revisions"] == []
 
     kept = client.post(
@@ -140,12 +144,80 @@ def test_formula_test_uses_pre_start_history_only_for_rolling_warmup(
     assert captured["panel_start"] == synthetic_panel.dates.min()
     assert captured["first_report_ready"] is True
     expected_dates = [date.date().isoformat() for date in synthetic_panel.dates[10:20]]
-    assert [item["date"] for item in result["returns"]] == expected_dates
+    assert [item["signal_date"] for item in result["returns"]] == expected_dates[:-1]
+    assert [item["date"] for item in result["returns"]] == expected_dates[1:]
     assert [item["date"] for item in result["normalized_equity"]] == expected_dates
+    assert result["normalized_equity"][0]["value"] == 1.0
     assert result["data_coverage"]["first_date"] == expected_dates[0]
     assert result["data_coverage"]["last_date"] == expected_dates[-1]
     assert result["data_coverage"]["observations"] == 10
     assert result["data_coverage"]["warmup_observations"] == 20
+
+
+def test_formula_test_horizon_uses_cumulative_ic_and_next_session_realization(
+    client, synthetic_panel
+):
+    from alphalineage.core.evaluate import evaluate
+    from alphalineage.core.fitness import daily_ic
+    from alphalineage.core.panel import Panel
+    from alphalineage.core.tree import Node
+
+    horizon = 3
+    start = synthetic_panel.dates[10]
+    end = synthetic_panel.dates[24]
+    submitted = client.post(
+        "/formula-tests",
+        json={
+            "source": {
+                "kind": "draft",
+                "body": {"name": "rank", "children": [{"name": "close"}]},
+                "inputs": [],
+                "out_type": "signal",
+            },
+            "bindings": {},
+            "start": start.date().isoformat(),
+            "end": end.date().isoformat(),
+            "horizon": horizon,
+        },
+    )
+    assert submitted.status_code == 200, submitted.text
+    completed = _wait(client, submitted.json()["job_id"])
+    assert completed["status"] == "done", completed
+    result = completed["result"]
+
+    # Formula tests intentionally truncate the warm-up panel at the requested end date. Build
+    # that panel and the horizon target directly so no future observations leak into expected IC.
+    warmup_panel = Panel(
+        {
+            name: frame.loc[frame.index <= end]
+            for name, frame in synthetic_panel.fields.items()
+        }
+    )
+    factor = evaluate(Node("rank", (Node("close"),)), warmup_panel)
+    assert hasattr(factor, "columns")
+    cumulative_target = (
+        warmup_panel["close"].shift(-horizon).div(warmup_panel["close"]).sub(1.0)
+    )
+    legacy_offset_target = warmup_panel["returns"].shift(-horizon)
+    report_dates = synthetic_panel.dates[10:25]
+    expected_ic = daily_ic(
+        factor, cumulative_target, "spearman", min_names=5
+    ).reindex(report_dates)
+    legacy_ic = daily_ic(
+        factor, legacy_offset_target, "spearman", min_names=5
+    ).reindex(report_dates)
+
+    assert float(expected_ic.mean()) != pytest.approx(float(legacy_ic.mean()), abs=1e-6)
+    assert result["horizon"] == horizon
+    assert result["metrics"]["signed_ic"] == pytest.approx(float(expected_ic.mean()))
+    assert result["metrics"]["mean_abs_ic"] == pytest.approx(float(expected_ic.abs().mean()))
+
+    expected_dates = [date.date().isoformat() for date in report_dates]
+    # Horizon changes the IC target and holding overlap, not the frequency at which the
+    # staggered portfolio realizes returns.
+    assert [item["signal_date"] for item in result["returns"]] == expected_dates[:-1]
+    assert [item["date"] for item in result["returns"]] == expected_dates[1:]
+    assert [item["date"] for item in result["normalized_equity"]] == expected_dates
 
 
 def test_saved_formula_requires_explicit_bindings_even_with_numeric_default(client):

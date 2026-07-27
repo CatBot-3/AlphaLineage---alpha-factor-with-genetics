@@ -37,6 +37,7 @@ def backtest_report(
     *,
     ic_method: str = "spearman",
     min_names: int = 5,
+    horizon: int = 1,
 ) -> dict[str, Any]:
     """Compute the canonical metric/time-series payload over ``dates``.
 
@@ -44,31 +45,52 @@ def backtest_report(
     sliced to ``dates``.  This preserves warm-up and boundary turnover semantics.
     """
     report_dates = pd.DatetimeIndex(dates)
-    tested = backtest(factor, panel, forward, scheme, costs, dates=report_dates)
+    tested = backtest(
+        factor,
+        panel,
+        forward,
+        scheme,
+        costs,
+        dates=report_dates,
+        horizon=horizon,
+    )
     ic = daily_ic(factor, forward, ic_method, min_names=min_names).reindex(report_dates)
     clean_ic = ic.dropna()
     signed_ic = clean_ic.mean() if len(clean_ic) else float("nan")
     mean_abs_ic = clean_ic.abs().mean() if len(clean_ic) else float("nan")
 
     gross, net = tested.gross_returns.align(tested.net_returns, join="outer")
-    dated_returns = [
-        {
-            "date": pd.Timestamp(date).date().isoformat(),
-            "gross": json_number(gross.loc[date]),
-            "net": json_number(net.loc[date]),
-        }
-        for date in gross.index
-    ]
-    equity = (1.0 + net.fillna(0.0)).cumprod()
-    normalized_equity = [
-        {"date": pd.Timestamp(date).date().isoformat(), "value": json_number(value)}
-        for date, value in equity.items()
-    ]
+    realization_dates = tested.realization_dates.reindex(gross.index)
+    dated_returns = []
+    for signal_date in gross.index:
+        realization_date = realization_dates.loc[signal_date]
+        if pd.isna(realization_date):
+            continue
+        dated_returns.append(
+            {
+                "signal_date": pd.Timestamp(signal_date).date().isoformat(),
+                "date": pd.Timestamp(realization_date).date().isoformat(),
+                "gross": json_number(gross.loc[signal_date]),
+                "net": json_number(net.loc[signal_date]),
+            }
+        )
+
+    normalized_equity: list[dict[str, Any]] = []
+    if dated_returns:
+        # The explicit pre-return baseline prevents the first realized return from disappearing
+        # when the chart converts levels to cumulative percentage performance.
+        normalized_equity.append({"date": dated_returns[0]["signal_date"], "value": 1.0})
+        level = 1.0
+        for point in dated_returns:
+            daily_net = point["net"]
+            if daily_net is not None:
+                level *= 1.0 + daily_net
+            normalized_equity.append({"date": point["date"], "value": json_number(level)})
     return {
         "start": (
-            pd.Timestamp(report_dates.min()).date().isoformat() if len(report_dates) else None
+            normalized_equity[0]["date"] if normalized_equity else None
         ),
-        "end": pd.Timestamp(report_dates.max()).date().isoformat() if len(report_dates) else None,
+        "end": normalized_equity[-1]["date"] if normalized_equity else None,
         "observations": int(net.notna().sum()),
         "metrics": {
             "signed_ic": json_number(signed_ic),

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -14,6 +16,8 @@ import alphalineage.api.app as api_app
 from alphalineage.api.app import app, get_panel
 from alphalineage.api.jobs import JobStore
 from alphalineage.core import extensions
+from alphalineage.data import schema
+from alphalineage.data.cache import ParquetCache
 
 
 @pytest.fixture
@@ -73,6 +77,135 @@ def test_health(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_benchmark_catalog_and_missing_series_never_trigger_a_download(
+    client, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ALPHALINEAGE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        api_app,
+        "_price_provider",
+        lambda: pytest.fail("benchmark reads must never trigger provider traffic"),
+    )
+
+    catalog = client.get("/benchmarks")
+    assert catalog.status_code == 200
+    assert [(item["id"], item["symbol"]) for item in catalog.json()] == [
+        ("sp500", "^GSPC"),
+        ("djia", "^DJI"),
+        ("nasdaq100", "^NDX"),
+    ]
+    assert all(item["return_type"] == "price_return" for item in catalog.json())
+
+    response = client.get(
+        "/benchmarks/sp500/series",
+        params={"start": "2025-01-02", "end": "2025-01-06"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "needs_sync"
+    assert payload["normalized_equity"] == []
+    assert payload["sync_request"] == {
+        "symbols": ["^GSPC"],
+        "start": "2025-01-02",
+        "end": "2025-01-07",
+        "mode": "incremental",
+    }
+
+
+def test_benchmark_series_uses_only_cached_adjusted_prices_and_reports_partial_coverage(
+    client, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ALPHALINEAGE_DATA_DIR", str(tmp_path))
+    dates = pd.to_datetime(["2025-01-02", "2025-01-03", "2025-01-06"])
+    raw = pd.DataFrame(
+        {
+            "open": [100.0, 110.0, 99.0],
+            "high": [100.0, 110.0, 99.0],
+            "low": [100.0, 110.0, 99.0],
+            "close": [100.0, 110.0, 99.0],
+            "volume": [1.0, 1.0, 1.0],
+            "div_cash": [0.0, 0.0, 0.0],
+            "split_factor": [1.0, 1.0, 1.0],
+        },
+        index=dates,
+    )
+    ParquetCache().store("^GSPC", schema.normalize(raw))
+
+    ready = client.get(
+        "/benchmarks/sp500/series",
+        params={"start": "2025-01-02", "end": "2025-01-06"},
+    )
+    assert ready.status_code == 200
+    payload = ready.json()
+    assert payload["status"] == "ready"
+    assert payload["return_type"] == "price_return"
+    assert [point["date"] for point in payload["normalized_equity"]] == [
+        "2025-01-02",
+        "2025-01-03",
+        "2025-01-06",
+    ]
+    assert [point["value"] for point in payload["normalized_equity"]] == pytest.approx(
+        [1.0, 1.1, 0.99]
+    )
+
+    weekend_end = client.get(
+        "/benchmarks/sp500/series",
+        params={"start": "2025-01-02", "end": "2025-01-05"},
+    ).json()
+    assert weekend_end["status"] == "ready"
+    assert weekend_end["coverage"]["needs_sync"] is False
+    assert weekend_end["normalized_equity"][-1]["date"] == "2025-01-03"
+
+    partial = client.get(
+        "/benchmarks/sp500/series",
+        params={"start": "2024-12-31", "end": "2025-01-06"},
+    ).json()
+    assert partial["status"] == "partial"
+    assert "partial" in partial["message"].lower()
+    assert partial["normalized_equity"][0]["date"] == "2025-01-02"
+
+    assert client.get(
+        "/benchmarks/not-real/series",
+        params={"start": "2025-01-02", "end": "2025-01-06"},
+    ).status_code == 404
+
+
+def test_benchmark_price_return_excludes_dividends_and_normalizes_splits(
+    client, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ALPHALINEAGE_DATA_DIR", str(tmp_path))
+    dates = pd.to_datetime(["2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07"])
+    raw = pd.DataFrame(
+        {
+            "open": [100.0, 90.0, 45.0, 47.0],
+            "high": [100.0, 90.0, 45.0, 47.0],
+            "low": [100.0, 90.0, 45.0, 47.0],
+            "close": [100.0, 90.0, 45.0, 47.0],
+            "volume": [1.0, 1.0, 2.0, 2.0],
+            # The first move is an ex-dividend drop; the second is a 2:1 split.
+            "div_cash": [0.0, 10.0, 0.0, 0.0],
+            "split_factor": [1.0, 1.0, 2.0, 1.0],
+        },
+        index=dates,
+    )
+    ParquetCache().store("^GSPC", schema.normalize(raw))
+
+    response = client.get(
+        "/benchmarks/sp500/series",
+        params={"start": "2025-01-02", "end": "2025-01-07"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ready"
+    assert payload["return_type"] == "price_return"
+    assert "split-adjusted" in payload["methodology"]
+    assert "not reinvested" in payload["methodology"]
+    assert [point["value"] for point in payload["normalized_equity"]] == pytest.approx(
+        [1.0, 0.9, 0.9, 0.94]
+    )
 
 
 def test_training_capabilities_are_device_relative_and_python_fallback_is_visible(
@@ -176,6 +309,8 @@ def test_universe_cache_coverage_validates_membership_period_edges(synthetic_pri
         cache=cache,
     )
     assert complete["complete"] is True
+    assert complete["required_start"] == prices.index.min().date().isoformat()
+    assert complete["required_end"] == cutoff.date().isoformat()
 
     coverage = api_app._cache_coverage_for(universe, cutoff, cache=cache)
     assert coverage["complete"] is False
@@ -186,6 +321,41 @@ def test_universe_cache_coverage_validates_membership_period_edges(synthetic_pri
 
     with pytest.raises(HTTPException, match="incomplete membership-period"):
         api_app._panel_from_universe_cache(universe, cutoff)
+
+
+def test_exited_membership_only_requires_prices_through_declared_exit(synthetic_prices):
+    from alphalineage.data.cache import ParquetCache
+    from alphalineage.data.universe import Membership, Universe
+
+    prices = api_app.schema.normalize(synthetic_prices)
+    cache = ParquetCache()
+    cache.store("EXITED", prices)
+    declared_exit = prices.index.max() + pd.Timedelta(days=1)
+    cutoff = pd.Timestamp("2026-07-24")
+    exited = Universe(
+        "exited-coverage",
+        [Membership("EXITED", prices.index.min(), declared_exit)],
+    )
+
+    coverage = api_app._cache_coverage_for(exited, cutoff, cache=cache)
+
+    assert coverage["complete"] is True
+    assert coverage["active_symbols"] == []
+    assert coverage["exited_symbols"] == ["EXITED"]
+    assert coverage["required_end"] == prices.index.max().date().isoformat()
+    assert coverage["symbol_coverage"]["EXITED"] == {
+        "first_date": prices.index.min().date().isoformat(),
+        "last_date": prices.index.max().date().isoformat(),
+        "required_start": prices.index.min().date().isoformat(),
+        "required_end": prices.index.max().date().isoformat(),
+        "membership_status": "exited",
+        "issues": [],
+    }
+
+    active = Universe("active-coverage", [Membership("EXITED", prices.index.min())])
+    active_coverage = api_app._cache_coverage_for(active, cutoff, cache=cache)
+    assert active_coverage["complete"] is False
+    assert active_coverage["stale_symbols"] == ["EXITED"]
 
 
 def test_job_lifecycle(client):
@@ -451,6 +621,156 @@ def test_universe_persistence_survives_memory_clear(client):
     assert set(restored["symbols"]) == {"AAA", "BBB"}
 
 
+def test_legacy_reserved_sample_file_is_moved_once_without_data_loss(client):
+    from alphalineage.data import paths
+    from alphalineage.data.universe import Membership, Universe
+
+    universe_dir = paths.universe_dir()
+    universe_dir.mkdir(parents=True, exist_ok=True)
+    Universe(
+        "sp500-lite-legacy",
+        [Membership("AAA", pd.Timestamp("2010-01-01"))],
+    ).save()
+    reserved = Universe(
+        "sp500-lite",
+        [
+            Membership(
+                "LEH",
+                pd.Timestamp("2000-01-01"),
+                pd.Timestamp("2008-09-15"),
+            )
+        ],
+    ).save()
+    original_bytes = reserved.read_bytes()
+    api_app._universes.clear()
+
+    try:
+        first = client.get("/universes")
+        assert first.status_code == 200
+        migrated = universe_dir / "sp500-lite-legacy-1.parquet"
+        assert not reserved.exists()
+        assert migrated.read_bytes() == original_bytes
+
+        by_name = {item["name"]: item for item in first.json()}
+        assert set(by_name["sp500-lite"]["symbols"]) != {"LEH"}
+        assert by_name["sp500-lite"]["source"] == "sample"
+        assert by_name["sp500-lite"]["symbol_count"] == 15
+        assert by_name["sp500-lite-legacy"]["symbols"] == ["AAA"]
+        assert by_name["sp500-lite-legacy-1"]["symbols"] == ["LEH"]
+
+        second = client.get("/universes")
+        assert second.status_code == 200
+        assert migrated.read_bytes() == original_bytes
+        assert not (universe_dir / "sp500-lite-legacy-2.parquet").exists()
+        assert [item["name"] for item in second.json()].count("sp500-lite-legacy-1") == 1
+    finally:
+        api_app._universes.clear()
+
+
+def test_reserved_sample_migration_never_overwrites_a_racing_destination(
+    client,
+    monkeypatch,
+):
+    from alphalineage.data import paths
+    from alphalineage.data.universe import Membership, Universe
+
+    universe_dir = paths.universe_dir()
+    universe_dir.mkdir(parents=True, exist_ok=True)
+    reserved = Universe(
+        "sp500-lite",
+        [Membership("LEGACY", pd.Timestamp("2000-01-01"))],
+    ).save()
+    original_bytes = reserved.read_bytes()
+    real_link = os.link
+    raced = False
+
+    def link_with_race(source, destination):
+        nonlocal raced
+        target = Path(destination)
+        if not raced and target.stem == "sp500-lite-legacy":
+            raced = True
+            Universe(
+                target.stem,
+                [Membership("NEW", pd.Timestamp("2020-01-01"))],
+            ).save(target)
+            raise FileExistsError(target)
+        return real_link(source, destination)
+
+    monkeypatch.setattr(api_app.os, "link", link_with_race)
+    api_app._universes.clear()
+
+    response = client.get("/universes")
+
+    assert response.status_code == 200
+    first_destination = universe_dir / "sp500-lite-legacy.parquet"
+    migrated = universe_dir / "sp500-lite-legacy-1.parquet"
+    assert Universe.load("sp500-lite-legacy", first_destination).all_symbols() == ["NEW"]
+    assert migrated.read_bytes() == original_bytes
+    assert not reserved.exists()
+
+
+def test_reserved_sample_migration_heals_a_same_inode_link_race(client, monkeypatch):
+    from alphalineage.data import paths
+    from alphalineage.data.universe import Membership, Universe
+
+    universe_dir = paths.universe_dir()
+    universe_dir.mkdir(parents=True, exist_ok=True)
+    reserved = Universe(
+        "sp500-lite",
+        [Membership("LEGACY", pd.Timestamp("2000-01-01"))],
+    ).save()
+    original_bytes = reserved.read_bytes()
+    real_link = os.link
+    raced = False
+
+    def link_then_report_race(source, destination):
+        nonlocal raced
+        if not raced:
+            raced = True
+            real_link(source, destination)
+            raise FileExistsError(destination)
+        return real_link(source, destination)
+
+    monkeypatch.setattr(api_app.os, "link", link_then_report_race)
+    api_app._universes.clear()
+
+    response = client.get("/universes")
+
+    assert response.status_code == 200
+    migrated = universe_dir / "sp500-lite-legacy.parquet"
+    assert migrated.read_bytes() == original_bytes
+    assert not reserved.exists()
+    assert not (universe_dir / "sp500-lite-legacy-1.parquet").exists()
+
+
+def test_reserved_sample_migration_deduplicates_interrupted_same_inode_moves(client):
+    from alphalineage.data import paths
+    from alphalineage.data.universe import Membership, Universe
+
+    universe_dir = paths.universe_dir()
+    universe_dir.mkdir(parents=True, exist_ok=True)
+    reserved = Universe(
+        "sp500-lite",
+        [Membership("LEGACY", pd.Timestamp("2000-01-01"))],
+    ).save()
+    original_bytes = reserved.read_bytes()
+    primary = universe_dir / "sp500-lite-legacy.parquet"
+    duplicate = universe_dir / "sp500-lite-legacy-1.parquet"
+    os.link(reserved, primary)
+    os.link(reserved, duplicate)
+    api_app._universes.clear()
+
+    response = client.get("/universes")
+
+    assert response.status_code == 200
+    assert primary.read_bytes() == original_bytes
+    assert not reserved.exists()
+    assert not duplicate.exists()
+    names = [item["name"] for item in response.json()]
+    assert names.count("sp500-lite-legacy") == 1
+    assert "sp500-lite-legacy-1" not in names
+
+
 def test_universe_get_update_delete_and_sample_protection(client):
     original = {
         "name": "editable-universe",
@@ -566,8 +886,12 @@ def test_universe_validation_unknown_run_and_honest_presets(client):
     assert presets["sp500"]["readiness"]["research_ready"] is False
     assert "memberships" not in presets["sp500"]
     bundled = client.get("/universes/sp500-lite").json()
-    assert bundled["integrity"]["membership_history"] == "illustrative"
+    assert bundled["display_name"] == "Popular US stocks sample"
+    assert bundled["mode"] == "static_snapshot"
+    assert bundled["integrity"]["membership_history"] == "static_snapshot"
     assert bundled["integrity"]["research_ready"] is False
+    assert bundled["symbol_count"] == 15
+    assert "LEH" not in bundled["symbols"]
 
 
 def test_symbol_search_and_validation(client, monkeypatch, synthetic_prices):
@@ -720,6 +1044,37 @@ def test_incremental_and_refresh_data_sync(client, monkeypatch, synthetic_prices
     assert replaced.index.max() < pd.Timestamp("2020-01-09")
 
 
+def test_data_sync_uses_provider_alias_but_keeps_canonical_cache_key(synthetic_prices):
+    prices = api_app.schema.normalize(synthetic_prices)
+
+    class AliasProvider:
+        name = "alias-provider"
+
+        def __init__(self):
+            self.symbols = []
+
+        def get_prices(self, symbol, start=None, end=None):
+            self.symbols.append(symbol)
+            return prices
+
+    provider = AliasProvider()
+    cache = api_app.ParquetCache()
+    result = api_app._sync_one_symbol(
+        "BRK.B",
+        provider_symbol="BRK-B",
+        start="2020-01-01",
+        end="2020-02-01",
+        mode="incremental",
+        provider=provider,
+        cache=cache,
+    )
+
+    assert provider.symbols == ["BRK-B"]
+    assert result.symbol == "BRK.B"
+    assert result.provider_symbol == "BRK-B"
+    assert cache.has("BRK.B")
+
+
 def test_data_sync_keeps_other_symbols_running_after_failure(client, monkeypatch, synthetic_prices):
     prices = api_app.schema.normalize(synthetic_prices)
 
@@ -748,7 +1103,9 @@ def test_data_sync_keeps_other_symbols_running_after_failure(client, monkeypatch
     assert results["BAD"]["status"] == "failed"
 
 
-def test_membership_date_sync_fills_entry_and_exit_for_active_stock(client, monkeypatch):
+def test_membership_date_sync_reports_coverage_without_mutating_membership(
+    client, monkeypatch
+):
     import numpy as np
 
     idx = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=30)
@@ -785,10 +1142,16 @@ def test_membership_date_sync_fills_entry_and_exit_for_active_stock(client, monk
     assert result["status"] == "resolved"
     assert result["delisted"] is False
     assert result["exit"] is None
-    assert result["entry"] == idx.min().date().isoformat()
+    assert result["entry"] is None
+    assert result["first_date"] == idx.min().date().isoformat()
+    assert result["list_date"] == result["first_date"]  # deprecated compatibility alias
+    assert result["last_date"] == idx.max().date().isoformat()
+    assert "Membership entry and exit were left unchanged" in result["note"]
 
 
-def test_membership_date_sync_detects_delisted_symbol(client, monkeypatch, synthetic_prices):
+def test_membership_date_sync_never_infers_delisting_from_stale_prices(
+    client, monkeypatch, synthetic_prices
+):
     prices = api_app.schema.normalize(synthetic_prices)
 
     class FakeProvider:
@@ -805,10 +1168,13 @@ def test_membership_date_sync_detects_delisted_symbol(client, monkeypatch, synth
     final = _poll_membership_sync(client, started.json()["job_id"])
     assert final["status"] == "done", final
     result = final["result"]["results"][0]
-    assert result["status"] == "resolved"
-    assert result["delisted"] is True
-    assert result["exit"] == (prices.index.max() + pd.Timedelta(days=1)).date().isoformat()
-    assert result["entry"] == prices.index.min().date().isoformat()
+    assert result["status"] == "unverified_stale"
+    assert result["review_needed"] is True
+    assert result["delisted"] is False
+    assert result["exit"] is None
+    assert result["entry"] is None
+    assert result["last_date"] == prices.index.max().date().isoformat()
+    assert "Membership was left unchanged" in result["note"]
 
 
 def test_membership_date_sync_keeps_other_symbols_running_after_failure(
@@ -832,8 +1198,12 @@ def test_membership_date_sync_keeps_other_symbols_running_after_failure(
     final = _poll_membership_sync(client, started.json()["job_id"])
     assert final["status"] == "done", final
     results = {item["symbol"]: item for item in final["result"]["results"]}
-    assert results["AAPL"]["status"] == "resolved"
+    assert results["AAPL"]["status"] == "unverified_stale"
+    assert results["AAPL"]["delisted"] is False
+    assert results["AAPL"]["exit"] is None
     assert results["BAD"]["status"] == "failed"
+    assert results["BAD"]["delisted"] is False
+    assert results["BAD"]["exit"] is None
 
 
 def test_workspace_save_load_list_delete(client):

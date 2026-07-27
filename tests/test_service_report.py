@@ -16,7 +16,7 @@ from alphalineage.backtest.engine import backtest, net_return_fn
 from alphalineage.backtest.portfolio import QuantileLongShort
 from alphalineage.core.evaluate import evaluate
 from alphalineage.core.extensions import ARG, register_operator, unregister_operator
-from alphalineage.core.fitness import forward_returns
+from alphalineage.core.fitness import forward_returns, mean_ic
 from alphalineage.core.generate import RandomTreeGenerator
 from alphalineage.core.tree import Node
 from alphalineage.core.types import DType
@@ -53,8 +53,14 @@ def test_build_report_deflates_on_net_returns(signal_panel):
     assert holdout["start"] == split.test.min().date().isoformat()
     assert holdout["end"] == split.test.max().date().isoformat()
     assert holdout["metrics"]["mean_abs_ic"] == pytest.approx(report["oos_ic"])
-    assert len(holdout["returns"]) == len(split.test)
+    assert len(holdout["returns"]) == len(split.test) - 1
     assert len(holdout["normalized_equity"]) == len(split.test)
+    assert holdout["normalized_equity"][0] == {
+        "date": split.test.min().date().isoformat(),
+        "value": 1.0,
+    }
+    assert holdout["returns"][0]["signal_date"] == split.test[0].date().isoformat()
+    assert holdout["returns"][0]["date"] == split.test[1].date().isoformat()
     factor = evaluate(best, panel)
     assert hasattr(factor, "columns")
     expected_backtest = backtest(
@@ -101,7 +107,11 @@ def test_build_report_uses_configured_horizon_and_ic_method(signal_panel):
     split = time_split(panel.dates, horizon=horizon)
     gen = RandomTreeGenerator(random.Random(2), max_depth=4, max_nodes=20)
     trials = gen.ramped_half_and_half(12, min_depth=2, max_depth=4)
-    best = trials[0]
+    # Use the fixture's known non-degenerate predictive field. A randomly generated first tree
+    # can be constant/invalid on this split, making both target definitions report IC=0 and
+    # weakening the horizon regression into a seed accident.
+    best = Node("volume")
+    trials[0] = best
     zero_costs = TransactionCostModel(commission_bps=0.0, slippage_bps=0.0)
 
     report = build_report(
@@ -115,7 +125,33 @@ def test_build_report_uses_configured_horizon_and_ic_method(signal_panel):
         costs=zero_costs,
     )
 
-    fwd = forward_returns(panel, horizon)
+    # Construct the target independently of ``forward_returns`` so this remains a regression
+    # test for the horizon contract rather than reproducing the implementation under test.
+    cumulative_target = panel["close"].shift(-horizon).div(panel["close"]).sub(1.0)
+    legacy_offset_target = panel["returns"].shift(-horizon)
+    factor = evaluate(best, panel)
+    assert hasattr(factor, "columns")
+    expected_oos_ic = mean_ic(
+        factor.loc[factor.index.isin(split.test)],
+        cumulative_target.loc[cumulative_target.index.isin(split.test)],
+        "pearson",
+        absolute=True,
+        min_names=5,
+    )
+    expected_train_ic = mean_ic(
+        factor.loc[factor.index.isin(split.train)],
+        cumulative_target.loc[cumulative_target.index.isin(split.train)],
+        "pearson",
+        absolute=True,
+        min_names=5,
+    )
+    legacy_oos_ic = mean_ic(
+        factor.loc[factor.index.isin(split.test)],
+        legacy_offset_target.loc[legacy_offset_target.index.isin(split.test)],
+        "pearson",
+        absolute=True,
+        min_names=5,
+    )
     expected = judge(
         best,
         trials,
@@ -125,10 +161,20 @@ def test_build_report_uses_configured_horizon_and_ic_method(signal_panel):
         n_trials=len(trials),
         horizon=horizon,
         ic_method="pearson",
-        returns_fn=net_return_fn(panel, fwd, QuantileLongShort(), zero_costs),
+        fwd=cumulative_target,
+        returns_fn=net_return_fn(
+            panel,
+            cumulative_target,
+            QuantileLongShort(),
+            zero_costs,
+            horizon=horizon,
+        ),
     )
-    assert report["oos_ic"] == pytest.approx(expected.oos_ic)
-    assert report["train_ic"] == pytest.approx(expected.train_ic)
+    assert expected_oos_ic != pytest.approx(legacy_oos_ic, abs=1e-6)
+    assert report["oos_ic"] == pytest.approx(expected_oos_ic)
+    assert report["train_ic"] == pytest.approx(expected_train_ic)
+    assert expected.oos_ic == pytest.approx(expected_oos_ic)
+    assert expected.train_ic == pytest.approx(expected_train_ic)
     assert report["deflated_sharpe"] == pytest.approx(expected.deflated_sharpe)
 
 

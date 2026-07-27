@@ -44,6 +44,9 @@ class Primitive:
     panel_field: str | None = None  # operands
     sampler: Callable[[random.Random], Any] | None = None  # ephemerals
     macro_body: Any = None  # user operators: a typed body tree (Node) expanded at evaluation
+    # Immutable formula-search contract.  Kept as JSON-compatible data so saved factors,
+    # sessions, and checkpoints can pin the exact parameter policy without executable code.
+    macro_policy: dict[str, Any] | None = None
 
     @property
     def arity(self) -> int:
@@ -217,6 +220,22 @@ def _ts_sum(a: pd.DataFrame, w: int) -> pd.DataFrame:
     return _roll(a, w).sum()
 
 
+def _ts_cumsum(a: pd.DataFrame) -> pd.DataFrame:
+    """Cumulative sum that restarts after every non-finite gap."""
+    values = a.to_numpy(dtype=float, copy=False)
+    result = np.full(values.shape, np.nan, dtype=float)
+    for column in range(values.shape[1]):
+        total = 0.0
+        for row in range(values.shape[0]):
+            value = float(values[row, column])
+            if not math.isfinite(value):
+                total = 0.0
+                continue
+            total += value
+            result[row, column] = total
+    return pd.DataFrame(result, index=a.index, columns=a.columns)
+
+
 def _ts_min(a: pd.DataFrame, w: int) -> pd.DataFrame:
     return _roll(a, w).min()
 
@@ -336,6 +355,7 @@ _OPERATOR_SPECS: list[tuple[str, tuple[DType, ...], DType, Callable[..., pd.Data
     ("ts_rma", (_SE, _WI), _SE, _ts_rma),
     ("ts_recursive_smooth", (_SE, _WI, _SC), _SE, _ts_recursive_smooth),
     ("ts_sum", (_SE, _WI), _SE, _ts_sum),
+    ("ts_cumsum", (_SE,), _SE, _ts_cumsum),
     ("ts_min", (_SE, _WI), _SE, _ts_min),
     ("ts_max", (_SE, _WI), _SE, _ts_max),
     ("ts_rank", (_SE, _WI), _SE, _ts_rank),

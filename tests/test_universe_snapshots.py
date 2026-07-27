@@ -240,18 +240,21 @@ def test_universe_sync_can_be_listed_reattached_and_stopped(
     monkeypatch.setattr(api_app, "_price_provider", lambda: FakeProvider())
     monkeypatch.setattr(api_app, "_sync_one_symbol", fake_sync)
 
-    started = client.post(
-        "/data/sync",
-        json={
-            "universe": "builtin-djia-current",
-            "start": "2020-01-01",
-            "mode": "incremental",
-        },
-    )
+    request = {
+        "universe": "builtin-djia-current",
+        "start": "2020-01-01",
+        "mode": "incremental",
+    }
+    started = client.post("/data/sync", json=request)
     assert started.status_code == 200
     job_id = started.json()["job_id"]
     assert entered.wait(timeout=2)
     try:
+        duplicate = client.post("/data/sync", json=request)
+        assert duplicate.status_code == 200
+        assert duplicate.json()["job_id"] == job_id
+        assert duplicate.json()["reused"] is True
+
         active = client.get("/data/sync", params={"active_only": True}).json()
         reattached = next(item for item in active if item["job_id"] == job_id)
         assert reattached["request"]["universe"] == "builtin-djia-current"

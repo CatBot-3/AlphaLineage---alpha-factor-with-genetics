@@ -188,10 +188,10 @@ def test_category_resolution_order(client):
 
     # an override beats both the formula's own category and the built-in default
     assert client.put("/categories/my_signal", json={"category": "alpha"}).status_code == 200
-    assert client.put("/categories/close", json={"category": "fields"}).status_code == 200
+    assert client.put("/categories/close", json={"category": "fields"}).status_code == 400
     prims = {p["name"]: p for p in client.get("/primitives").json()}
     assert prims["my_signal"]["category"] == "alpha"
-    assert prims["close"]["category"] == "fields"
+    assert prims["close"]["category"] == "data"
 
 
 def test_recategorize_unknown_primitive_is_404(client):
@@ -205,6 +205,38 @@ def test_create_and_rename_category(client):
     # a brand-new category referenced by an override is auto-appended to the order
     res = client.put("/categories", json={"overrides": {"ts_mean": "trend"}})
     assert "trend" in res.json()["order"]
+
+
+def test_legacy_category_settings_remove_duplicate_data_groups(client):
+    from alphalineage.data import paths
+
+    paths.write_categories(
+        {
+            "order": ["Data", "data", "constant", "custom"],
+            "overrides": {
+                "close": "fields",
+                "zscore": "data",
+                "ts_mean": "trend",
+            },
+        }
+    )
+    settings = client.get("/categories").json()
+    assert settings["order"].count("data") == 1
+    assert "Data" not in settings["order"]
+    assert settings["overrides"] == {"ts_mean": "trend"}
+
+    response = client.post(
+        "/formulas",
+        json={
+            "name": "reserved_data_formula",
+            "arg_types": [],
+            "out_type": "series",
+            "body": {"name": "close"},
+            "category": "Data",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["category"] == "custom"
 
 
 def test_user_formula_window_arg_is_gp_mutable(synthetic_panel):
@@ -232,6 +264,35 @@ def test_user_formula_window_arg_is_gp_mutable(synthetic_panel):
             if node.name == "window" and node.value is not None:
                 observed.add(int(node.value))
     assert observed - {5}, "GP point mutation never altered the call-site window argument"
+
+
+def test_saved_formula_keeps_parameter_policy_on_initial_registration_and_reload(client):
+    spec = {
+        "name": "bounded_ma",
+        "arg_types": ["series", "window"],
+        "inputs": [
+            {"name": "series", "type": "series", "role": "data"},
+            {
+                "name": "lookback",
+                "type": "window",
+                "role": "parameter",
+                "default": 10,
+                "tuning": {"min": 5, "max": 20, "step": 1, "radius": 2},
+            },
+        ],
+        "out_type": "series",
+        "body": {
+            "name": "ts_mean",
+            "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+        },
+    }
+    response = client.post("/formulas", json=spec)
+    assert response.status_code == 200, response.text
+    assert REGISTRY["bounded_ma"].macro_policy["inputs"][1]["default"] == 10
+
+    loaded = {item["name"]: item for item in client.get("/formulas").json()}
+    assert loaded["bounded_ma"]["registered"] is True
+    assert REGISTRY["bounded_ma"].macro_policy["inputs"][1]["tuning"]["radius"] == 2
 
 
 def test_primitive_catalog_has_readable_metadata_and_named_inputs(client):
@@ -275,7 +336,14 @@ def test_packaged_indicator_catalog_is_managed_searchable_and_idempotent(client)
     assert all(formulas[name]["category"] == "technical_indicators" for name in CATALOG_NAMES)
     assert all(formulas[name]["family"] for name in CATALOG_NAMES)
     assert all(formulas[name]["aliases"] for name in CATALOG_NAMES)
-    assert all(formulas[name]["catalog_revision"] == 1 for name in CATALOG_NAMES)
+    assert all(formulas[name]["catalog_revision"] == 2 for name in CATALOG_NAMES)
+    assert formulas["ta_macd_histogram_2x"]["status"] == "retired"
+    assert formulas["ta_macd_histogram_2x"]["replacement"] == "ta_macd_histogram"
+    macd = formulas["ta_macd_histogram"]
+    assert [item["name"] for item in macd["inputs"]] == ["fast", "slow"]
+    assert macd["constraints"] == [
+        {"left": "fast", "operator": "lt", "right": "slow"}
+    ]
     assert "mea" in formulas["ta_dea"]["aliases"]
     assert "Looking for MEA" in formulas["ta_dea"]["description"]
 
@@ -289,6 +357,150 @@ def test_packaged_indicator_catalog_is_managed_searchable_and_idempotent(client)
     assert primitives["ta_dea"]["origin"] == "catalog_formula"
     assert primitives["ta_dea"]["editable"] is False
     assert primitives["ta_dea"]["aliases"] == formulas["ta_dea"]["aliases"]
+
+
+def test_catalog_v2_uses_canonical_fields_and_bounded_formula_parameters(
+    client, synthetic_panel
+):
+    from alphalineage.core.extensions import expand_all
+    from alphalineage.core.generate import RandomTreeGenerator
+    from alphalineage.core.gp import GP, GPConfig, iter_variation_positions
+    from alphalineage.core.tree import InvalidTree, Node, validate
+    from alphalineage.core.types import DType
+
+    formulas = {item["name"]: item for item in client.get("/formulas").json()}
+    macd = formulas["ta_macd_histogram"]
+    assert all(item["role"] == "parameter" for item in macd["inputs"])
+    assert not any(item["type"] == "series" for item in macd["inputs"])
+    assert {node["name"] for node in macd["body"]["children"]} == {
+        formulas["ta_dif"]["runtime_name"],
+        formulas["ta_dea"]["runtime_name"],
+    }
+
+    runtime = macd["runtime_name"]
+    default = Node(runtime, (Node("window", value=12), Node("window", value=26)))
+    validate(default)
+    with pytest.raises(InvalidTree, match="requires fast < slow"):
+        validate(Node(runtime, (Node("window", value=20), Node("window", value=20))))
+
+    generator = RandomTreeGenerator(
+        max_depth=8,
+        max_nodes=40,
+        root_type=DType.SERIES,
+        allowed_operators={runtime},
+    )
+    assert generator.generate(grow=False) == default
+    assert [path for path, _, _ in iter_variation_positions(default, DType.SERIES)] == [()]
+
+    gp = GP(
+        GPConfig(population_size=8, generations=1, max_depth=32, max_nodes=40),
+        synthetic_panel,
+        root_type=DType.SERIES,
+        allowed_operators={runtime},
+    )
+    observed: set[tuple[int, int]] = set()
+    for seed in range(40):
+        gp.rng.seed(seed)
+        mutated = gp._point_mutation(default)
+        validate(mutated)
+        observed.add(tuple(int(child.value) for child in mutated.children))
+    assert observed - {(12, 26)}
+    assert all(fast < slow for fast, slow in observed)
+    assert (
+        expand_all(default, max_depth=32, max_nodes=40).unique_computation_size()
+        <= 40
+    )
+
+    standalone = Node("mul_scalar", (default, Node("const", value=1.0)))
+    assert gp._mutate_formula_coefficient(standalone, (1,), standalone.children[1]) == standalone
+    combination = Node("add", (standalone, Node("close")))
+    weighted = gp._mutate_formula_coefficient(
+        combination, (0, 1), standalone.children[1]
+    )
+    assert weighted is not None and weighted != combination
+
+
+def test_every_active_catalog_formula_fits_default_node_budget(client):
+    from alphalineage.core.extensions import expand_all
+    from alphalineage.core.tree import Node
+
+    formulas = client.get("/formulas").json()
+    for formula in formulas:
+        if formula["origin"] != "catalog_formula" or formula["status"] != "active":
+            continue
+        children = tuple(
+            Node("window", value=int(item["default"]))
+            if item["type"] == "window"
+            else Node("const", value=float(item["default"]))
+            for item in formula["inputs"]
+        )
+        expanded = expand_all(
+            Node(formula["runtime_name"], children), max_depth=32, max_nodes=40
+        )
+        assert expanded.unique_computation_size() <= 40, formula["name"]
+
+
+def test_deep_atomic_starters_initialize_and_mutate_with_default_gp_budget(
+    client, synthetic_panel, tmp_path
+):
+    import json
+
+    from alphalineage.core.gp import GP, GPConfig
+    from alphalineage.core.tree import Node, validate
+    from alphalineage.core.types import DType
+
+    formulas = {item["name"]: item for item in client.get("/formulas").json()}
+    selected = ["ta_rsi_wilder", "ta_kdj_j", "ta_adx", "ta_mfi"]
+    seeds = []
+    runtimes = set()
+    for name in selected:
+        formula = formulas[name]
+        runtimes.add(formula["runtime_name"])
+        children = tuple(
+            Node("window", value=int(item["default"]))
+            if item["type"] == "window"
+            else Node("const", value=float(item["default"]))
+            for item in formula["inputs"]
+        )
+        seeds.append(Node(formula["runtime_name"], children))
+
+    gp = GP(
+        GPConfig(population_size=8, generations=1),
+        synthetic_panel,
+        root_type=DType.SERIES,
+        allowed_operators=runtimes,
+    )
+    assert all(gp._fits_complexity(tree) for tree in seeds)
+    gp.initialize(seeds)
+    checkpoint = tmp_path / "catalog-policy-checkpoint.json"
+    gp.save_checkpoint(checkpoint)
+    persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert runtimes <= persisted["formula_policies"].keys()
+    assert persisted["evolution_version"] >= 2
+    for tree in seeds:
+        gp.rng.seed(17)
+        mutated = gp._point_mutation(tree)
+        validate(mutated)
+        assert gp._fits_complexity(mutated)
+
+
+def test_formula_allow_list_selects_one_active_starter(client):
+    from alphalineage.api.app import _allowed_operators
+    from alphalineage.core.categories import TECHNICAL_INDICATORS
+    from alphalineage.core.gp import GPConfig
+
+    formulas = {item["name"]: item for item in client.get("/formulas").json()}
+    runtimes = {item["runtime_name"] for item in formulas.values()}
+    config = GPConfig(
+        population_size=8,
+        generations=1,
+        enabled_categories=[TECHNICAL_INDICATORS],
+        enabled_formula_names=["ta_macd_histogram"],
+    )
+    allowed = _allowed_operators(config, runtimes)
+    assert formulas["ta_macd_histogram"]["runtime_name"] in allowed
+    assert formulas["ta_dif"]["runtime_name"] not in allowed
+    assert formulas["ta_macd_histogram_2x"]["runtime_name"] not in allowed
 
 
 def test_packaged_indicator_catalog_rejects_mutation_and_deletion(client):
@@ -320,25 +532,80 @@ def test_catalog_upgrade_publishes_pinned_revision_and_preserves_user_formulas(
     upgraded_catalog = []
     for definition in api_module.INDICATOR_CATALOG:
         candidate = copy.deepcopy(definition)
-        if candidate["name"] == "ta_sma":
+        if candidate["name"] == "ta_ema":
             candidate["body"] = {
-                "name": "ts_ema",
-                "children": [{"name": "$arg", "value": 0}, {"name": "$arg", "value": 1}],
+                "name": "ts_mean",
+                "children": [{"name": "close"}, {"name": "$arg", "value": 0}],
             }
-            candidate["catalog_revision"] = 2
+            candidate["catalog_revision"] = 3
         upgraded_catalog.append(candidate)
     monkeypatch.setattr(api_module, "INDICATOR_CATALOG", tuple(upgraded_catalog))
 
     assert client.get("/formulas").status_code == 200
-    sma = client.get("/formulas/ta_sma").json()
-    assert [item["runtime_name"] for item in sma["revisions"]] == ["ta_sma", "ta_sma__r2"]
-    assert sma["body"]["name"] == "ts_ema"
-    middle = client.get("/formulas/ta_boll_middle").json()
-    assert middle["body"]["name"] == "ta_sma__r2"
+    ema = client.get("/formulas/ta_ema").json()
+    assert [item["runtime_name"] for item in ema["revisions"]] == ["ta_ema", "ta_ema__r2"]
+    assert ema["body"]["name"] == "ts_mean"
+    dema = client.get("/formulas/ta_dema").json()
+
+    def names(tree):
+        return {tree["name"]} | {
+            name for child in tree.get("children", []) for name in names(child)
+        }
+
+    assert "ta_ema__r2" in names(dema["body"])
     user_detail = client.get("/formulas/user_catalog_neighbor").json()
     assert [item["runtime_name"] for item in user_detail["revisions"]] == [
         "user_catalog_neighbor"
     ]
+
+
+def test_catalog_upgrade_retires_orphan_managed_family_without_rewriting_old_runtime(client):
+    from alphalineage.data import paths
+
+    legacy = {
+        "schema_version": 2,
+        "families": [
+            {
+                "name": "ta_rsi",
+                "latest_revision": 1,
+                "revisions": [
+                    {
+                        "name": "ta_rsi",
+                        "display_name": "RSI",
+                        "arg_types": [],
+                        "inputs": [],
+                        "out_type": "series",
+                        "body": {"name": "close"},
+                        "category": "technical_indicators",
+                        "revision": 1,
+                        "runtime_name": "ta_rsi",
+                        "origin": "catalog_formula",
+                        "editable": False,
+                        "family": "rsi",
+                        "aliases": ["rsi legacy"],
+                        "catalog_revision": 1,
+                    }
+                ],
+            }
+        ],
+    }
+    paths.formulas_path().parent.mkdir(parents=True, exist_ok=True)
+    paths.formulas_path().write_text(json.dumps(legacy), encoding="utf-8")
+
+    formulas = client.get("/formulas").json()
+    orphan = next(item for item in formulas if item["name"] == "ta_rsi")
+    assert orphan["status"] == "retired"
+    assert orphan["replacement"] == "ta_rsi_wilder"
+    assert sum(
+        item["origin"] == "catalog_formula" and item["status"] == "active"
+        for item in formulas
+    ) == 36
+    detail = client.get("/formulas/ta_rsi").json()
+    assert [item["runtime_name"] for item in detail["revisions"]] == [
+        "ta_rsi",
+        "ta_rsi__r2",
+    ]
+    assert detail["revisions"][0]["status"] == "active"
 
 
 def test_packaged_indicators_expand_and_match_python_and_native(client, synthetic_panel):
@@ -403,7 +670,7 @@ def test_wilder_rsi_and_kdj_define_flat_and_zero_loss_edges(client):
         volume=pd.DataFrame(1.0, index=dates, columns=columns),
     )
     rsi = evaluate_python(
-        Node("ta_rsi_wilder", (Node("close"), Node("window", value=3))),
+        Node("ta_rsi_wilder", (Node("window", value=3),)),
         panel,
     )
     assert np.isnan(rsi.iloc[:3].to_numpy()).all()
@@ -414,7 +681,7 @@ def test_wilder_rsi_and_kdj_define_flat_and_zero_loss_edges(client):
     rsv = evaluate_python(
         Node(
             "ta_kdj_rsv",
-            (Node("high"), Node("low"), Node("close"), Node("window", value=3)),
+            (Node("window", value=3),),
         ),
         panel,
     )
@@ -496,19 +763,17 @@ def test_indicator_families_match_independent_fixed_references(client):
     expected_sma = close.rolling(3, min_periods=3).mean()
     expected_ema = close.ewm(span=3, adjust=False, min_periods=3).mean()
     expected_rma = wilder(close, 3)
-    assert np.allclose(result("ta_sma", Node("close"), window(3)), expected_sma, equal_nan=True)
-    assert np.allclose(result("ta_ema", Node("close"), window(3)), expected_ema, equal_nan=True)
-    assert np.allclose(result("ta_rma", Node("close"), window(3)), expected_rma, equal_nan=True)
+    assert np.allclose(result("ta_sma", window(3)), expected_sma, equal_nan=True)
+    assert np.allclose(result("ta_ema", window(3)), expected_ema, equal_nan=True)
+    assert np.allclose(result("ta_rma", window(3)), expected_rma, equal_nan=True)
 
     fast = close.ewm(span=2, adjust=False, min_periods=2).mean()
     slow = close.ewm(span=3, adjust=False, min_periods=3).mean()
     expected_dif = fast - slow
-    expected_dea = expected_dif.ewm(span=2, adjust=False, min_periods=2).mean()
+    expected_dea = expected_dif.ewm(span=9, adjust=False, min_periods=9).mean()
     expected_macd = expected_dif - expected_dea
-    macd_args = (Node("close"), window(2), window(3), window(2))
-    assert np.allclose(
-        result("ta_dif", *macd_args[:3]), expected_dif, equal_nan=True
-    )
+    macd_args = (window(2), window(3))
+    assert np.allclose(result("ta_dif", *macd_args), expected_dif, equal_nan=True)
     assert np.allclose(result("ta_dea", *macd_args), expected_dea, equal_nan=True)
     assert np.allclose(
         result("ta_macd_histogram", *macd_args), expected_macd, equal_nan=True
@@ -522,7 +787,7 @@ def test_indicator_families_match_independent_fixed_references(client):
     upper, lower = middle + 2.0 * deviation, middle - 2.0 * deviation
     percent_b = (close - lower) / (upper - lower)
     bandwidth = (upper - lower) / middle * 100.0
-    boll_args = (Node("close"), window(3), scalar(2.0))
+    boll_args = (window(3),)
     for name, expected in (
         ("ta_boll_middle", middle),
         ("ta_boll_upper", upper),
@@ -530,22 +795,18 @@ def test_indicator_families_match_independent_fixed_references(client):
         ("ta_boll_percent_b", percent_b),
         ("ta_boll_bandwidth", bandwidth),
     ):
-        args = boll_args[:2] if name == "ta_boll_middle" else boll_args
-        assert np.allclose(result(name, *args), expected, equal_nan=True), name
+        assert np.allclose(result(name, *boll_args), expected, equal_nan=True), name
 
     previous = close.shift(1)
     true_range = pd.concat(
         [high - low, (high - previous).abs(), (low - previous).abs()], axis=1
     ).max(axis=1, skipna=True)
     expected_atr = wilder(true_range, 3)
-    price_args = (Node("high"), Node("low"), Node("close"))
-    assert np.allclose(result("ta_true_range", *price_args), true_range, equal_nan=True)
-    assert np.allclose(
-        result("ta_atr", *price_args, window(3)), expected_atr, equal_nan=True
-    )
+    assert np.allclose(result("ta_true_range"), true_range, equal_nan=True)
+    assert np.allclose(result("ta_atr", window(3)), expected_atr, equal_nan=True)
     expected_roc = (close / close.shift(2) - 1.0) * 100.0
     assert np.allclose(
-        result("ta_roc", Node("close"), window(2)), expected_roc, equal_nan=True
+        result("ta_roc", window(2)), expected_roc, equal_nan=True
     )
 
     lowest = low.rolling(3, min_periods=3).min()
@@ -554,21 +815,135 @@ def test_indicator_families_match_independent_fixed_references(client):
     expected_k = recursive(expected_rsv, 3)
     expected_d = recursive(expected_k, 3)
     expected_j = 3.0 * expected_k - 2.0 * expected_d
-    kdj_base = (*price_args, window(3))
-    assert np.allclose(result("ta_kdj_rsv", *kdj_base), expected_rsv, equal_nan=True)
-    assert np.allclose(
-        result("ta_kdj_k", *kdj_base, window(3)), expected_k, equal_nan=True
+    assert np.allclose(result("ta_kdj_rsv", window(3)), expected_rsv, equal_nan=True)
+    assert np.allclose(result("ta_kdj_k", window(3)), expected_k, equal_nan=True)
+    assert np.allclose(result("ta_kdj_d", window(3)), expected_d, equal_nan=True)
+    assert np.allclose(result("ta_kdj_j", window(3)), expected_j, equal_nan=True)
+
+
+def test_catalog_v2_additions_match_independent_references(client):
+    import numpy as np
+    import pandas as pd
+
+    from alphalineage.core.evaluate import evaluate_python
+    from alphalineage.core.panel import Panel
+    from alphalineage.core.tree import Node
+
+    client.get("/formulas")
+    dates = pd.date_range("2024-04-01", periods=30, freq="B")
+    close = pd.Series(
+        [
+            10, 11, 10, 12, 13, 12, 14, 15, 14, 16,
+            15, 17, 18, 17, 19, 20, 18, 21, 22, 21,
+            23, 22, 24, 25, 24, 26, 27, 25, 28, 29,
+        ],
+        index=dates,
+        dtype=float,
     )
+    high = close + pd.Series(np.resize([1.0, 1.4, 0.8, 1.2], 30), index=dates)
+    low = close - pd.Series(np.resize([0.7, 1.1, 0.9], 30), index=dates)
+    volume = pd.Series(np.arange(100.0, 130.0), index=dates)
+    frame = lambda values: values.to_frame("A")  # noqa: E731
+    panel = Panel.from_prices(
+        open=frame(close.shift(1).fillna(close.iloc[0])),
+        high=frame(high),
+        low=frame(low),
+        close=frame(close),
+        volume=frame(volume),
+    )
+
+    def result(name: str, *values: int) -> pd.Series:
+        return evaluate_python(
+            Node(name, tuple(Node("window", value=value) for value in values)), panel
+        )["A"]
+
+    def wilder(source: pd.Series, lookback: int) -> pd.Series:
+        output = pd.Series(np.nan, index=source.index, dtype=float)
+        seed: list[float] = []
+        state: float | None = None
+        for index, value in source.items():
+            if not np.isfinite(value):
+                seed.clear()
+                state = None
+                continue
+            if state is None:
+                seed.append(float(value))
+                if len(seed) < lookback:
+                    continue
+                state = sum(seed) / lookback
+                seed.clear()
+            else:
+                state = (state * (lookback - 1) + float(value)) / lookback
+            output.loc[index] = state
+        return output
+
+    weights = np.arange(1.0, 4.0)
+    wma = close.rolling(3, min_periods=3).apply(
+        lambda values: float(np.dot(values, weights) / weights.sum()), raw=True
+    )
+    ema1 = close.ewm(span=3, adjust=False, min_periods=3).mean()
+    ema2 = ema1.ewm(span=3, adjust=False, min_periods=3).mean()
+    ema3 = ema2.ewm(span=3, adjust=False, min_periods=3).mean()
+    assert np.allclose(result("ta_wma", 3), wma, equal_nan=True)
+    assert np.allclose(result("ta_dema", 3), 2 * ema1 - ema2, equal_nan=True)
+    assert np.allclose(result("ta_tema", 3), 3 * ema1 - 3 * ema2 + ema3, equal_nan=True)
+
+    fast = close.ewm(span=2, adjust=False, min_periods=2).mean()
+    slow = close.ewm(span=5, adjust=False, min_periods=5).mean()
+    assert np.allclose(result("ta_ppo", 2, 5), (fast - slow) / slow * 100, equal_nan=True)
+
+    highest = high.rolling(3, min_periods=3).max()
+    lowest = low.rolling(3, min_periods=3).min()
     assert np.allclose(
-        result("ta_kdj_d", *kdj_base, window(3), window(3)),
-        expected_d,
+        result("ta_williams_r", 3), (highest - close) / (highest - lowest) * -100,
         equal_nan=True,
     )
+    previous = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - previous).abs(), (low - previous).abs()], axis=1
+    ).max(axis=1, skipna=True)
+    atr = wilder(true_range, 3)
+    assert np.allclose(result("ta_natr", 3), atr / close * 100, equal_nan=True)
+    assert np.allclose(result("ta_donchian_upper", 3), highest, equal_nan=True)
+    assert np.allclose(result("ta_donchian_lower", 3), lowest, equal_nan=True)
     assert np.allclose(
-        result("ta_kdj_j", *kdj_base, window(3), window(3)),
-        expected_j,
+        result("ta_donchian_middle", 3), (highest + lowest) / 2, equal_nan=True
+    )
+    assert np.allclose(
+        result("ta_donchian_position", 3), (close - lowest) / (highest - lowest) * 100,
         equal_nan=True,
     )
+
+    up, down = high.diff(), -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    plus_dm.iloc[0] = np.nan
+    minus_dm.iloc[0] = np.nan
+    plus_di = wilder(plus_dm, 3) / atr * 100
+    minus_di = wilder(minus_dm, 3) / atr * 100
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di) * 100
+    adx = wilder(dx, 3)
+    assert np.allclose(result("ta_plus_di", 3), plus_di, equal_nan=True)
+    assert np.allclose(result("ta_minus_di", 3), minus_di, equal_nan=True)
+    assert np.allclose(result("ta_dx", 3), dx, equal_nan=True)
+    assert np.allclose(result("ta_adx", 3), adx, equal_nan=True)
+
+    signed_volume = np.sign(close.diff()) * volume
+    assert np.allclose(result("ta_obv"), signed_volume.cumsum(), equal_nan=True)
+    typical = (high + low + close) / 3
+    raw_flow = typical * volume
+    change = typical.diff()
+    positive = raw_flow.where(change > 0, 0.0).rolling(3, min_periods=3).sum()
+    negative = raw_flow.where(change < 0, 0.0).rolling(3, min_periods=3).sum()
+    mfi = 100 - 100 / (1 + positive / negative)
+    mfi = mfi.mask((negative == 0) & (positive > 0), 100.0)
+    mfi = mfi.mask((negative == 0) & (positive == 0), 50.0)
+    assert np.allclose(result("ta_mfi", 3), mfi, equal_nan=True)
+    multiplier = ((close - low) - (high - close)) / (high - low)
+    cmf = (multiplier * volume).rolling(3, min_periods=3).sum() / volume.rolling(
+        3, min_periods=3
+    ).sum()
+    assert np.allclose(result("ta_cmf", 3), cmf, equal_nan=True)
 
 
 def test_indicator_zero_denominators_are_explicitly_nan(client):
@@ -597,8 +972,7 @@ def test_indicator_zero_denominators_are_explicitly_nan(client):
         volume=pd.DataFrame(1.0, index=dates, columns=close.columns),
     )
     window = Node("window", value=3)
-    deviations = Node("const", value=2.0)
-    boll_args = (Node("close"), window, deviations)
+    boll_args = (window,)
     percent_b = evaluate_python(Node("ta_boll_percent_b", boll_args), panel)
     bandwidth = evaluate_python(Node("ta_boll_bandwidth", boll_args), panel)
     assert percent_b[["ZERO", "FLAT"]].iloc[2:].isna().all().all()
@@ -606,11 +980,14 @@ def test_indicator_zero_denominators_are_explicitly_nan(client):
     assert np.allclose(bandwidth["FLAT"].iloc[2:], 0.0)
 
     roc = evaluate_python(
-        Node("ta_roc", (Node("close"), Node("window", value=1))), panel
+        Node("ta_roc", (Node("window", value=1),)), panel
     )
     assert roc["ZERO"].iloc[1:].isna().all()
     assert roc["CROSS"].iloc[1:].isna().to_list() == [True, True, False, True, False]
     assert roc["CROSS"].iloc[3] == -100.0
+
+    cmf = evaluate_python(Node("ta_cmf", (window,)), panel)
+    assert np.allclose(cmf.iloc[2:].to_numpy(), 0.0)
 
 
 def test_legacy_formula_store_migrates_named_inputs_on_write(client):

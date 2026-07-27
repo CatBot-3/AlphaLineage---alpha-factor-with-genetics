@@ -21,10 +21,19 @@ from alphalineage.core.tree import Node
 
 
 def forward_returns(panel: Panel, horizon: int = 1) -> pd.DataFrame:
-    """Next-``horizon`` simple return per date/symbol (the prediction target)."""
+    """Cumulative close-to-close return over the next ``horizon`` sessions.
+
+    A horizon of one is the next session's realized return.  Longer horizons use
+    ``close[t + horizon] / close[t] - 1`` rather than selecting only the one-day
+    return observed ``horizon`` rows later.
+    """
     if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
         raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
-    return panel["returns"].shift(-horizon)
+    if horizon == 1:
+        # Preserve the established default scorer bit-for-bit.
+        return panel["returns"].shift(-1)
+    close = panel["close"]
+    return close.shift(-horizon).div(close).sub(1.0)
 
 
 def _rowwise_corr_values(a: np.ndarray, b: np.ndarray, min_names: int) -> np.ndarray:
@@ -179,7 +188,7 @@ def score_tree(
     """
     expanded = expand_all(tree)
     return _score_factor(
-        expanded.size(),
+        expanded.unique_size(),
         evaluate(expanded, panel),
         fwd,
         method=method,

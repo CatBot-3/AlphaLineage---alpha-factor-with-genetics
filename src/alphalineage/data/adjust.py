@@ -46,7 +46,7 @@ def price_adjustment(df: pd.DataFrame) -> pd.Series:
 
 
 def split_adjustment(df: pd.DataFrame) -> pd.Series:
-    """Cumulative split-only adjustment factor (used for volume)."""
+    """Cumulative split-only adjustment factor for prices and volume."""
     schema.validate(df)
     split_factor = df["split_factor"].replace(0.0, 1.0)
     return _suffix_excl_self(1.0 / split_factor)
@@ -67,5 +67,14 @@ def adjust(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def adjusted_close(df: pd.DataFrame) -> pd.Series:
-    """Convenience accessor for the back-adjusted close series."""
+    """Return the split-and-dividend-adjusted (total-return) close series."""
     return df["close"] * price_adjustment(df)
+
+
+def split_adjusted_close(df: pd.DataFrame) -> pd.Series:
+    """Return close prices back-adjusted for splits but not cash dividends.
+
+    This is the appropriate level series for a price-return benchmark: forward and reverse
+    splits are normalized away, while an ex-dividend price drop remains part of the return.
+    """
+    return df["close"] * split_adjustment(df)

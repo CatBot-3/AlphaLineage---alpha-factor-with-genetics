@@ -109,6 +109,25 @@ export interface RunBacktestReport {
   normalized_equity: FormulaTestEquityPoint[];
 }
 
+export interface BenchmarkDefinition {
+  id: "sp500" | "djia" | "nasdaq100" | string;
+  label: string;
+  symbol: string;
+  color: string;
+  return_type: "price_return";
+  methodology: string;
+}
+
+export interface BenchmarkSeries extends BenchmarkDefinition {
+  status: "ready" | "partial" | "needs_sync";
+  message: string | null;
+  requested_start: string;
+  requested_end: string;
+  coverage: DataCoverage;
+  normalized_equity: FormulaTestEquityPoint[];
+  sync_request: DataSyncRequest;
+}
+
 // --- iterative sessions (A4/A5) ------------------------------------------------
 export interface GpConfig {
   population_size: number;
@@ -128,6 +147,8 @@ export interface GpConfig {
   seed: number;
   time_budget_s: number | null;
   enabled_categories?: string[] | null;
+  /** Logical formula allow-list. Null preserves the legacy category-wide selection. */
+  enabled_formula_names?: string[] | null;
 }
 
 export type TrainingResourceProfile = "light" | "auto" | "maximum" | "custom";
@@ -369,6 +390,9 @@ export interface FormulaTestMetrics {
 }
 
 export interface FormulaTestReturnPoint {
+  /** Date on which the factor was observed and the newest cohort was formed. */
+  signal_date?: string;
+  /** Date on which the close-to-close portfolio return was realized. */
   date: string;
   gross: number | null;
   net: number | null;
@@ -455,6 +479,10 @@ export interface PrimitiveInfo {
   family?: string;
   aliases?: string[];
   catalog_revision?: number | null;
+  constraints?: FormulaConstraint[];
+  status?: "active" | "retired";
+  replacement?: string | null;
+  family_order?: number | null;
 }
 
 export interface OperatorSpec {
@@ -462,6 +490,12 @@ export interface OperatorSpec {
   arg_types: string[];
   out_type: string;
   body: FactorNode; // a typed body tree with $arg leaves
+}
+
+export interface FormulaConstraint {
+  left: string;
+  operator: "lt" | "le" | "gt" | "ge" | "ne";
+  right: string;
 }
 
 export interface FormulaSpec {
@@ -484,6 +518,10 @@ export interface FormulaSpec {
   family?: string;
   aliases?: string[];
   catalog_revision?: number | null;
+  constraints?: FormulaConstraint[];
+  status?: "active" | "retired";
+  replacement?: string | null;
+  family_order?: number | null;
 }
 
 export interface FormulaInputSpec {
@@ -492,6 +530,14 @@ export interface FormulaInputSpec {
   description: string;
   /** Optional, visible call-site default for scalar/window inputs only. */
   default?: number | null;
+  role?: "data" | "parameter";
+  tuning?: {
+    enabled: boolean;
+    min: number;
+    max: number;
+    step: number;
+    radius: number;
+  } | null;
 }
 
 export interface FormulaImpact {
@@ -568,7 +614,15 @@ export interface UniverseReadiness {
 
 export interface UniverseCacheCoverage {
   as_of: string;
+  /** Earliest membership date that must be cached for point-in-time integrity. */
+  required_start?: string | null;
+  /** Latest date included in this readiness decision. */
+  required_end?: string | null;
   eligible_symbols: string[];
+  /** Memberships still active at the coverage cutoff (static snapshots are included here). */
+  active_symbols?: string[];
+  /** Symbols whose declared membership exit is on or before the coverage cutoff. */
+  exited_symbols?: string[];
   cached_symbols: string[];
   missing_symbols: string[];
   invalid_symbols?: string[];
@@ -579,6 +633,9 @@ export interface UniverseCacheCoverage {
   symbol_coverage?: Record<string, {
     first_date: string | null;
     last_date: string | null;
+    required_start?: string | null;
+    required_end?: string | null;
+    membership_status?: "active" | "exited" | "current_snapshot" | string;
     issues: string[];
   }>;
   complete: boolean;
@@ -712,6 +769,8 @@ export interface DataSyncRequest {
   start: string;
   end?: string | null;
   mode: "incremental" | "refresh";
+  /** Canonical cache symbol -> provider symbol; normally resolved from a saved universe. */
+  aliases?: Record<string, string>;
 }
 
 export interface DataSyncResult {
@@ -739,7 +798,6 @@ export interface DataSyncJob {
   termination_reason?: "completed" | "user_stopped" | string | null;
   request?: DataSyncRequest & {
     resolved_symbols?: string[];
-    aliases?: Record<string, string>;
   };
   universe_definition?: {
     name: string;
@@ -759,6 +817,8 @@ export interface DataSyncJob {
     resolved_symbols?: string[];
     aliases?: Record<string, string>;
     universe_definition?: DataSyncJob["universe_definition"];
+    failed_count?: number;
+    succeeded_count?: number;
     termination_reason?: "completed" | "user_stopped" | string;
     results: DataSyncResult[];
   } | null;
@@ -773,12 +833,19 @@ export interface MembershipSyncRequest {
 
 export interface MembershipSyncResult {
   symbol: string;
-  status: "resolved" | "failed";
+  status: "resolved" | "unverified_stale" | "failed";
+  /** Deprecated and always inert: price coverage cannot establish membership. */
   entry?: string | null;
+  /** Deprecated and always inert: an absent price tail cannot establish an exit. */
   exit?: string | null;
+  /** Deprecated and always false without an authoritative security-status source. */
   delisted: boolean;
+  review_needed?: boolean;
+  first_date?: string | null;
+  /** Deprecated alias for first_date. */
   list_date?: string | null;
   last_date?: string | null;
+  note?: string | null;
   error?: string | null;
 }
 

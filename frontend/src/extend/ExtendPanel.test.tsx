@@ -39,11 +39,12 @@ describe("ExtendPanel (controlled by the nav dropdown)", () => {
     expect(screen.queryByTestId("sync-data-page")).not.toBeInTheDocument();
   });
 
-  it("renders Sync Data when page=sync", () => {
+  it("migrates the legacy page=sync value to Universe Editor", async () => {
     setupMocks();
     render(<ExtendPanel page="sync" />);
-    expect(screen.getByTestId("sync-data-page")).toBeInTheDocument();
-    expect(screen.queryByTestId("universe-editor-page")).not.toBeInTheDocument();
+    await waitFor(() => expect(listUniverses).toHaveBeenCalled());
+    expect(screen.getByTestId("universe-editor-page")).toBeInTheDocument();
+    expect(screen.getByTestId("universe-data-sync")).toBeInTheDocument();
   });
 
   it("renders the unified Formula Builder when page=formula", async () => {

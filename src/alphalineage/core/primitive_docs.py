@@ -126,6 +126,11 @@ PRIMITIVE_DOCS: dict[str, dict[str, Any]] = {
         ("series", "Input series."),
         ("lookback", "Number of periods in the trailing window."),
     ),
+    "ts_cumsum": _entry(
+        "Cumulative sum",
+        "Running sum that restarts after a missing or non-finite observation.",
+        ("series", "Input series."),
+    ),
     "ts_min": _entry(
         "Rolling minimum",
         "Lowest value in the trailing lookback window.",

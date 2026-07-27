@@ -25,7 +25,7 @@ export function TrainPanel({
   onRunningChange?: (running: boolean, sessionId: string | null) => void;
   onOpenDashboard?: () => void;
   onOpenUniverseEditor?: (universeName: string) => void;
-  onOpenDataSync?: () => void;
+  onOpenDataSync?: (universeName: string) => void;
   onOpenFormulaEditor?: () => void;
 }) {
   const { sessionId, state, error, notice, phase, start, cont, stop, attach, reset } =

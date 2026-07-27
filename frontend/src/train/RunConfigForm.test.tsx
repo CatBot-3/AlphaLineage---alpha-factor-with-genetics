@@ -1,8 +1,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { FormulaSpec, PrimitiveInfo } from "../api/types";
 import type { RunRequestForm } from "./RunConfigForm";
 
-const { universeCoverage } = vi.hoisted(() => ({
+const { universeCoverage, formulaList, primitiveList } = vi.hoisted(() => ({
   universeCoverage: vi.fn((_name?: string, _asOf?: string) =>
     Promise.resolve({
       as_of: "2026-07-15",
@@ -13,6 +14,13 @@ const { universeCoverage } = vi.hoisted(() => ({
       complete: true,
     }),
   ),
+  formulaList: vi.fn<() => Promise<FormulaSpec[]>>(() => Promise.resolve([])),
+  primitiveList: vi.fn<() => Promise<PrimitiveInfo[]>>(() =>
+    Promise.resolve([
+      { name: "ts_mean", kind: "operator", arg_types: ["series", "window"], out_type: "series", user: false, category: "time_series" },
+      { name: "gt", kind: "operator", arg_types: ["series", "series"], out_type: "bool", user: false, category: "condition" },
+      { name: "close", kind: "operand", arg_types: [], out_type: "series", user: false, category: "data" },
+    ])),
 }));
 
 vi.mock("../api/client", () => ({
@@ -27,12 +35,8 @@ vi.mock("../api/client", () => ({
         tree: { name: "close" },
       },
     ]),
-  getPrimitives: () =>
-    Promise.resolve([
-      { name: "ts_mean", kind: "operator", arg_types: ["series", "window"], out_type: "series", user: false, category: "time_series" },
-      { name: "gt", kind: "operator", arg_types: ["series", "series"], out_type: "bool", user: false, category: "condition" },
-      { name: "close", kind: "operand", arg_types: [], out_type: "series", user: false, category: "data" },
-    ]),
+  getPrimitives: () => primitiveList(),
+  listFormulas: () => formulaList(),
   getTrainingCapabilities: () =>
     Promise.resolve({
       default_profile: "auto",
@@ -126,6 +130,45 @@ describe("RunConfigForm function space", () => {
     expect(req.config.enabled_categories).toContain("condition");
   });
 
+  it("selects managed formulas individually while preserving their tuning contract", async () => {
+    formulaList.mockResolvedValueOnce([
+      {
+        name: "ta_macd_histogram",
+        display_name: "MACD",
+        description: "Canonical MACD.",
+        arg_types: ["window", "window"],
+        inputs: [
+          { name: "fast", type: "window", description: "Fast EMA.", default: 12, role: "parameter", tuning: { enabled: true, min: 8, max: 20, step: 1, radius: 1 } },
+          { name: "slow", type: "window", description: "Slow EMA.", default: 26, role: "parameter", tuning: { enabled: true, min: 20, max: 40, step: 1, radius: 1 } },
+        ],
+        constraints: [{ left: "fast", operator: "lt", right: "slow" }],
+        out_type: "series",
+        body: { name: "close" },
+        category: "technical_indicators",
+        origin: "catalog_formula",
+        registered: true,
+      },
+    ]);
+    primitiveList.mockResolvedValueOnce([
+      { name: "ta_macd_histogram", logical_name: "ta_macd_histogram", display_name: "MACD", kind: "operator", arg_types: ["window", "window"], out_type: "series", user: true, origin: "catalog_formula", category: "technical_indicators" },
+      { name: "ts_mean", kind: "operator", arg_types: ["series", "window"], out_type: "series", user: false, category: "time_series" },
+    ]);
+
+    const onStart = vi.fn();
+    render(<RunConfigForm onStart={onStart} />);
+    await screen.findByTestId("function-cat-technical_indicators");
+    expect(screen.getByText(/fast 12 \(8–20, step 1\)/)).toBeInTheDocument();
+    expect(screen.getByText(/fast < slow/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("enable technical_indicators"));
+    fireEvent.click(screen.getByLabelText("enable formula ta_macd_histogram"));
+    fireEvent.submit(screen.getByTestId("run-config-form"));
+
+    const request = onStart.mock.calls[0][0] as RunRequestForm;
+    expect(request.config.enabled_categories).toContain("technical_indicators");
+    expect(request.config.enabled_formula_names).toEqual([]);
+  });
+
   it("submits the explicit research as-of date", async () => {
     const onStart = vi.fn();
     render(<RunConfigForm onStart={onStart} />);
@@ -153,7 +196,7 @@ describe("RunConfigForm function space", () => {
     expect(await screen.findByText("Price history needs attention")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start training" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Data Sync" }));
-    expect(onOpenDataSync).toHaveBeenCalledOnce();
+    expect(onOpenDataSync).toHaveBeenCalledWith("sp500-lite");
     fireEvent.submit(screen.getByTestId("run-config-form"));
     expect(onStart).not.toHaveBeenCalled();
   });

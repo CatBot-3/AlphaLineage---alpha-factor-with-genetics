@@ -1,12 +1,11 @@
-// Extend > Sync Data: inspect price readiness and manage resumable cache-sync jobs.
+// Embedded price-data sync controls for the Universe Editor.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as apiClient from "../api/client";
 import {
   getDataCoverage,
   getDataSync,
   getUniverse,
-  listUniverses,
   startDataSync,
   stopDataSync,
 } from "../api/client";
@@ -16,17 +15,19 @@ import type {
   SyncProgressSnapshot,
   UniverseInfo,
 } from "../api/types";
+import { CompactSection } from "../app/CompactSection";
 import { uniqueSymbols, type UniverseRow } from "./toUniversePayload";
 
 const DEFAULT_SYNC_START = "2020-01-01";
-const DRAFT_TARGET = "__draft__";
+const COVERAGE_CHUNK_SIZE = 75;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function listAvailableDataSyncs(): Promise<DataSyncJob[]> {
-  // Keeps the relocated page compatible with older embedded/demo clients and partial test hosts.
+  // Older embedded/demo clients may not expose the collection route. Starting and polling a
+  // newly-created job still works on those clients.
   if (!("listDataSyncs" in apiClient)) return Promise.resolve([]);
   return apiClient.listDataSyncs({ activeOnly: true });
 }
@@ -69,6 +70,52 @@ function coverageFromUniverse(universe: UniverseInfo): DataCoverage[] {
   });
 }
 
+async function getDraftCoverage(
+  symbols: string[],
+  start: string,
+  end?: string,
+): Promise<DataCoverage[]> {
+  // Keep the compatibility GET endpoint, but bound each query URL for large unsaved drafts.
+  const rows: DataCoverage[] = [];
+  for (let offset = 0; offset < symbols.length; offset += COVERAGE_CHUNK_SIZE) {
+    rows.push(...await getDataCoverage(
+      symbols.slice(offset, offset + COVERAGE_CHUNK_SIZE),
+      start,
+      end,
+    ));
+  }
+  return rows;
+}
+
+function normalizedSymbols(symbols: string[]): string[] {
+  return [...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))].sort();
+}
+
+function sameSymbols(left: string[], right: string[]): boolean {
+  const a = normalizedSymbols(left);
+  const b = normalizedSymbols(right);
+  return a.length === b.length && a.every((symbol, index) => symbol === b[index]);
+}
+
+function jobMatchesTarget(
+  job: DataSyncJob,
+  universeName: string,
+  universeFingerprint: string | undefined,
+  symbols: string[],
+): boolean {
+  const jobUniverse = job.request?.universe ?? job.result?.universe;
+  if (universeName) {
+    const jobFingerprint = job.universe_definition?.fingerprint ??
+      job.result?.universe_definition?.fingerprint;
+    if (universeFingerprint && jobFingerprint) return universeFingerprint === jobFingerprint;
+    return jobUniverse === universeName;
+  }
+  if (jobUniverse) return false;
+  const requested = job.request?.resolved_symbols ?? job.request?.symbols ??
+    job.result?.resolved_symbols ?? job.result?.results.map((item) => item.symbol) ?? [];
+  return sameSymbols(requested, symbols);
+}
+
 function jobTarget(job: DataSyncJob): string {
   const universe = job.request?.universe ?? job.result?.universe;
   if (universe) return universe;
@@ -77,111 +124,178 @@ function jobTarget(job: DataSyncJob): string {
   return `${count} symbol${count === 1 ? "" : "s"}`;
 }
 
-export function SyncDataPage({
+export function UniverseDataSync({
   rows,
+  universeName = "",
+  universe = null,
+  savedDefinitionDirty = false,
+  recommendedStart = DEFAULT_SYNC_START,
   canSubmit = true,
   onPullProgress,
+  onUniverseRefresh,
 }: {
   rows: UniverseRow[];
+  universeName?: string;
+  universe?: UniverseInfo | null;
+  savedDefinitionDirty?: boolean;
+  recommendedStart?: string;
   canSubmit?: boolean;
   onPullProgress?: (snapshot: SyncProgressSnapshot | null) => void;
+  onUniverseRefresh?: (universe: UniverseInfo) => void;
 }) {
   const draftSymbols = useMemo(() => uniqueSymbols(rows), [rows]);
-  const [syncTarget, setSyncTarget] = useState(DRAFT_TARGET);
-  const [universes, setUniverses] = useState<UniverseInfo[]>([]);
-  const [universeDetail, setUniverseDetail] = useState<UniverseInfo | null>(null);
-  const [syncStart, setSyncStart] = useState(DEFAULT_SYNC_START);
+  const targetIsSaved = Boolean(universeName);
+  const targetSymbols = targetIsSaved ? universe?.symbols ?? draftSymbols : draftSymbols;
+  const targetKey = targetIsSaved ? `universe:${universeName}` : `draft:${draftSymbols.join(",")}`;
+  const targetLabel = targetIsSaved
+    ? universe?.display_name ?? universeName
+    : `Current draft (${draftSymbols.length} symbol${draftSymbols.length === 1 ? "" : "s"})`;
+  const canSyncTarget = targetIsSaved
+    ? universe?.name === universeName && !savedDefinitionDirty
+    : draftSymbols.length > 0;
+
+  const [syncStart, setSyncStart] = useState(recommendedStart || DEFAULT_SYNC_START);
   const [syncEnd, setSyncEnd] = useState("");
   const [syncMode, setSyncMode] = useState<"incremental" | "refresh">("incremental");
-  const [coverage, setCoverage] = useState<DataCoverage[]>([]);
+  const [coverage, setCoverage] = useState<DataCoverage[]>(() =>
+    universe ? coverageFromUniverse(universe) : [],
+  );
   const [jobs, setJobs] = useState<DataSyncJob[]>([]);
   const [syncJob, setSyncJob] = useState<DataSyncJob | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(() => universe?.cache_coverage?.complete !== true);
+  const mountedRef = useRef(true);
+  const targetKeyRef = useRef(targetKey);
+  targetKeyRef.current = targetKey;
 
-  const selectedSummary = universes.find((item) => item.name === syncTarget);
-  const selectedUniverse = universeDetail?.name === syncTarget ? universeDetail : selectedSummary;
-  const targetSymbols = syncTarget === DRAFT_TARGET
-    ? draftSymbols
-    : selectedUniverse?.symbols ?? [];
-  const canSyncTarget = syncTarget === DRAFT_TARGET ? targetSymbols.length > 0 : Boolean(syncTarget);
+  const targetIsCurrent = useCallback(
+    () => mountedRef.current && targetKeyRef.current === targetKey,
+    [targetKey],
+  );
+
+  const latestFailedCount = syncJob?.result?.failed_count ??
+    syncJob?.result?.results.filter((item) => item.status === "failed").length ?? 0;
+
   const staleCount = coverage.filter((item) => item.needs_sync).length;
   const currentCount = coverage.length - staleCount;
   const activeJobs = jobs.filter(isActive);
   const syncSummary = isActive(syncJob)
     ? "Sync running"
+    : syncJob?.status === "done" && latestFailedCount > 0
+      ? `Completed with ${latestFailedCount} failure${latestFailedCount === 1 ? "" : "s"}`
     : coverage.length > 0
-      ? `${staleCount} stale, ${currentCount} current`
-      : syncTarget === DRAFT_TARGET
-        ? `${targetSymbols.length} draft symbols`
-        : `${selectedUniverse?.definition?.member_count ?? targetSymbols.length} universe symbols`;
+      ? `${staleCount} need sync, ${currentCount} current`
+      : `${targetSymbols.length} symbol${targetSymbols.length === 1 ? "" : "s"}`;
+
+  useEffect(() => {
+    if (activeJobs.length > 0 || universe?.cache_coverage?.complete === false) {
+      setExpanded(true);
+    }
+  }, [activeJobs.length, universe?.cache_coverage?.complete]);
 
   const refreshJobs = useCallback(async () => {
     if (!canSubmit) return;
     try {
       setJobs(await listAvailableDataSyncs());
     } catch {
-      // Older compatible backends do not expose the collection route. New jobs still work.
+      // Starting and polling a new job remains available on older compatible backends.
     }
   }, [canSubmit]);
+
+  useEffect(() => {
+    setSyncStart(recommendedStart || DEFAULT_SYNC_START);
+    setSyncEnd("");
+    setSyncError(null);
+    setSyncNotice(null);
+    setSyncJob((current) => current && jobMatchesTarget(
+      current,
+      universeName,
+      universe?.fingerprint,
+      draftSymbols,
+    )
+      ? current
+      : null);
+  }, [draftSymbols, recommendedStart, targetKey, universe?.fingerprint, universeName]);
+
+  useEffect(() => {
+    setCoverage(universeName && universe?.name === universeName
+      ? coverageFromUniverse(universe)
+      : []);
+  }, [universe, universeName]);
 
   useEffect(() => {
     if (!canSubmit) {
-      setUniverses([]);
+      setJobs([]);
       return;
     }
     let cancelled = false;
-    Promise.allSettled([
-      listUniverses({ summary: true }),
-      listAvailableDataSyncs(),
-    ]).then(([universeResult, jobsResult]) => {
-      if (cancelled) return;
-      if (universeResult.status === "fulfilled") setUniverses(universeResult.value);
-      if (jobsResult.status === "fulfilled") setJobs(jobsResult.value);
-    });
+    listAvailableDataSyncs()
+      .then((items) => {
+        if (!cancelled) setJobs(items);
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
   }, [canSubmit]);
 
+  // Automatically reattach to a job for the universe/draft currently being inspected.
   useEffect(() => {
-    if (!canSubmit || syncTarget === DRAFT_TARGET) {
-      setUniverseDetail(null);
-      return;
+    if (isActive(syncJob)) return;
+    const matching = jobs.find((job) =>
+      isActive(job) && jobMatchesTarget(job, universeName, universe?.fingerprint, draftSymbols),
+    );
+    if (matching) {
+      setSyncJob(matching);
+      onPullProgress?.(matching.progress ?? null);
     }
-    let cancelled = false;
-    getUniverse(syncTarget)
-      .then((detail) => {
-        if (!cancelled) setUniverseDetail(detail);
-      })
-      .catch((error) => {
-        if (!cancelled) setSyncError(String(error));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [canSubmit, syncTarget]);
+  }, [draftSymbols, jobs, onPullProgress, syncJob, universe?.fingerprint, universeName]);
 
-  // Clear the global progress footer when this page disappears.
-  useEffect(() => () => onPullProgress?.(null), [onPullProgress]);
+  // Clear the global progress footer when Universe Editor disappears.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      onPullProgress?.(null);
+    };
+  }, [onPullProgress]);
 
   const checkCoverage = useCallback(async () => {
     if (!canSubmit || !canSyncTarget) return;
     setSyncError(null);
+    setSyncNotice(null);
     try {
-      if (syncTarget === DRAFT_TARGET) {
-        setCoverage(await getDataCoverage(targetSymbols, syncStart, syncEnd || undefined));
-      } else {
-        const detail = await getUniverse(syncTarget);
-        setUniverseDetail(detail);
+      if (targetIsSaved) {
+        const detail = await getUniverse(universeName);
+        if (!targetIsCurrent()) return;
         setCoverage(coverageFromUniverse(detail));
+        onUniverseRefresh?.(detail);
+      } else {
+        const nextCoverage = await getDraftCoverage(
+          draftSymbols,
+          syncStart,
+          syncEnd || undefined,
+        );
+        if (!targetIsCurrent()) return;
+        setCoverage(nextCoverage);
       }
     } catch (error) {
-      setSyncError(String(error));
+      if (targetIsCurrent()) setSyncError(String(error));
     }
-  }, [canSubmit, canSyncTarget, syncEnd, syncStart, syncTarget, targetSymbols]);
+  }, [
+    canSubmit,
+    canSyncTarget,
+    draftSymbols,
+    onUniverseRefresh,
+    syncEnd,
+    syncStart,
+    targetIsSaved,
+    targetIsCurrent,
+    universeName,
+  ]);
 
-  // Poll an attached job until the backend reports a terminal status. There is deliberately no
-  // elapsed-time cap: large index pulls can run for hours and remain reattachable after navigation.
+  // Poll without an elapsed-time ceiling: full-index pulls may legitimately take hours.
   useEffect(() => {
     if (!syncJob || !isActive(syncJob)) return;
     let cancelled = false;
@@ -200,7 +314,7 @@ export function SyncDataPage({
           void poll();
         } else {
           onPullProgress?.(null);
-          if (next.status === "done") void checkCoverage();
+          if (next.status === "done") await checkCoverage();
           if (next.status === "failed") setSyncError(next.error ?? "Data sync failed.");
         }
       } catch (error) {
@@ -215,19 +329,22 @@ export function SyncDataPage({
   }, [checkCoverage, onPullProgress, syncJob?.job_id]);
 
   async function syncData() {
-    if (!canSubmit || !canSyncTarget || isActive(syncJob)) return;
+    if (!canSubmit || !canSyncTarget || !syncStart || isActive(syncJob)) return;
     setSyncError(null);
     setSyncJob(null);
     try {
       const started = await startDataSync({
-        ...(syncTarget === DRAFT_TARGET
-          ? { symbols: targetSymbols }
-          : { universe: syncTarget }),
+        ...(targetIsSaved ? { universe: universeName } : { symbols: draftSymbols }),
         start: syncStart,
         end: syncEnd || undefined,
         mode: syncMode,
       });
+      if (!targetIsCurrent()) return;
+      if (started.reused) {
+        setSyncNotice("Reattached to the existing matching sync job.");
+      }
       const job = await getDataSync(started.job_id);
+      if (!targetIsCurrent()) return;
       setSyncJob(job);
       setJobs((current) => upsertJob(current, job));
       onPullProgress?.(job.progress ?? null);
@@ -237,8 +354,10 @@ export function SyncDataPage({
         if (job.status === "failed") setSyncError(job.error ?? "Data sync failed.");
       }
     } catch (error) {
-      setSyncError(String(error));
-      onPullProgress?.(null);
+      if (targetIsCurrent()) {
+        setSyncError(String(error));
+        onPullProgress?.(null);
+      }
     }
   }
 
@@ -261,46 +380,53 @@ export function SyncDataPage({
   }
 
   return (
-    <section className="panel" data-testid="sync-data-page">
-      <header className="panel-head">
+    <details
+      className="compact-section universe-price-section"
+      data-testid="universe-data-sync"
+      open={expanded}
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
+      <summary className="compact-section__trigger">
+        <span className="compact-section__chevron" aria-hidden="true">{expanded ? "v" : ">"}</span>
+        <span className="compact-section__title">Price data</span>
+        <span className="compact-section__summary">{syncSummary}</span>
+      </summary>
+      <div className="compact-section__body universe-data-sync">
+      <div className="universe-data-sync__head">
         <div>
-          <h3>Sync data</h3>
-          <p className="panel-note">
-            Select a saved universe to preserve its definition and symbol aliases, or sync the
-            unsaved draft symbols directly.
+          <h4>Price data sync</h4>
+          <p className="hint">
+            Target: <strong>{targetLabel}</strong>. Incremental sync keeps existing cached rows and
+            resumes missing date ranges.
           </p>
         </div>
-        <span className="mode-chip">{syncSummary}</span>
-      </header>
+      </div>
 
       {!canSubmit && (
-        <p className="panel-note">Data sync unlocks when the local backend is running.</p>
+        <p className="panel-note">Price data sync unlocks when the local backend is running.</p>
       )}
 
-      <div className="inline-tools">
+      {targetIsSaved && !universe && (
+        <p className="hint">Loading the saved universe definition before price sync…</p>
+      )}
+      {targetIsSaved && universe && savedDefinitionDirty && (
+        <p className="error" role="status">
+          Save this universe before syncing. The displayed name or memberships differ from the
+          loaded saved definition.
+        </p>
+      )}
+      {!targetIsSaved && (
+        <p className="hint">
+          Draft sync caches these symbols only. Save and load the universe definition to verify
+          point-in-time membership readiness.
+        </p>
+      )}
+
+      <div className="inline-tools universe-data-sync__controls">
         <label className="field">
-          <span className="field-label">Sync target</span>
-          <select
-            aria-label="Sync target"
-            value={syncTarget}
-            onChange={(event) => {
-              setSyncTarget(event.target.value);
-              setCoverage([]);
-              setSyncError(null);
-            }}
-            disabled={!canSubmit}
-          >
-            <option value={DRAFT_TARGET}>Current draft ({draftSymbols.length} symbols)</option>
-            {universes.map((universe) => (
-              <option key={universe.name} value={universe.name}>
-                {universe.display_name ?? universe.name} ({universe.mode?.replace(/_/g, " ") ?? universe.source})
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="field">
-          <span className="field-label">Start date</span>
+          <span className="field-label">Required start date</span>
           <input
+            type="date"
             aria-label="Sync start date"
             value={syncStart}
             onChange={(event) => setSyncStart(event.target.value)}
@@ -309,8 +435,8 @@ export function SyncDataPage({
         <label className="field">
           <span className="field-label">End date</span>
           <input
+            type="date"
             aria-label="Sync end date"
-            placeholder="today"
             value={syncEnd}
             onChange={(event) => setSyncEnd(event.target.value)}
           />
@@ -318,66 +444,67 @@ export function SyncDataPage({
         <label className="check-row">
           <input
             type="checkbox"
+            aria-label="Incremental merge"
             checked={syncMode === "incremental"}
             onChange={(event) => setSyncMode(event.target.checked ? "incremental" : "refresh")}
           />
           Incremental merge
         </label>
-      </div>
-
-      {syncTarget !== DRAFT_TARGET && selectedUniverse && (
-        <aside className="universe-integrity" data-testid="sync-universe-definition">
-          <strong>{selectedUniverse.display_name ?? selectedUniverse.name}</strong>
-          <span>
-            Mode: {selectedUniverse.mode?.replace(/_/g, " ") ?? "point in time"} · Source: {selectedUniverse.source}
-          </span>
-          <span>
-            Definition: {selectedUniverse.definition?.display_name ?? selectedUniverse.name} ·
-            Fingerprint: {selectedUniverse.fingerprint ?? "unavailable"}
-          </span>
-          <span>
-            Readiness: {selectedUniverse.readiness?.price_ready ?? selectedUniverse.cache_coverage?.complete
-              ? "prices ready"
-              : "price sync needed"}
-          </span>
-          {Object.keys(selectedUniverse.aliases ?? {}).length > 0 && (
-            <small>
-              {Object.keys(selectedUniverse.aliases ?? {}).length} provider alias(es): {Object.entries(selectedUniverse.aliases ?? {})
-                .slice(0, 4).map(([symbol, alias]) => `${symbol} → ${alias}`).join(", ")}
-            </small>
-          )}
-        </aside>
-      )}
-
-      <div className="actions">
         <button type="button" onClick={checkCoverage} disabled={!canSubmit || !canSyncTarget}>
-          Check coverage
+          Refresh coverage
         </button>
         <button
           type="button"
           data-testid="sync-universe"
           onClick={syncData}
-          disabled={!canSubmit || !canSyncTarget || isActive(syncJob)}
+          disabled={!canSubmit || !canSyncTarget || !syncStart || isActive(syncJob)}
         >
-          {isActive(syncJob) ? "Syncing..." : "Sync selected universe"}
+          {isActive(syncJob)
+            ? "Syncing..."
+            : targetIsSaved && savedDefinitionDirty
+              ? "Save universe before syncing"
+            : targetIsSaved
+              ? "Sync this universe"
+              : "Sync draft symbols"}
         </button>
       </div>
 
+      {targetIsSaved && universe && (
+        <p className="hint" data-testid="sync-universe-definition">
+          {(universe.mode ?? "point_in_time").replace(/_/g, " ")} definition
+          {universe.fingerprint ? ` · ${universe.fingerprint}` : ""}
+          {Object.keys(universe.aliases ?? {}).length > 0
+            ? ` · ${Object.keys(universe.aliases ?? {}).length} provider alias(es)`
+            : ""}
+          {universe.cache_coverage?.required_start
+            ? ` · required ${universe.cache_coverage.required_start} through ${universe.cache_coverage.required_end ?? universe.cache_coverage.as_of}`
+            : ""}
+        </p>
+      )}
+
+      {syncNotice && <p className="ok" role="status">{syncNotice}</p>}
+      {syncJob?.status === "done" && latestFailedCount > 0 && (
+        <p className="error" role="status">
+          Sync completed with {latestFailedCount} failed symbol{latestFailedCount === 1 ? "" : "s"}.
+          Coverage remains incomplete until those symbols succeed.
+        </p>
+      )}
+
       {activeJobs.length > 0 && (
         <section data-testid="active-sync-jobs">
-          <div className="panel-head">
+          <div className="universe-data-sync__subhead">
             <div>
-              <h4>Active sync jobs</h4>
-              <p className="hint">Reattach after navigation, or stop a pull without losing cached rows.</p>
+              <h5>Active sync jobs</h5>
+              <p className="hint">Jobs survive navigation. Reattach or stop without losing cached rows.</p>
             </div>
-            <button type="button" className="ghost" onClick={refreshJobs}>Refresh</button>
+            <button type="button" className="ghost" onClick={refreshJobs}>Refresh jobs</button>
           </div>
-          <ul className="coverage-list">
+          <ul className="coverage-list universe-data-sync__list">
             {activeJobs.map((job) => (
               <li key={job.job_id}>
                 <strong>{jobTarget(job)}</strong>
                 <span>{job.stopping ? "stopping" : job.status}</span>
-                <span>{job.progress ? `${job.progress.done} / ${job.progress.total}` : "Waiting for progress"}</span>
+                <span>{job.progress ? `${job.progress.done} / ${job.progress.total}` : "Waiting"}</span>
                 <div className="actions">
                   <button type="button" onClick={() => reattach(job)}>
                     {syncJob?.job_id === job.job_id ? "Attached" : "Reattach"}
@@ -398,38 +525,53 @@ export function SyncDataPage({
       )}
 
       {coverage.length > 0 && (
-        <ul className="coverage-list" data-testid="coverage-list">
-          {coverage.map((item) => (
-            <li key={item.symbol}>
-              <strong>{item.symbol}</strong>
-              <span>{item.cached ? `${item.rows || "Some"} cached rows` : "No cached rows"}</span>
-              <span>{item.needs_sync ? "Needs sync" : "Current"}</span>
-              <span>
-                {item.first_date && item.last_date
-                  ? `${item.first_date} to ${item.last_date}`
-                  : "No date range"}
-              </span>
-            </li>
-          ))}
-        </ul>
+        <CompactSection
+          title="Symbol coverage"
+          summary={`${staleCount} need sync · ${currentCount} current`}
+          defaultOpen={staleCount > 0 && coverage.length <= 20}
+        >
+          <ul className="coverage-list universe-data-sync__list" data-testid="coverage-list">
+            {[...coverage]
+              .sort((left, right) => Number(right.needs_sync) - Number(left.needs_sync))
+              .map((item) => (
+                <li key={item.symbol}>
+                  <strong>{item.symbol}</strong>
+                  <span>{item.cached ? `${item.rows || "Some"} cached rows` : "No cached rows"}</span>
+                  <span>{item.needs_sync ? "Needs sync" : "Current"}</span>
+                  <span>
+                    {item.first_date && item.last_date
+                      ? `${item.first_date} to ${item.last_date}`
+                      : "No date range"}
+                  </span>
+                </li>
+              ))}
+          </ul>
+        </CompactSection>
       )}
 
       {syncJob?.result && (
-        <ul className="coverage-list" data-testid="sync-results">
-          {syncJob.result.results.map((result) => (
-            <li key={result.symbol}>
-              <strong>{result.symbol}</strong>
-              <span>{result.status}</span>
-              <span>{result.rows_fetched} fetched</span>
-              <span>{result.error ?? `${result.rows_cached} cached`}</span>
-              {result.provider_symbol && result.provider_symbol !== result.symbol && (
-                <span>Provider symbol: {result.provider_symbol}</span>
-              )}
-            </li>
-          ))}
-        </ul>
+        <CompactSection
+          title="Latest sync result"
+          summary={`${syncJob.result.results.filter((item) => item.status !== "failed").length} completed · ${syncJob.result.results.filter((item) => item.status === "failed").length} failed`}
+          defaultOpen={syncJob.result.results.some((item) => item.status === "failed")}
+        >
+          <ul className="coverage-list universe-data-sync__list" data-testid="sync-results">
+            {syncJob.result.results.map((result) => (
+              <li key={result.symbol}>
+                <strong>{result.symbol}</strong>
+                <span>{result.status}</span>
+                <span>{result.rows_fetched} fetched</span>
+                <span>{result.error ?? `${result.rows_cached} cached`}</span>
+                {result.provider_symbol && result.provider_symbol !== result.symbol && (
+                  <span>Provider symbol: {result.provider_symbol}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </CompactSection>
       )}
       {syncError && <p className="error">{syncError}</p>}
-    </section>
+      </div>
+    </details>
   );
 }

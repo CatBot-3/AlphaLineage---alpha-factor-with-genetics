@@ -16,7 +16,7 @@ from alphalineage.core.types import DType
 
 def _arg_node(dtype: DType) -> Node:
     # 'returns' carries a leading NaN row, so every operator is exercised on NaN input.
-    if dtype is DType.SERIES:
+    if dtype in {DType.SERIES, DType.SIGNAL}:
         return Node("returns")
     if dtype is DType.SCALAR:
         return Node("const", value=2.0)
@@ -25,6 +25,17 @@ def _arg_node(dtype: DType) -> Node:
     if dtype is DType.BOOL:
         return Node("gt", (Node("close"), Node("open")))
     raise AssertionError(dtype)
+
+
+def _operator_arg(primitive, index: int, dtype: DType) -> Node:
+    inputs = (primitive.macro_policy or {}).get("inputs") or []
+    item = inputs[index] if index < len(inputs) and isinstance(inputs[index], dict) else {}
+    default = item.get("default")
+    if default is not None and dtype is DType.WINDOW:
+        return Node("window", value=int(default))
+    if default is not None and dtype is DType.SCALAR:
+        return Node("const", value=float(default))
+    return _arg_node(dtype)
 
 
 def test_operator_signatures_consistent():
@@ -48,7 +59,10 @@ def test_operands_and_ephemerals_consistent():
 def test_every_operator_evaluates_without_error_on_nan_input(synthetic_panel):
     expected_shape = synthetic_panel["close"].shape
     for prim in OPERATORS.values():
-        node = Node(prim.name, tuple(_arg_node(t) for t in prim.arg_types))
+        node = Node(
+            prim.name,
+            tuple(_operator_arg(prim, index, dtype) for index, dtype in enumerate(prim.arg_types)),
+        )
         validate(node)
         result = evaluate(node, synthetic_panel)
         assert isinstance(result, pd.DataFrame), prim.name
@@ -107,3 +121,12 @@ def test_indicator_smoothing_primitives_have_explicit_nan_and_seed_semantics():
     assert population_std is not None
     actual_std = population_std(pd.DataFrame({"A": [1.0, 2.0, 3.0]}), 3).iloc[-1, 0]
     assert actual_std == pytest.approx(math.sqrt(2.0 / 3.0))
+
+
+def test_cumulative_sum_restarts_after_non_finite_gaps():
+    cumulative = OPERATORS["ts_cumsum"].fn
+    assert cumulative is not None
+    source = pd.DataFrame({"A": [1.0, 2.0, np.nan, 4.0, -1.0, np.inf, 3.0]})
+    actual = cumulative(source)["A"].to_numpy()
+    expected = np.array([1.0, 3.0, np.nan, 4.0, 3.0, np.nan, 3.0])
+    assert np.allclose(actual, expected, equal_nan=True)

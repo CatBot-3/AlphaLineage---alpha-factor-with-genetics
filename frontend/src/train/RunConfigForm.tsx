@@ -5,10 +5,12 @@ import { useEffect, useMemo, useState } from "react";
 import {
   getPrimitives,
   getUniverseCoverage,
+  listFormulas,
   listFormulaResults,
   listUniverses,
 } from "../api/client";
 import type {
+  FormulaSpec,
   GpConfig,
   PrimitiveInfo,
   SavedFactor,
@@ -65,7 +67,7 @@ export function RunConfigForm({
   onStart: (req: RunRequestForm) => void;
   disabled?: boolean;
   onEditUniverse?: (universeName: string) => void;
-  onOpenDataSync?: () => void;
+  onOpenDataSync?: (universeName: string) => void;
   onOpenFormulaEditor?: () => void;
 }) {
   const [name, setName] = useState("Session");
@@ -83,6 +85,8 @@ export function RunConfigForm({
   const [coverageError, setCoverageError] = useState<string | null>(null);
   const [factors, setFactors] = useState<SavedFactor[]>([]);
   const [primitives, setPrimitives] = useState<PrimitiveInfo[]>([]);
+  const [formulas, setFormulas] = useState<FormulaSpec[] | null>(null);
+  const [disabledFormulaNames, setDisabledFormulaNames] = useState<Set<string>>(new Set());
   // Operator categories the GP may draw from this run. `condition` (boolean ops) is off by
   // default so the classic numeric search space is unchanged unless the user opts it in.
   const [disabledCats, setDisabledCats] = useState<Set<string>>(
@@ -93,6 +97,7 @@ export function RunConfigForm({
     listUniverses({ summary: true }).then(setUniverses).catch(() => setUniverses([]));
     listFormulaResults().then(setFactors).catch(() => setFactors([]));
     getPrimitives().then(setPrimitives).catch(() => setPrimitives([]));
+    listFormulas().then(setFormulas).catch(() => setFormulas(null));
   }, []);
 
   useEffect(() => {
@@ -129,13 +134,25 @@ export function RunConfigForm({
   // Functions available to training, grouped by category (operators + user formulas only).
   const functionsByCategory = useMemo(() => {
     const groups = new Map<string, PrimitiveInfo[]>();
+    const latestFormulaRuntimes = formulas === null
+      ? null
+      : new Set(
+        formulas
+          .filter((formula) => formula.status !== "retired" && formula.registered !== false && !formula.error)
+          .map((formula) => formula.runtime_name ?? formula.name),
+      );
     for (const p of primitives) {
       if (p.kind !== "operator") continue;
+      if (
+        latestFormulaRuntimes !== null &&
+        (p.origin === "catalog_formula" || p.origin === "user_formula") &&
+        !latestFormulaRuntimes.has(p.runtime_name ?? p.name)
+      ) continue;
       const key = p.category ?? "uncategorized";
       (groups.get(key) ?? groups.set(key, []).get(key)!).push(p);
     }
     return groups;
-  }, [primitives]);
+  }, [formulas, primitives]);
 
   function toggleCategory(cat: string) {
     setDisabledCats((prev) => {
@@ -145,6 +162,45 @@ export function RunConfigForm({
       return next;
     });
   }
+
+  function toggleFormula(formulaName: string) {
+    setDisabledFormulaNames((previous) => {
+      const next = new Set(previous);
+      if (next.has(formulaName)) next.delete(formulaName);
+      else next.add(formulaName);
+      return next;
+    });
+  }
+
+  function setCategoryFormulaSelection(items: FormulaSpec[], enabled: boolean) {
+    setDisabledFormulaNames((previous) => {
+      const next = new Set(previous);
+      for (const formula of items) {
+        if (enabled) next.delete(formula.name);
+        else next.add(formula.name);
+      }
+      return next;
+    });
+  }
+
+  const selectableFormulas = useMemo(() => (formulas ?? []).filter((formula) => (
+    formula.status !== "retired" && formula.registered !== false && !formula.error
+  )), [formulas]);
+
+  const formulasByCategory = useMemo(() => {
+    const groups = new Map<string, FormulaSpec[]>();
+    for (const formula of selectableFormulas) {
+      const key = formula.category ?? "custom";
+      (groups.get(key) ?? groups.set(key, []).get(key)!).push(formula);
+    }
+    for (const items of groups.values()) {
+      items.sort((left, right) => (
+        (left.family_order ?? 0) - (right.family_order ?? 0) ||
+        (left.display_name || left.name).localeCompare(right.display_name || right.name)
+      ));
+    }
+    return groups;
+  }, [selectableFormulas]);
 
   const selectedUniverse = universes.find((item) => item.name === universe);
   const trainingReady = coverage?.complete === true;
@@ -157,11 +213,20 @@ export function RunConfigForm({
         e.preventDefault();
         if (disabled || coverageLoading || !trainingReady) return;
         const enabled = [...functionsByCategory.keys()].filter((c) => !disabledCats.has(c));
+        const enabledFormulaNames = formulas === null
+          ? null
+          : selectableFormulas
+            .filter((formula) => !disabledFormulaNames.has(formula.name))
+            .map((formula) => formula.name);
         onStart({
           name,
           universe,
           as_of: asOf,
-          config: { ...config, enabled_categories: enabled.length ? enabled : null },
+          config: {
+            ...config,
+            enabled_categories: enabled.length ? enabled : null,
+            enabled_formula_names: enabledFormulaNames,
+          },
           resources,
           seed_factor_ids: seedIds,
         });
@@ -235,7 +300,7 @@ export function RunConfigForm({
             </span>
           </div>
           {!coverageLoading && !trainingReady && onOpenDataSync && (
-            <button type="button" className="ghost" onClick={onOpenDataSync}>
+            <button type="button" className="ghost" onClick={() => onOpenDataSync(universe)}>
               Data Sync
             </button>
           )}
@@ -283,22 +348,89 @@ export function RunConfigForm({
             </button>
           )}
         </div>
-        {[...functionsByCategory.entries()].map(([cat, prims]) => (
+        {[...functionsByCategory.entries()].map(([cat, prims]) => {
+          const categoryFormulas = formulasByCategory.get(cat) ?? [];
+          const categoryDisabled = disabledCats.has(cat);
+          return (
           <fieldset key={cat} className="function-cat" data-testid={`function-cat-${cat}`}>
             <legend>
               <label className="seed-option">
                 <input
                   type="checkbox"
                   aria-label={`enable ${cat}`}
-                  checked={!disabledCats.has(cat)}
+                  checked={!categoryDisabled}
                   onChange={() => toggleCategory(cat)}
                 />
                 <span>{cat}</span>
               </label>
             </legend>
-            <span className="function-cat-names">{prims.map((p) => p.name).join(", ")}</span>
+            <span className="function-cat-names">
+              {prims
+                .filter((primitive) => primitive.origin !== "catalog_formula" && primitive.origin !== "user_formula")
+                .map((primitive) => primitive.name)
+                .join(", ")}
+              {categoryFormulas.length > 0 && (
+                `${prims.some((primitive) => primitive.origin !== "catalog_formula" && primitive.origin !== "user_formula") ? " · " : ""}${categoryFormulas.length} selectable formula${categoryFormulas.length === 1 ? "" : "s"}`
+              )}
+            </span>
+            {categoryFormulas.length > 0 && (
+              <div className="training-formula-picker">
+                <div className="training-formula-picker__head">
+                  <p className="hint">
+                    Choose the formulas training may combine. Only the declared numeric parameters
+                    below are locally tuned; canonical market inputs stay fixed.
+                  </p>
+                  <span className="inline-tools">
+                    <button
+                      type="button"
+                      className="ghost"
+                      disabled={categoryDisabled}
+                      onClick={() => setCategoryFormulaSelection(categoryFormulas, true)}
+                    >Select all</button>
+                    <button
+                      type="button"
+                      className="ghost"
+                      disabled={categoryDisabled}
+                      onClick={() => setCategoryFormulaSelection(categoryFormulas, false)}
+                    >Clear</button>
+                  </span>
+                </div>
+                <div className="training-formula-picker__grid">
+                  {categoryFormulas.map((formula) => (
+                    <label key={formula.name} className="training-formula-option">
+                      <input
+                        type="checkbox"
+                        aria-label={`enable formula ${formula.name}`}
+                        checked={!disabledFormulaNames.has(formula.name)}
+                        disabled={categoryDisabled}
+                        onChange={() => toggleFormula(formula.name)}
+                      />
+                      <span>
+                        <strong>{formula.display_name || formula.name}</strong>
+                        <small>
+                          {(formula.inputs ?? []).length
+                            ? (formula.inputs ?? []).map((input) => {
+                              if (input.tuning?.enabled) {
+                                return `${input.name} ${input.default} (${input.tuning.min}–${input.tuning.max}, step ${input.tuning.step})`;
+                              }
+                              return typeof input.default === "number"
+                                ? `${input.name} ${input.default}`
+                                : input.name;
+                            }).join(" · ")
+                            : "Fixed canonical market inputs"}
+                          {(formula.constraints ?? []).map((constraint) => (
+                            ` · ${constraint.left} ${constraint.operator === "lt" ? "<" : constraint.operator} ${constraint.right}`
+                          )).join("")}
+                        </small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
           </fieldset>
-        ))}
+          );
+        })}
       </details>
 
       {factors.length > 0 && (

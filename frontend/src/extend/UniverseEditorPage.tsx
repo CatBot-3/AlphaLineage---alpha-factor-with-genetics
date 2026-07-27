@@ -1,6 +1,6 @@
-// Extend > Universe Editor: define/edit a point-in-time universe and resolve tickers into it.
+// Extend > Universe Editor: define current snapshots or point-in-time memberships and prices.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   defineUniverse,
   deleteUniverse,
@@ -25,6 +25,7 @@ import type {
   UniversePreset,
 } from "../api/types";
 import { CompactSection } from "../app/CompactSection";
+import { UniverseDataSync } from "./SyncDataPage";
 import { rowsFromUniverse, toUniversePayload, uniqueSymbols, type UniverseRow } from "./toUniversePayload";
 import { parseMembershipImport } from "./membershipImport";
 
@@ -35,6 +36,48 @@ const VISIBLE_CANDIDATES = 5;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function requiredPriceStart(
+  rows: UniverseRow[],
+  expectedStart: string,
+  mode: UniverseInfo["mode"],
+  backendRequiredStart?: string | null,
+): string {
+  const candidates = [expectedStart];
+  // A point-in-time universe needs prices for every declared membership interval. This is the
+  // important distinction between "a cache file exists" and "the universe is trainable".
+  if ((mode ?? "point_in_time") === "point_in_time") {
+    if (backendRequiredStart && /^\d{4}-\d{2}-\d{2}$/.test(backendRequiredStart)) {
+      return backendRequiredStart;
+    }
+    candidates.push(...rows.map((row) => row.entry));
+  }
+  return candidates
+    .map((value) => value.trim())
+    .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+    .sort()[0] ?? DEFAULT_EXPECTED_START;
+}
+
+function normalizedMembershipRows(rows: UniverseRow[]): string[] {
+  return rows
+    .filter((row) => row.symbol.trim() || row.entry.trim() || row.exit.trim())
+    .map((row) => [
+      row.symbol.trim().toUpperCase(),
+      row.entry.trim(),
+      row.exit.trim(),
+    ].join("|"))
+    .sort();
+}
+
+function savedMembershipRows(universe: UniverseInfo): string[] {
+  return universe.memberships
+    .map((membership) => [
+      membership.symbol.trim().toUpperCase(),
+      membership.entry,
+      membership.exit ?? "",
+    ].join("|"))
+    .sort();
 }
 
 export function UniverseEditorPage({
@@ -73,20 +116,74 @@ export function UniverseEditorPage({
   const [membershipSyncJob, setMembershipSyncJob] = useState<MembershipSyncJob | null>(null);
   const [membershipSyncBusy, setMembershipSyncBusy] = useState(false);
   const [membershipSyncError, setMembershipSyncError] = useState<string | null>(null);
+  const loadUniverseRequest = useRef(0);
+  const mountedRef = useRef(true);
+  const directOperationEpoch = useRef(0);
+  const selectedUniverseRef = useRef(selectedUniverse);
+  selectedUniverseRef.current = selectedUniverse;
+
+  const selectUniverseIdentity = useCallback((universeName: string) => {
+    if (selectedUniverseRef.current !== universeName) {
+      directOperationEpoch.current += 1;
+      setMembershipSyncBusy(false);
+      setMembershipSyncJob(null);
+      setMembershipSyncError(null);
+      onPullProgress?.(null);
+    }
+    selectedUniverseRef.current = universeName;
+    setSelectedUniverse(universeName);
+  }, [onPullProgress]);
 
   const symbols = useMemo(() => uniqueSymbols(rows), [rows]);
   const selectedInfo = universeOptions.find((universe) => universe.name === selectedUniverse);
   const selectedDetail = loadedUniverse?.name === selectedUniverse ? loadedUniverse : selectedInfo;
+  const loadedSavedUniverse = loadedUniverse?.name === selectedUniverse ? loadedUniverse : null;
   const cacheCoverage = selectedDetail?.cache_coverage;
   const cacheProblems = cacheCoverage?.incomplete_symbols ?? cacheCoverage?.missing_symbols ?? [];
-  const importPreview = useMemo(() => parseMembershipImport(membershipText), [membershipText]);
-  const delistedResults = (membershipSyncJob?.result?.results ?? []).filter(
-    (result) => result.delisted && symbols.includes(result.symbol),
+  const savedDefinitionDirty = Boolean(
+    selectedUniverse && loadedSavedUniverse && (
+      name.trim() !== loadedSavedUniverse.name ||
+      normalizedMembershipRows(rows).join("\n") !== savedMembershipRows(loadedSavedUniverse).join("\n")
+    ),
   );
+  const recommendedPriceStart = useMemo(
+    () => requiredPriceStart(
+      rows,
+      expectedStart,
+      selectedDetail?.mode,
+      cacheCoverage?.required_start,
+    ),
+    [cacheCoverage?.required_start, expectedStart, rows, selectedDetail?.mode],
+  );
+  const importPreview = useMemo(() => parseMembershipImport(membershipText), [membershipText]);
+  const membershipDiagnostics = (membershipSyncJob?.result?.results ?? []).filter(
+    (result) => symbols.includes(result.symbol),
+  );
+
+  const acceptRefreshedUniverse = useCallback((universe: UniverseInfo) => {
+    // Sync, save, and hydration requests may finish after the user selects something else.
+    // Never let an old detail response replace the active universe's readiness/membership data.
+    if (universe.name !== selectedUniverseRef.current) return;
+    setLoadedUniverse(universe);
+    setUniverseOptions((current) => {
+      const existing = current.findIndex((item) => item.name === universe.name);
+      if (existing < 0) return [universe, ...current];
+      return current.map((item, index) => index === existing ? universe : item);
+    });
+  }, []);
 
   useEffect(() => {
     onDraftChange?.({ name, rows, selectedUniverse, expectedStart });
   }, [expectedStart, name, onDraftChange, rows, selectedUniverse]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      loadUniverseRequest.current += 1;
+      directOperationEpoch.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     if (!canSubmit) {
@@ -119,6 +216,40 @@ export function UniverseEditorPage({
     };
   }, [canSubmit]);
 
+  // A workspace can reopen directly on a saved universe. Summaries intentionally omit full
+  // memberships/coverage, so hydrate the selected identity without replacing the saved draft.
+  useEffect(() => {
+    const savedName = draft?.selectedUniverse;
+    if (
+      !canSubmit ||
+      !savedName ||
+      selectedUniverse !== savedName ||
+      loadedUniverse?.name === savedName
+    ) return;
+    const request = ++loadUniverseRequest.current;
+    let cancelled = false;
+    getUniverse(savedName)
+      .then((universe) => {
+        if (
+          !cancelled &&
+          request === loadUniverseRequest.current &&
+          selectedUniverseRef.current === savedName
+        ) {
+          acceptRefreshedUniverse(universe);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    acceptRefreshedUniverse,
+    canSubmit,
+    draft?.selectedUniverse,
+    loadedUniverse?.name,
+    selectedUniverse,
+  ]);
+
   // Leaving this page mid-pull stops the poll loops below - clear the bottom bar rather than
   // leaving it frozen on a stale snapshot.
   useEffect(() => () => onPullProgress?.(null), [onPullProgress]);
@@ -132,13 +263,6 @@ export function UniverseEditorPage({
   function removeRow(index: number) {
     setRows((current) => {
       const next = current.filter((_, rowIndex) => rowIndex !== index);
-      return next.length > 0 ? next : [{ ...EMPTY }];
-    });
-  }
-
-  function removeSymbolRow(symbol: string) {
-    setRows((current) => {
-      const next = current.filter((row) => row.symbol.trim().toUpperCase() !== symbol);
       return next.length > 0 ? next : [{ ...EMPTY }];
     });
   }
@@ -160,28 +284,36 @@ export function UniverseEditorPage({
   }
 
   async function loadUniverse(nameToLoad: string) {
-    setSelectedUniverse(nameToLoad);
-    if (!canSubmit || !nameToLoad) return;
+    const request = ++loadUniverseRequest.current;
+    selectUniverseIdentity(nameToLoad);
+    if (!nameToLoad) {
+      setLoadedUniverse(null);
+      return;
+    }
+    if (!canSubmit) return;
     setUniverseError(null);
     setUniverseMessage(null);
     try {
       const universe = await getUniverse(nameToLoad);
+      if (request !== loadUniverseRequest.current) return;
       setName(universe.name);
       setRows(rowsFromUniverse(universe));
-      setLoadedUniverse(universe);
+      acceptRefreshedUniverse(universe);
       setPreparedPreset(null);
       setUniverseMessage(
         `Loaded ${universe.display_name ?? universe.name} with ${universe.symbols.length} symbols`,
       );
     } catch (error) {
+      if (request !== loadUniverseRequest.current) return;
       setUniverseError(String(error));
     }
   }
 
   function newUniverse() {
+    loadUniverseRequest.current += 1;
     setName("my-universe");
     setRows([{ ...EMPTY }]);
-    setSelectedUniverse("");
+    selectUniverseIdentity("");
     setLoadedUniverse(null);
     setUniverseMessage(null);
     setUniverseError(null);
@@ -201,12 +333,13 @@ export function UniverseEditorPage({
   }
 
   function preparePresetImport(preset: UniversePreset) {
+    loadUniverseRequest.current += 1;
     setUniverseError(null);
     setUniverseMessage(null);
     const importName = preset.pit_import_name ?? preset.id;
     setName(importName);
     setRows([{ ...EMPTY }]);
-    setSelectedUniverse("");
+    selectUniverseIdentity("");
     setLoadedUniverse(null);
     setPreparedPreset(preset.id);
     setMembershipText("");
@@ -258,15 +391,24 @@ export function UniverseEditorPage({
         return;
       }
     }
+    const request = ++loadUniverseRequest.current;
     try {
       const response = isUpdatingLoaded
         ? await updateUniverse(payload.name, payload)
         : await defineUniverse(payload);
-      setSelectedUniverse(response.name);
+      if (request !== loadUniverseRequest.current) return;
+      selectUniverseIdentity(response.name);
       setLoadedUniverse(null);
       setPreparedPreset(null);
       setUniverseMessage(`Saved ${response.name} with ${response.symbols.length} symbols`);
       await refreshUniverses();
+      if (request !== loadUniverseRequest.current) return;
+      try {
+        const refreshed = await getUniverse(response.name);
+        if (request === loadUniverseRequest.current) acceptRefreshedUniverse(refreshed);
+      } catch {
+        // The save succeeded. A later coverage refresh can hydrate older compatible backends.
+      }
     } catch (error) {
       setUniverseError(String(error));
     }
@@ -274,13 +416,20 @@ export function UniverseEditorPage({
 
   async function removeUniverse() {
     if (!canSubmit || selectedInfo?.source !== "custom") return;
+    const removing = selectedInfo.name;
+    const request = ++loadUniverseRequest.current;
     setUniverseError(null);
     setUniverseMessage(null);
     try {
-      await deleteUniverse(selectedInfo.name);
-      setSelectedUniverse("");
-      setLoadedUniverse(null);
-      setUniverseMessage(`Deleted ${selectedInfo.name}`);
+      await deleteUniverse(removing);
+      if (
+        request === loadUniverseRequest.current &&
+        selectedUniverseRef.current === removing
+      ) {
+        selectUniverseIdentity("");
+        setLoadedUniverse(null);
+      }
+      setUniverseMessage(`Deleted ${removing}`);
       await refreshUniverses();
     } catch (error) {
       setUniverseError(String(error));
@@ -326,19 +475,34 @@ export function UniverseEditorPage({
   }
 
   async function pullSymbolNow(symbol: string) {
+    const universeAtStart = selectedUniverseRef.current;
+    const operation = ++directOperationEpoch.current;
+    const isCurrent = () => (
+      mountedRef.current &&
+      operation === directOperationEpoch.current &&
+      selectedUniverseRef.current === universeAtStart
+    );
     try {
       const started = await startDataSync({ symbols: [symbol], start: expectedStart, mode: "incremental" });
+      if (!isCurrent()) return;
       let job = await getDataSync(started.job_id);
+      if (!isCurrent()) return;
       onPullProgress?.(job.progress ?? null);
       while (job.status === "queued" || job.status === "running" || job.status === "stopping") {
         await delay(500);
+        if (!isCurrent()) return;
         job = await getDataSync(started.job_id);
+        if (!isCurrent()) return;
         onPullProgress?.(job.progress ?? null);
       }
+      if (job.status === "done" && universeAtStart) {
+        const refreshed = await getUniverse(universeAtStart);
+        if (isCurrent()) acceptRefreshedUniverse(refreshed);
+      }
     } catch (error) {
-      setSymbolError(String(error));
+      if (isCurrent()) setSymbolError(String(error));
     } finally {
-      onPullProgress?.(null);
+      if (isCurrent()) onPullProgress?.(null);
     }
   }
 
@@ -361,42 +525,40 @@ export function UniverseEditorPage({
 
   async function syncMembershipDates() {
     if (!canSubmit || symbols.length === 0) return;
+    const universeAtStart = selectedUniverseRef.current;
+    const operation = ++directOperationEpoch.current;
+    const isCurrent = () => (
+      mountedRef.current &&
+      operation === directOperationEpoch.current &&
+      selectedUniverseRef.current === universeAtStart
+    );
     setMembershipSyncBusy(true);
     setMembershipSyncError(null);
     try {
       const started = await startMembershipSync({ symbols, expected_start: expectedStart });
+      if (!isCurrent()) return;
       let job = await getMembershipSync(started.job_id);
+      if (!isCurrent()) return;
       setMembershipSyncJob(job);
       onPullProgress?.(job.progress ?? null);
       while (job.status === "queued" || job.status === "running") {
         await delay(500);
+        if (!isCurrent()) return;
         job = await getMembershipSync(started.job_id);
+        if (!isCurrent()) return;
         setMembershipSyncJob(job);
         onPullProgress?.(job.progress ?? null);
       }
-      if (job.status === "done" && job.result) {
-        const resolved = new Map(
-          job.result.results.filter((r) => r.status === "resolved").map((r) => [r.symbol, r]),
-        );
-        setRows((current) =>
-          current.map((row) => {
-            const result = resolved.get(row.symbol.trim().toUpperCase());
-            if (!result) return row;
-            return {
-              ...row,
-              entry: result.entry ?? row.entry,
-              exit: result.delisted ? result.exit ?? row.exit : "",
-            };
-          }),
-        );
-      } else if (job.status === "failed") {
+      if (job.status === "failed") {
         setMembershipSyncError(job.error ?? "Date sync failed.");
       }
     } catch (error) {
-      setMembershipSyncError(String(error));
+      if (isCurrent()) setMembershipSyncError(String(error));
     } finally {
-      setMembershipSyncBusy(false);
-      onPullProgress?.(null);
+      if (isCurrent()) {
+        setMembershipSyncBusy(false);
+        onPullProgress?.(null);
+      }
     }
   }
 
@@ -421,20 +583,24 @@ export function UniverseEditorPage({
 
       {canSubmit && presets.length > 0 && (
         <CompactSection
-          title="Common index templates"
-          summary={`${presets.length} templates · snapshots and PIT`}
+          title="Prepared universes"
+          summary={`${presets.length} offline definitions`}
           defaultOpen
         >
-          <p className="hint">
-            A bundled static snapshot is convenient for current-universe research, but it is not
-            historical membership. Prepare a separate point-in-time import for survivorship-safe
-            research; the two definitions never overwrite one another.
-          </p>
+          <details className="universe-preset-guidance">
+            <summary>Current snapshot or point-in-time history?</summary>
+            <p className="hint">
+              A current snapshot answers who is included now. Applying that same list to earlier
+              dates omits past removals, so use point-in-time history when historical membership
+              matters. The two definitions remain separate.
+            </p>
+          </details>
           <div className="universe-preset-grid" data-testid="universe-presets">
             {presets.map((preset) => {
               const snapshot = preset.snapshot_universe ?? (preset.available ? preset.id : null);
               const definition = preset.definition;
               const provenance = preset.provenance_detail;
+              const isSample = preset.status === "bundled_sample";
               return (
                 <article
                   key={preset.id}
@@ -442,25 +608,22 @@ export function UniverseEditorPage({
                 >
                   <div className="universe-preset__head">
                     <strong>{preset.display_name}</strong>
-                    <span className="mode-chip">{preset.status.replace(/_/g, " ")}</span>
+                    <span
+                      className="universe-preset__scope"
+                      title={preset.warning}
+                      aria-label={`${preset.warning} More detail is available below.`}
+                    >
+                      {isSample ? "Demo basket" : "Current members"} ⓘ
+                    </span>
                   </div>
-                  <span>{preset.coverage}</span>
-                  <small>
-                    {preset.mode === "static_snapshot" ? "Static definition" : "Bundled definition"}: {definition?.snapshot_date ?? "packaged with the app"}
-                    {definition?.member_count != null ? ` · ${definition.member_count} members` : ""}
-                  </small>
-                  <small>Provenance: {provenance?.provider ?? preset.provenance}</small>
-                  {provenance?.attribution && (
-                    <small>
-                      Attribution: {provenance.attribution}
-                      {provenance.license ? ` · ${provenance.license}` : ""}
-                    </small>
-                  )}
-                  {preset.fingerprint && (
-                    <code title={preset.fingerprint}>Fingerprint: {preset.fingerprint}</code>
-                  )}
-                  <p className={preset.readiness?.research_ready ? "ok" : "oos-warning"}>
-                    {preset.warning}
+                  <p className="universe-preset__summary">{preset.coverage}</p>
+                  <p className="universe-preset__facts">
+                    <span>
+                      {definition?.member_count != null
+                        ? `${definition.member_count} symbols`
+                        : "Bundled definition"}
+                    </span>
+                    <span>{definition?.snapshot_date ?? "Offline"}</span>
                   </p>
                   <div className="actions">
                     <button
@@ -468,9 +631,7 @@ export function UniverseEditorPage({
                       disabled={!snapshot}
                       onClick={() => loadPresetSnapshot(preset)}
                     >
-                      {preset.mode === "static_snapshot"
-                        ? "Load current snapshot"
-                        : "Load bundled sample"}
+                      {isSample ? "Load sample" : "Load current snapshot"}
                     </button>
                     <button
                       type="button"
@@ -483,6 +644,22 @@ export function UniverseEditorPage({
                         : "Import point-in-time history"}
                     </button>
                   </div>
+                  <details className="universe-preset__details">
+                    <summary>Source and research notes</summary>
+                    <p>{preset.warning}</p>
+                    <small>Source: {provenance?.provider ?? preset.provenance}</small>
+                    {provenance?.attribution && (
+                      <small>
+                        Attribution: {provenance.attribution}
+                        {provenance.license ? ` · ${provenance.license}` : ""}
+                      </small>
+                    )}
+                    {preset.fingerprint && (
+                      <code title={preset.fingerprint}>
+                        Fingerprint: {preset.fingerprint}
+                      </code>
+                    )}
+                  </details>
                 </article>
               );
             })}
@@ -599,6 +776,13 @@ export function UniverseEditorPage({
             {cacheCoverage.cached_symbols.length} of {cacheCoverage.eligible_symbols.length} historical
             symbols have cache files through {cacheCoverage.as_of}.
           </span>
+          {(cacheCoverage.exited_symbols?.length ?? 0) > 0 && (
+            <small>
+              {cacheCoverage.exited_symbols?.length} exited membership
+              {cacheCoverage.exited_symbols?.length === 1 ? " requires" : "s require"} prices only through
+              their declared exit dates. Missing provider data never creates an exit automatically.
+            </small>
+          )}
           <p className={cacheCoverage.complete ? "ok" : "oos-warning"}>
             {cacheCoverage.complete
               ? "Cached dates cover every declared membership interval."
@@ -606,6 +790,18 @@ export function UniverseEditorPage({
           </p>
         </aside>
       )}
+
+      <UniverseDataSync
+        key={`price-data-${selectedUniverse || "draft"}-${loadedSavedUniverse ? "loaded" : "loading"}`}
+        rows={rows}
+        universeName={selectedUniverse}
+        universe={loadedSavedUniverse}
+        savedDefinitionDirty={savedDefinitionDirty}
+        recommendedStart={recommendedPriceStart}
+        canSubmit={canSubmit}
+        onPullProgress={onPullProgress}
+        onUniverseRefresh={acceptRefreshedUniverse}
+      />
 
       <label className="field">
         <span className="field-label">Universe name</span>
@@ -758,26 +954,35 @@ export function UniverseEditorPage({
           onClick={syncMembershipDates}
           disabled={!canSubmit || membershipSyncBusy || symbols.length === 0}
         >
-          {membershipSyncBusy ? "Syncing dates..." : "Sync entry/exit dates"}
+          {membershipSyncBusy ? "Inspecting prices..." : "Inspect price dates"}
         </button>
       </div>
+      <p className="hint">
+        Price coverage is diagnostic only: its first row may reflect provider coverage, and a
+        missing tail never proves a delisting. A membership exit means that a symbol left this
+        universe; it does not necessarily mean the security stopped trading. Enter or import
+        membership dates only from an authoritative constituent source.
+      </p>
       {membershipSyncError && <p className="error">{membershipSyncError}</p>}
 
-      {delistedResults.length > 0 && (
+      {membershipDiagnostics.length > 0 && (
         <CompactSection
-          title="Delisted symbols detected"
-          summary={`${delistedResults.length} found`}
+          title="Price-date diagnostics"
+          summary={`${membershipDiagnostics.length} result${membershipDiagnostics.length === 1 ? "" : "s"}`}
           defaultOpen
         >
-          <ul className="coverage-list" data-testid="delisted-list">
-            {delistedResults.map((result) => (
+          <ul className="coverage-list" data-testid="stale-membership-list">
+            {membershipDiagnostics.map((result) => (
               <li key={result.symbol}>
                 <strong>{result.symbol}</strong>
-                <span>Exited {result.exit}</span>
-                <span />
-                <button type="button" className="ghost" onClick={() => removeSymbolRow(result.symbol)}>
-                  Remove
-                </button>
+                <span>
+                  {result.status === "failed"
+                    ? "Price coverage unavailable"
+                    : `${result.first_date ?? result.list_date ?? "unknown"} to ${result.last_date ?? "unknown"}`}
+                </span>
+                <span>
+                  {result.error ?? result.note ?? "Membership dates were left unchanged."}
+                </span>
               </li>
             ))}
           </ul>

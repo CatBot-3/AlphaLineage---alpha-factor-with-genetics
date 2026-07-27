@@ -75,9 +75,29 @@ describe("dashboard (P6-T3)", () => {
       },
     } as unknown as RunResult;
     render(<Dashboard report={report} history={history} extra={result} />);
-    expect(screen.getByText("Normalized net equity")).toBeInTheDocument();
+    expect(screen.getByText("Cumulative percentage return")).toBeInTheDocument();
     expect(screen.getByText("Population fitness")).toBeInTheDocument();
     expect(screen.getAllByText("Best |rank IC|").length).toBeGreaterThan(0);
     expect(screen.getAllByRole("img")).toHaveLength(3);
+  });
+
+  it("renders an equity curve from legacy dated net returns", () => {
+    const result = {
+      oos_backtest: {
+        start: "2025-01-01",
+        end: "2025-01-03",
+        observations: 3,
+        metrics: {},
+        returns: [
+          { date: "2025-01-01", gross: 0.01, net: 0.009 },
+          { date: "2025-01-02", gross: -0.01, net: -0.011 },
+          { date: "2025-01-03", gross: 0.02, net: 0.019 },
+        ],
+        normalized_equity: [],
+      },
+    } as unknown as RunResult;
+    render(<Dashboard report={report} history={history} extra={result} />);
+    expect(screen.getByText("Cumulative percentage return")).toBeInTheDocument();
+    expect(screen.queryByText(/Equity history is unavailable/)).not.toBeInTheDocument();
   });
 });

@@ -123,9 +123,20 @@ def build_report(
         horizon=horizon,
         fwd=fwd,
         ic_method=ic_method,
-        returns_fn=net_return_fn(panel, fwd, selected_scheme, cost_model),
+        returns_fn=net_return_fn(
+            panel,
+            fwd,
+            selected_scheme,
+            cost_model,
+            horizon=horizon,
+        ),
         returns_from_factor=lambda factor: net_returns_for_factor(
-            factor, fwd, selected_scheme, cost_model
+            factor,
+            fwd,
+            selected_scheme,
+            cost_model,
+            panel=panel,
+            horizon=horizon,
         ),
         progress=progress,
         stop=stop,
@@ -141,6 +152,7 @@ def build_report(
             dates,
             ic_method=ic_method,
             min_names=min_names,
+            horizon=horizon,
         ),
     )
     payload: dict[str, Any] = {

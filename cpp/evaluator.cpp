@@ -28,7 +28,7 @@ namespace py = pybind11;
 
 using Vec = std::vector<double>;
 static const double NA = std::numeric_limits<double>::quiet_NaN();
-static constexpr int ABI_VERSION = 4;
+static constexpr int ABI_VERSION = 5;
 static constexpr int MAX_NATIVE_WORKERS = 32;
 
 enum Opcode : int32_t {
@@ -70,6 +70,7 @@ enum Opcode : int32_t {
   OP_TS_RMA = 35,
   OP_TS_RECURSIVE_SMOOTH = 36,
   OP_TS_STD_POP = 37,
+  OP_TS_CUMSUM = 38,
 };
 
 template <typename T>
@@ -142,7 +143,7 @@ static Plan make_plan(const Arr<int32_t>& ops, const Arr<int32_t>& a_arr,
   };
   for (size_t i = 0; i < k; ++i) {
     const int op = p.op[i];
-    if (op < OP_LOAD || op > OP_TS_STD_POP) throw std::runtime_error("unknown opcode");
+    if (op < OP_LOAD || op > OP_TS_CUMSUM) throw std::runtime_error("unknown opcode");
     if (op == OP_LOAD) {
       if (p.field[i] < 0 || p.field[i] >= n_fields) {
         throw std::runtime_error("field index out of range");
@@ -650,6 +651,21 @@ static void compute_plan(const double* fields, ssize_t n_fields, ssize_t t_count
         case OP_TS_MIN:
         case OP_TS_MAX:
           rolling_min_max(x, out, t_count, n_symbols, plan.ival[i], op == OP_TS_MIN);
+          break;
+        case OP_TS_CUMSUM:
+          std::fill(out.begin(), out.end(), NA);
+          for (ssize_t s = 0; s < n_symbols; ++s) {
+            double total = 0.0;
+            for (ssize_t t = 0; t < t_count; ++t) {
+              const double current = x[t * n_symbols + s];
+              if (!rolling_observation(current)) {
+                total = 0.0;
+                continue;
+              }
+              total += current;
+              out[t * n_symbols + s] = total;
+            }
+          }
           break;
         case OP_DELTA: {
           const ssize_t window = plan.ival[i];

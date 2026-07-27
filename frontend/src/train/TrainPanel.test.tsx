@@ -36,6 +36,7 @@ vi.mock("../api/client", () => ({
       complete: true,
     }),
   listFormulaResults: () => Promise.resolve([]),
+  listFormulas: () => Promise.resolve([]),
   getPrimitives: () => Promise.resolve([]),
   getTrainingCapabilities: () => Promise.resolve({
     default_profile: "auto",

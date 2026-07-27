@@ -87,6 +87,8 @@ def register_operator(
     arg_types: Sequence[DType],
     out_type: DType,
     body: Node | dict[str, Any],
+    *,
+    policy: dict[str, Any] | None = None,
 ) -> Primitive:
     """Validate and register a user operator (a typed macro). Returns the new primitive."""
     if not isinstance(name, str) or not name or name == ARG:
@@ -104,7 +106,14 @@ def register_operator(
     if not is_subtype(inferred, out_type):
         raise InvalidOperator(f"body produces {inferred}, not the declared output {out_type}")
 
-    prim = Primitive(name, Kind.OPERATOR, out_type, types, macro_body=body_node)
+    prim = Primitive(
+        name,
+        Kind.OPERATOR,
+        out_type,
+        types,
+        macro_body=body_node,
+        macro_policy=policy,
+    )
     OPERATORS[name] = prim
     REGISTRY[name] = prim
     USER_OPERATORS[name] = prim
@@ -116,6 +125,8 @@ def ensure_operator(
     arg_types: Sequence[DType],
     out_type: DType,
     body: Node | dict[str, Any],
+    *,
+    policy: dict[str, Any] | None = None,
 ) -> Primitive:
     """Idempotently register a user operator.
 
@@ -136,12 +147,13 @@ def ensure_operator(
             existing.arg_types == types
             and existing.out_type == out_type
             and existing.macro_body == body_node
+            and (policy is None or existing.macro_policy == policy)
         ):
             return existing
         raise InvalidOperator(f"{name!r} already registered with a different definition")
     if name in REGISTRY:  # a built-in (or other non-macro primitive) holds this name
         raise InvalidOperator(f"{name!r} already exists; choose another name")
-    return register_operator(name, types, out_type, body_node)
+    return register_operator(name, types, out_type, body_node, policy=policy)
 
 
 def unregister_operator(name: str) -> None:
@@ -191,7 +203,10 @@ def expand_all(
     """
     if max_depth < 1 or max_nodes < 1:
         raise InvalidOperator("expansion limits must be positive")
-    emitted = 0
+    # Macro bodies often reuse the same dependency several times (MACD, DEMA/TEMA, Bollinger
+    # bands).  Memoizing structurally identical expansions turns that expression into a DAG in
+    # memory and lets complexity measure distinct calculations rather than textual duplication.
+    memo: dict[Node, Node] = {}
     expansions = 0
 
     def visit(
@@ -201,11 +216,9 @@ def expand_all(
         *,
         account: bool = True,
     ) -> Node:
-        nonlocal emitted, expansions
-        if account and depth > max_depth:
-            raise InvalidOperator(
-                f"expanded expression depth exceeds the limit of {max_depth}"
-            )
+        nonlocal expansions
+        if current in memo and current.name not in active:
+            return memo[current]
         prim = REGISTRY.get(current.name)
         if prim is not None and prim.macro_body is not None:
             if current.name in active:
@@ -224,22 +237,28 @@ def expand_all(
                 visit(child, depth, active, account=False) for child in current.children
             )
             call = Node(current.name, expanded_children, current.value)
-            return visit(
+            result = visit(
                 expand(call, prim.macro_body),
                 depth,
                 (*active, current.name),
                 account=account,
             )
+            memo[current] = result
+            return result
 
-        if account:
-            emitted += 1
-            if emitted > max_nodes:
-                raise InvalidOperator(
-                    f"expanded expression size exceeds the limit of {max_nodes} nodes"
-                )
         children = tuple(
             visit(child, depth + 1, active, account=account) for child in current.children
         )
-        return Node(current.name, children, current.value)
+        result = Node(current.name, children, current.value)
+        memo[current] = result
+        return result
 
-    return visit(node, 1, ())
+    expanded = visit(node, 1, ())
+    if expanded.depth() > max_depth:
+        raise InvalidOperator(f"expanded expression depth exceeds the limit of {max_depth}")
+    unique_nodes = expanded.unique_computation_size()
+    if unique_nodes > max_nodes:
+        raise InvalidOperator(
+            f"expanded expression size exceeds the limit of {max_nodes} distinct nodes"
+        )
+    return expanded

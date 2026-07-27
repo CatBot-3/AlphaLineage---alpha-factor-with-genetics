@@ -38,12 +38,15 @@ DISCLAIMER = "Not investment advice. Research output only."
 
 def _operator_spec(name: str) -> dict[str, Any]:
     prim = USER_OPERATORS[name]
-    return {
+    spec = {
         "name": prim.name,
         "arg_types": [t.value for t in prim.arg_types],
         "out_type": prim.out_type.value,
         "body": tree_to_dict(prim.macro_body),
     }
+    if prim.macro_policy is not None:
+        spec["policy"] = prim.macro_policy
+    return spec
 
 
 def required_operators(tree: Node) -> list[dict[str, Any]]:

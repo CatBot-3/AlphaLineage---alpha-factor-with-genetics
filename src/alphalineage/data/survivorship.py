@@ -1,9 +1,8 @@
 """P0-T5 - survivorship-bias audit report.
 
-Free/prototype data sources often silently drop delisted names, which inflates
-backtest results. This report makes the universe's delisted coverage explicit: it
-enumerates active vs delisted members so a reader can judge whether the dataset is
-survivorship-biased before trusting any downstream metric.
+Free/prototype constituent sources often omit historical removals, which inflates
+backtest results. A declared universe exit and a security delisting are different
+events, so this report describes only the membership evidence actually stored.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ _DISCLAIMER = (
 def survivorship_report(universe: Universe) -> str:
     """Render a Markdown survivorship audit for ``universe``."""
     active = universe.active()
-    delisted = universe.delisted()
+    exited = universe.exited()
     total = len(universe.memberships)
     generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
 
@@ -33,19 +32,27 @@ def survivorship_report(universe: Universe) -> str:
         f"_Generated {generated}_",
         "",
         f"- Total members: **{total}**",
-        f"- Active: **{len(active)}**",
-        f"- Delisted: **{len(delisted)}**",
+        f"- Open membership intervals: **{len(active)}**",
+        f"- Declared membership exits: **{len(exited)}**",
         "",
-        "## Delisted names",
+        (
+            "_A membership exit means the symbol left this universe; it does not establish "
+            "that the security was delisted._"
+        ),
+        "",
+        "## Declared membership exits",
         "",
     ]
-    if delisted:
+    if exited:
         lines.append("| Symbol | Entry | Exit |")
         lines.append("| --- | --- | --- |")
-        for m in sorted(delisted, key=lambda x: x.symbol):
+        for m in sorted(exited, key=lambda x: x.symbol):
             lines.append(f"| {m.symbol} | {m.entry.date()} | {m.exit.date() if m.exit else ''} |")
     else:
-        lines.append("_No delisted names recorded - this dataset is likely survivorship-biased._")
+        lines.append(
+            "_No historical membership exits are recorded - this dataset is likely "
+            "survivorship-biased._"
+        )
     lines += [
         "",
         "## Active names",

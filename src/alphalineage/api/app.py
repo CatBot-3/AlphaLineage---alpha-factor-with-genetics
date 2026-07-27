@@ -75,6 +75,7 @@ from alphalineage.core.tree import to_json as tree_to_json
 from alphalineage.core.tree import validate as validate_tree
 from alphalineage.core.types import DType, is_subtype
 from alphalineage.data import paths, schema, usage
+from alphalineage.data.adjust import split_adjusted_close
 from alphalineage.data.cache import ParquetCache
 from alphalineage.data.identifiers import (
     atomic_write_text,
@@ -101,7 +102,9 @@ from alphalineage.library.factors import DISCLAIMER, FactorStore
 from alphalineage.library.indicator_catalog import (
     CATALOG_NAMES,
     CATALOG_ORIGIN,
+    CATALOG_REVISION,
     INDICATOR_CATALOG,
+    LEGACY_CATALOG_REPLACEMENTS,
 )
 from alphalineage.validation.splits import time_split
 
@@ -116,6 +119,8 @@ app.add_middleware(
 _jobs = JobStore()
 _universes: dict[str, Universe] = {}
 _data_jobs = JobStore()
+_data_sync_submit_lock = threading.Lock()
+_universe_lifecycle_lock = threading.RLock()
 _formula_test_jobs = JobStore()
 # Formula registration is process-global.  Serialize deletion with one-shot run submission so a
 # run is visible as a revision holder before its pinned primitives can be unregistered.
@@ -126,6 +131,38 @@ _DEFAULT_AS_OF = datetime.now(UTC).date().isoformat()
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _FORMULA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _FORMULA_INPUT_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_BENCHMARK_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "id": "sp500",
+        "label": "S&P 500",
+        "symbol": "^GSPC",
+        "color": "#8f2d22",
+        "methodology": (
+            "S&P 500 split-adjusted close-to-close price return "
+            "(cash dividends are not reinvested)."
+        ),
+    },
+    {
+        "id": "djia",
+        "label": "Dow Jones Industrial Average",
+        "symbol": "^DJI",
+        "color": "#8a6514",
+        "methodology": (
+            "Dow Jones Industrial Average split-adjusted close-to-close price return "
+            "(cash dividends are not reinvested)."
+        ),
+    },
+    {
+        "id": "nasdaq100",
+        "label": "Nasdaq-100",
+        "symbol": "^NDX",
+        "color": "#6d3fa0",
+        "methodology": (
+            "Nasdaq-100 split-adjusted close-to-close price return "
+            "(cash dividends are not reinvested)."
+        ),
+    },
+)
 
 
 # --- models ----------------------------------------------------------------------
@@ -134,6 +171,17 @@ class OperatorSpec(BaseModel):
     arg_types: list[str]
     out_type: str
     body: dict[str, Any]
+    policy: dict[str, Any] | None = None
+
+
+class FormulaTuningSpec(BaseModel):
+    """Deterministic local-search policy for a numeric formula parameter."""
+
+    enabled: bool = True
+    min: float | int
+    max: float | int
+    step: float | int
+    radius: int = Field(default=1, ge=1, le=16)
 
 
 class FormulaInputSpec(BaseModel):
@@ -141,6 +189,14 @@ class FormulaInputSpec(BaseModel):
     type: str
     description: str = ""
     default: float | int | None = None
+    role: Literal["data", "parameter"] | None = None
+    tuning: FormulaTuningSpec | None = None
+
+
+class FormulaConstraintSpec(BaseModel):
+    left: str
+    operator: Literal["lt", "le", "gt", "ge", "ne"]
+    right: str
 
 
 class FormulaSpec(BaseModel):
@@ -161,6 +217,10 @@ class FormulaSpec(BaseModel):
     family: str = ""
     aliases: list[str] = Field(default_factory=list)
     catalog_revision: int | None = None
+    constraints: list[FormulaConstraintSpec] = Field(default_factory=list)
+    status: Literal["active", "retired"] = "active"
+    replacement: str | None = None
+    family_order: int = Field(default=0, ge=0)
 
 
 class CategoryUpdate(BaseModel):
@@ -325,6 +385,9 @@ class DataSyncRequest(BaseModel):
     start: str
     end: str | None = None
     mode: str = "incremental"
+    # Canonical cache symbol -> provider symbol. Universe submissions populate this from the
+    # pinned definition; direct symbol submissions normally leave it empty.
+    aliases: dict[str, str] = Field(default_factory=dict)
 
 
 class DataSyncResult(BaseModel):
@@ -346,12 +409,18 @@ class MembershipSyncRequest(BaseModel):
 
 class MembershipSyncResult(BaseModel):
     symbol: str
-    status: str  # resolved | failed
+    status: str  # resolved | unverified_stale | failed
+    # Deprecated membership-shaped fields remain in the response for older clients. Price
+    # availability is diagnostic evidence only, so these fields are intentionally inert.
     entry: str | None = None
     exit: str | None = None
     delisted: bool = False
+    review_needed: bool = False
+    first_date: str | None = None
+    # ``list_date`` is the deprecated alias for ``first_date``.
     list_date: str | None = None
     last_date: str | None = None
+    note: str | None = None
     error: str | None = None
 
 
@@ -431,10 +500,37 @@ def _formula_categories() -> dict[str, str]:
     }
 
 
+_RESERVED_LEAF_CATEGORIES = {core_categories.DATA, core_categories.CONSTANT}
+
+
+def _category_override_allowed(name: str, category: object) -> bool:
+    """Only calculation operators may be recategorized, never into leaf-only groups."""
+    primitive = REGISTRY.get(name)
+    normalized_category = category.strip() if isinstance(category, str) else ""
+    return bool(
+        primitive is not None
+        and primitive.kind.value == "operator"
+        and normalized_category
+        and normalized_category.casefold() not in _RESERVED_LEAF_CATEGORIES
+    )
+
+
+def _formula_category(category: str) -> str:
+    """Keep the data/constant headings leaf-only, including legacy case variants."""
+    normalized = category.strip()
+    if not normalized or normalized.casefold() in _RESERVED_LEAF_CATEGORIES:
+        return core_categories.CUSTOM
+    return normalized
+
+
 def _resolve_category(name: str, *, is_user: bool, formula_categories: dict[str, str]) -> str:
     """Category for a primitive: user override > formula's own > built-in default > custom."""
     overrides = paths.read_categories().get("overrides", {})
-    if isinstance(overrides, dict) and name in overrides:
+    if (
+        isinstance(overrides, dict)
+        and name in overrides
+        and _category_override_allowed(name, overrides[name])
+    ):
         return str(overrides[name])
     if name in formula_categories:
         return formula_categories[name]
@@ -461,10 +557,30 @@ def _allowed_operators(
         else {spec.runtime_name for spec in _read_formula_specs()}
     )
     current.update(explicit_operator_names or set())
+    by_runtime = {spec.runtime_name: spec for spec in _all_formula_specs()}
+    active_specs = [
+        by_runtime[runtime_name]
+        for runtime_name in current
+        if runtime_name in by_runtime and by_runtime[runtime_name].status == "active"
+    ]
+    if config.enabled_formula_names is not None:
+        available_names = {spec.name for spec in active_specs}
+        unknown = sorted(set(config.enabled_formula_names) - available_names)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown or retired enabled formula(s): {', '.join(unknown)}",
+            )
+        selected_names = set(config.enabled_formula_names)
+        active_specs = [spec for spec in active_specs if spec.name in selected_names]
+    active_formula_runtimes = {spec.runtime_name for spec in active_specs}
     return {
         prim.name
         for prim in OPERATORS.values()
         if (prim.macro_body is None or prim.name in current)
+        if prim.macro_body is None
+        or prim.name in active_formula_runtimes
+        or prim.name in (explicit_operator_names or set())
         if _resolve_category(
             prim.name, is_user=prim.macro_body is not None, formula_categories=cats
         )
@@ -487,6 +603,8 @@ def _primitive_info(
                     "name": item.name,
                     "description": item.description,
                     "default": item.default,
+                    "role": item.role,
+                    "tuning": _model_dump(item.tuning) if item.tuning is not None else None,
                 }
                 for item in formula.inputs
             ],
@@ -504,6 +622,10 @@ def _primitive_info(
         }
         if meta.get("default") is not None:
             item["default"] = meta["default"]
+        if meta.get("role") is not None:
+            item["role"] = meta["role"]
+        if meta.get("tuning") is not None:
+            item["tuning"] = meta["tuning"]
         inputs.append(item)
     if prim.kind.value == "operand":
         origin = "data"
@@ -531,13 +653,23 @@ def _primitive_info(
         "family": formula.family if formula is not None else "",
         "aliases": formula.aliases if formula is not None else [],
         "catalog_revision": formula.catalog_revision if formula is not None else None,
+        "constraints": (
+            [_model_dump(item) for item in formula.constraints] if formula is not None else []
+        ),
+        "status": formula.status if formula is not None else "active",
+        "replacement": formula.replacement if formula is not None else None,
+        "family_order": formula.family_order if formula is not None else 0,
     }
 
 
 def _register(spec: OperatorSpec) -> Primitive:
     try:
         return register_operator(
-            spec.name, [DType(t) for t in spec.arg_types], DType(spec.out_type), spec.body
+            spec.name,
+            [DType(t) for t in spec.arg_types],
+            DType(spec.out_type),
+            spec.body,
+            policy=spec.policy,
         )
     except (InvalidOperator, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -580,6 +712,24 @@ def _formula_inputs(
                 detail=f"input {name!r} type does not match argument {index + 1}",
             )
         default = item.default
+        role = item.role or (
+            "parameter"
+            if item.type in {DType.WINDOW.value, DType.SCALAR.value}
+            else "data"
+        )
+        if role == "data" and item.type in {DType.WINDOW.value, DType.SCALAR.value}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"numeric input {name!r} must use the parameter role",
+            )
+        if role == "parameter" and item.type not in {
+            DType.WINDOW.value,
+            DType.SCALAR.value,
+        }:
+            raise HTTPException(
+                status_code=400,
+                detail=f"connectable input {name!r} must use the data role",
+            )
         if default is not None:
             if item.type == DType.WINDOW.value:
                 if isinstance(default, bool) or not isinstance(default, int):
@@ -606,6 +756,52 @@ def _formula_inputs(
                     status_code=400,
                     detail=f"only scalar and window inputs may define defaults ({name!r})",
                 )
+        tuning = item.tuning
+        if tuning is not None:
+            if item.type not in {DType.WINDOW.value, DType.SCALAR.value}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"only numeric input {name!r} may define a tuning policy",
+                )
+            numeric = (tuning.min, tuning.max, tuning.step)
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in numeric
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"tuning bounds for {name!r} must be finite numbers",
+                )
+            if tuning.min > tuning.max or tuning.step <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid tuning range for {name!r}",
+                )
+            if item.type == DType.WINDOW.value and any(
+                isinstance(value, bool) or not isinstance(value, int) for value in numeric
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"window tuning values for {name!r} must be integers",
+                )
+            if item.type == DType.WINDOW.value:
+                try:
+                    validate_tree(Node("window", value=tuning.min))
+                    validate_tree(Node("window", value=tuning.max))
+                except Exception as exc:  # noqa: BLE001 - normalize as a client contract error
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if default is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"tunable input {name!r} requires a default",
+                )
+            if not tuning.min <= default <= tuning.max:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"default for {name!r} must be within its tuning range",
+                )
         seen.add(name)
         normalized.append(
             FormulaInputSpec(
@@ -613,8 +809,53 @@ def _formula_inputs(
                 type=item.type,
                 description=item.description.strip(),
                 default=default,
+                role=role,
+                tuning=tuning,
             )
         )
+    return normalized
+
+
+def _formula_constraints(
+    constraints: list[FormulaConstraintSpec], inputs: list[FormulaInputSpec]
+) -> list[FormulaConstraintSpec]:
+    by_name = {item.name: item for item in inputs}
+    normalized: list[FormulaConstraintSpec] = []
+    comparisons = {
+        "lt": lambda left, right: left < right,
+        "le": lambda left, right: left <= right,
+        "gt": lambda left, right: left > right,
+        "ge": lambda left, right: left >= right,
+        "ne": lambda left, right: left != right,
+    }
+    for item in constraints:
+        left = item.left.strip().lower()
+        right = item.right.strip().lower()
+        if left not in by_name or right not in by_name:
+            raise HTTPException(
+                status_code=400,
+                detail=f"formula constraint references unknown inputs {left!r}, {right!r}",
+            )
+        if by_name[left].type not in {DType.WINDOW.value, DType.SCALAR.value} or by_name[
+            right
+        ].type not in {DType.WINDOW.value, DType.SCALAR.value}:
+            raise HTTPException(
+                status_code=400,
+                detail="formula constraints may compare only numeric inputs",
+            )
+        normalized.append(
+            FormulaConstraintSpec(left=left, operator=item.operator, right=right)
+        )
+        left_default, right_default = by_name[left].default, by_name[right].default
+        if (
+            left_default is not None
+            and right_default is not None
+            and not comparisons[item.operator](left_default, right_default)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"formula defaults violate constraint {left} {item.operator} {right}",
+            )
     return normalized
 
 
@@ -640,15 +881,21 @@ def _normalize_formula_spec(
         ) from exc
     rev = revision if revision is not None else max(1, int(spec.revision or 1))
     now = _now_iso()
+    inputs = _formula_inputs(arg_types, list(spec.inputs))
+    replacement = spec.replacement.strip() if spec.replacement else None
+    if replacement is not None:
+        replacement = _normalize_formula_name(replacement)
+        if replacement == name:
+            raise HTTPException(status_code=400, detail="formula cannot replace itself")
     return FormulaSpec(
         name=name,
         display_name=spec.display_name.strip() or name.replace("_", " ").title(),
         description=spec.description.strip(),
         arg_types=arg_types,
-        inputs=_formula_inputs(arg_types, list(spec.inputs)),
+        inputs=inputs,
         out_type=spec.out_type,
         body=spec.body,
-        category=spec.category.strip() or core_categories.CUSTOM,
+        category=_formula_category(spec.category),
         revision=rev,
         runtime_name=runtime_name or spec.runtime_name or (name if rev == 1 else f"{name}__r{rev}"),
         created_at=created_at or spec.created_at or now,
@@ -658,7 +905,21 @@ def _normalize_formula_spec(
         family=spec.family.strip(),
         aliases=list(dict.fromkeys(alias.strip() for alias in spec.aliases if alias.strip())),
         catalog_revision=spec.catalog_revision,
+        constraints=_formula_constraints(list(spec.constraints), inputs),
+        status=spec.status,
+        replacement=replacement,
+        family_order=spec.family_order,
     )
+
+
+def _formula_policy(spec: FormulaSpec) -> dict[str, Any]:
+    """JSON-safe parameter contract pinned with every registered formula revision."""
+    return {
+        "inputs": [_model_dump(item) for item in spec.inputs],
+        "constraints": [_model_dump(item) for item in spec.constraints],
+        "status": spec.status,
+        "catalog_revision": spec.catalog_revision,
+    }
 
 
 def _legacy_formula_store(items: list[Any]) -> dict[str, Any]:
@@ -769,6 +1030,38 @@ def _merge_indicator_catalog(store: dict[str, Any]) -> bool:
                 ]
             changed = True
         pinned[name] = candidate.runtime_name
+    # Retire managed families removed or renamed by the packaged catalog. Publishing a new
+    # metadata revision (rather than rewriting the old one) preserves the active runtime/status
+    # pinned by historical sessions and saved formulas.
+    for name, family in families.items():
+        if name in CATALOG_NAMES:
+            continue
+        latest = _family_latest(family)
+        if latest.origin != CATALOG_ORIGIN or latest.status == "retired":
+            continue
+        next_revision = latest.revision + 1
+        replacement = LEGACY_CATALOG_REPLACEMENTS.get(name)
+        retired = _normalize_formula_spec(
+            FormulaSpec(
+                **{
+                    **_model_dump(latest),
+                    "display_name": f"{latest.display_name} (retired)",
+                    "description": (
+                        f"{latest.description} Legacy managed formula retained for pinned "
+                        "dependencies."
+                    ).strip(),
+                    "catalog_revision": CATALOG_REVISION,
+                    "status": "retired",
+                    "replacement": replacement,
+                }
+            ),
+            revision=next_revision,
+            runtime_name=f"{name}__r{next_revision}",
+            created_at=latest.created_at,
+        )
+        family["revisions"].append(_model_dump(retired))
+        family["latest_revision"] = next_revision
+        changed = True
     return changed
 
 
@@ -876,6 +1169,7 @@ def _formula_operator_spec(spec: FormulaSpec) -> OperatorSpec:
         arg_types=spec.arg_types,
         out_type=spec.out_type,
         body=spec.body,
+        policy=_formula_policy(spec),
     )
 
 
@@ -1004,14 +1298,11 @@ def _load_persisted_formulas() -> list[dict[str, Any]]:
         try:
             existing = USER_OPERATORS.get(spec.runtime_name)
             expected_body = tree_from_dict(spec.body)
-            if (
-                spec.origin == CATALOG_ORIGIN
-                and existing is not None
-                and (
-                    existing.arg_types != tuple(DType(t) for t in spec.arg_types)
-                    or existing.out_type != DType(spec.out_type)
-                    or existing.macro_body != expected_body
-                )
+            if existing is not None and (
+                existing.arg_types != tuple(DType(t) for t in spec.arg_types)
+                or existing.out_type != DType(spec.out_type)
+                or existing.macro_body != expected_body
+                or existing.macro_policy != _formula_policy(spec)
             ):
                 unregister_operator(spec.runtime_name)
             ensure_operator(
@@ -1019,6 +1310,7 @@ def _load_persisted_formulas() -> list[dict[str, Any]]:
                 [DType(t) for t in spec.arg_types],
                 DType(spec.out_type),
                 spec.body,
+                policy=_formula_policy(spec),
             )
             status[spec.runtime_name] = (True, None)
         except (InvalidOperator, ValueError) as exc:
@@ -1143,13 +1435,19 @@ def _formula_impact(name: str, proposed: FormulaSpec | None = None) -> dict[str,
             normalized.body != current.body
             or normalized.arg_types != current.arg_types
             or normalized.out_type != current.out_type
+            or normalized.inputs != current.inputs
+            or normalized.constraints != current.constraints
+            or normalized.status != current.status
+            or normalized.replacement != current.replacement
         ):
             change = "calculation"
         elif (
             normalized.display_name != current.display_name
             or normalized.description != current.description
             or normalized.category != current.category
-            or normalized.inputs != current.inputs
+            or normalized.family != current.family
+            or normalized.aliases != current.aliases
+            or normalized.family_order != current.family_order
         ):
             change = "metadata"
     return {
@@ -1364,6 +1662,7 @@ def _merge_price_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
 def _sync_one_symbol(
     symbol: str,
     *,
+    provider_symbol: str | None = None,
     start: str,
     end: str | None,
     mode: str,
@@ -1371,6 +1670,7 @@ def _sync_one_symbol(
     cache: ParquetCache,
 ) -> DataSyncResult:
     clean = validate_market_symbol(symbol)
+    provider_clean = validate_market_symbol(provider_symbol or clean)
     requested_end = end or _today_iso()
     try:
         existing = cache.load(clean) if cache.has(clean) else None
@@ -1389,25 +1689,25 @@ def _sync_one_symbol(
         if not fetch_ranges and existing is not None:
             return DataSyncResult(
                 symbol=clean,
-                provider_symbol=clean,
+                provider_symbol=provider_clean,
                 status="skipped",
                 rows_cached=len(existing),
                 first_date=_date_iso(existing.index.min()),
                 last_date=_date_iso(existing.index.max()),
-                provider=_provider_source(provider, clean),
+                provider=_provider_source(provider, provider_clean),
             )
 
         fetched: list[pd.DataFrame] = []
         for range_start, range_end in fetch_ranges:
-            frame = provider.get_prices(clean, range_start, range_end)
+            frame = provider.get_prices(provider_clean, range_start, range_end)
             if not frame.empty:
                 fetched.append(frame)
         if not fetched and existing is None:
             return DataSyncResult(
                 symbol=clean,
-                provider_symbol=clean,
+                provider_symbol=provider_clean,
                 status="failed",
-                provider=_provider_source(provider, clean),
+                provider=_provider_source(provider, provider_clean),
                 error="provider returned no rows",
             )
 
@@ -1417,18 +1717,18 @@ def _sync_one_symbol(
         stored = cache.load(clean)
         return DataSyncResult(
             symbol=clean,
-            provider_symbol=clean,
+            provider_symbol=provider_clean,
             status="fetched" if fetched else "skipped",
             rows_fetched=sum(len(frame) for frame in fetched),
             rows_cached=len(stored),
             first_date=_date_iso(stored.index.min()),
             last_date=_date_iso(stored.index.max()),
-            provider=_provider_source(provider, clean),
+            provider=_provider_source(provider, provider_clean),
         )
     except Exception as exc:  # noqa: BLE001 - one failed symbol should not abort the batch
         return DataSyncResult(
             symbol=clean,
-            provider_symbol=clean,
+            provider_symbol=provider_clean,
             status="failed",
             provider=provider.name,
             error=str(exc),
@@ -1453,6 +1753,7 @@ def _run_data_sync(
         results.append(
             _sync_one_symbol(
                 symbol,
+                provider_symbol=req.aliases.get(symbol, symbol),
                 start=req.start,
                 end=req.end,
                 mode=req.mode,
@@ -1462,18 +1763,23 @@ def _run_data_sync(
         )
         if progress is not None:
             progress.advance(symbol)
+    failed_count = sum(result.status == "failed" for result in results)
     return {
         "mode": req.mode,
         "universe": req.universe,
         "start": req.start,
         "end": req.end,
         "results": [_model_dump(result) for result in results],
+        "failed_count": failed_count,
+        "succeeded_count": len(results) - failed_count,
         "termination_reason": "user_stopped" if stopped else "completed",
     }
 
 
-# Weekends/holidays/provider lag before a stale price tail is treated as a delisting.
-_DELISTING_TOLERANCE_DAYS = 10
+# Weekends, market holidays, and ordinary provider lag can leave a short price tail.  A
+# longer gap is surfaced for review, but is never treated as proof that the security or an
+# index membership ended.  Only an explicit membership/status source may establish an exit.
+_STALE_PRICE_REVIEW_DAYS = 10
 _EARLIEST_HISTORY_START = "1900-01-01"
 
 
@@ -1496,18 +1802,43 @@ def _resolve_membership_dates(
     list_date = frame.index.min()
     last_date = frame.index.max()
     today = pd.Timestamp(_today_iso())
-    delisted = bool((today - last_date).days > _DELISTING_TOLERANCE_DAYS)
-    entry = max(pd.Timestamp(expected_start), list_date)
+    stale = bool((today - last_date).days > _STALE_PRICE_REVIEW_DAYS)
+    # ``expected_start`` remains part of the request for wire compatibility, but a price
+    # provider is not an authoritative source for either index membership or listing status.
+    # In particular, first price availability may reflect provider coverage rather than an IPO.
+    _ = expected_start
+    first_date = _date_iso(list_date)
+    if stale:
+        return MembershipSyncResult(
+            symbol=clean,
+            status="unverified_stale",
+            # Price history is not authoritative membership data.  In particular, a
+            # transient provider failure, symbol change, or stale feed must never mutate
+            # the user's entry/exit interval.
+            entry=None,
+            exit=None,
+            delisted=False,
+            review_needed=True,
+            first_date=first_date,
+            list_date=first_date,
+            last_date=_date_iso(last_date),
+            note=(
+                "Price history ends well before today. Membership was left unchanged; "
+                "confirm any exit with authoritative constituent or exchange-status data."
+            ),
+        )
     return MembershipSyncResult(
         symbol=clean,
         status="resolved",
-        entry=_date_iso(entry),
-        # Membership intervals are half-open [entry, exit), so the day after the final
-        # observation is the earliest exit that retains the symbol's last trading date.
-        exit=_next_day_iso(last_date) if delisted else None,
-        delisted=delisted,
-        list_date=_date_iso(list_date),
+        entry=None,
+        exit=None,
+        delisted=False,
+        first_date=first_date,
+        list_date=first_date,
         last_date=_date_iso(last_date),
+        note=(
+            "Observed price coverage only. Membership entry and exit were left unchanged."
+        ),
     )
 
 
@@ -1595,41 +1926,143 @@ def _universe_to_spec(universe: Universe) -> dict[str, Any]:
 
 
 def _persist_universe(spec: UniverseSpec) -> Universe:
-    if bundled_snapshot_name(spec.name) == spec.name:
-        raise HTTPException(
-            status_code=400,
-            detail="bundled snapshot universe ids are reserved and immutable",
-        )
-    try:
-        universe = _universe_from_spec(spec)
-        universe.save()
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _universes[spec.name] = universe
-    return universe
+    with _universe_lifecycle_lock:
+        if bundled_snapshot_name(spec.name) == spec.name:
+            raise HTTPException(
+                status_code=400,
+                detail="bundled snapshot universe ids are reserved and immutable",
+            )
+        try:
+            universe = _universe_from_spec(spec)
+            universe.save()
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _universes[spec.name] = universe
+        return universe
+
+
+def _migrate_reserved_default_universe() -> None:
+    """Move a legacy user ``sp500-lite`` file away from the now-reserved sample id.
+
+    Older releases allowed a persisted custom file to shadow the bundled demonstration
+    universe. Preserve that file byte-for-byte under the first free legacy id. A move makes
+    the migration idempotent: subsequent loads see no reserved source and create no duplicate.
+    """
+    with _universe_lifecycle_lock:
+        universe_dir = paths.universe_dir()
+        source = universe_dir / f"{_DEFAULT_UNIVERSE}.parquet"
+        # The reserved id must never survive in memory, including when an app process is upgraded
+        # in place after an older version already loaded the custom file.
+        _universes.pop(_DEFAULT_UNIVERSE, None)
+        if not source.exists():
+            return
+
+        stem = f"{_DEFAULT_UNIVERSE}-legacy"
+
+        def heal_linked_destinations() -> bool:
+            """Finish or de-duplicate an interrupted/concurrent hard-link move."""
+            linked: list[Path] = []
+            for candidate in universe_dir.glob(f"{stem}*.parquet"):
+                try:
+                    if source.samefile(candidate):
+                        linked.append(candidate)
+                except OSError:
+                    continue
+            if not linked:
+                return False
+
+            def destination_order(candidate: Path) -> tuple[int, int, str]:
+                if candidate.stem == stem:
+                    return (0, 0, candidate.name)
+                suffix_text = candidate.stem.removeprefix(f"{stem}-")
+                return (
+                    1,
+                    int(suffix_text) if suffix_text.isdigit() else 2**31 - 1,
+                    candidate.name,
+                )
+
+            linked.sort(key=destination_order)
+            # Keep the first canonical name. Multiple same-inode destinations can exist if two
+            # processes linked before either removed the source; they contain no distinct data.
+            for duplicate in linked[1:]:
+                try:
+                    duplicate.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return True  # preserve the source so a later load can finish safely
+                _universes.pop(duplicate.stem, None)
+            try:
+                source.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return True
+            _universes.pop(linked[0].stem, None)
+            return True
+
+        if heal_linked_destinations():
+            return
+
+        suffix = 0
+        while True:
+            destination_stem = stem if suffix == 0 else f"{stem}-{suffix}"
+            destination = universe_dir / f"{destination_stem}.parquet"
+            if destination.exists():
+                # A crash after the link but before source cleanup can leave several names for the
+                # same inode. Scan all candidates before advancing so a concurrent migration cannot
+                # turn that state into an additional ``legacy-N`` file.
+                if heal_linked_destinations():
+                    return
+                suffix += 1
+                continue
+            try:
+                # Hard-link creation is atomic and never overwrites an existing destination.
+                # This closes the check/replace race across app processes on the same cache
+                # volume; unlinking the reserved name then completes the move byte-for-byte.
+                os.link(source, destination)
+            except FileExistsError:
+                # Another process may have won this exact hard-link race after our exists()
+                # check. Recheck inode identity before trying a second destination.
+                if heal_linked_destinations():
+                    return
+                suffix += 1
+                continue
+            except OSError:
+                # Preserve the reserved source for a later retry if the filesystem cannot link.
+                return
+            # Centralized healing also handles the unlikely case where another process linked a
+            # second destination between our link and cleanup.
+            heal_linked_destinations()
+            return
 
 
 def _load_persisted_universes() -> None:
-    universe_dir = paths.universe_dir()
-    if not universe_dir.exists():
-        return
-    for source in universe_dir.glob("*.parquet"):
-        if source.stem in _universes:
-            continue
-        try:
-            _universes[source.stem] = Universe.load(source.stem, source)
-        except Exception:
-            continue
+    with _universe_lifecycle_lock:
+        universe_dir = paths.universe_dir()
+        if not universe_dir.exists():
+            _universes.pop(_DEFAULT_UNIVERSE, None)
+            return
+        _migrate_reserved_default_universe()
+        for source in universe_dir.glob("*.parquet"):
+            if source.stem == _DEFAULT_UNIVERSE:
+                continue
+            if source.stem in _universes:
+                continue
+            try:
+                _universes[source.stem] = Universe.load(source.stem, source)
+            except Exception:
+                continue
 
 
 def _resolve_universe(name: str, *, status_code: int = 400) -> Universe:
     """Resolve bundled and custom universes through one non-fallback path."""
     _load_persisted_universes()
-    universe = _universes.get(name)
-    if universe is not None:  # exact user ids take precedence over stable bundled aliases
-        return universe
     if name == _DEFAULT_UNIVERSE:
         return sample_universe(name)
+    universe = _universes.get(name)
+    if universe is not None:
+        return universe
     canonical = bundled_snapshot_name(name)
     if canonical is not None:
         return _universes.get(canonical) or bundled_universe(canonical)
@@ -1692,6 +2125,8 @@ def _cache_coverage_for(
         by_symbol.setdefault(membership.symbol, []).append(membership)
 
     eligible = sorted(by_symbol)
+    active_symbols: list[str] = []
+    exited_symbols: list[str] = []
     cached: list[str] = []
     missing: list[str] = []
     invalid: list[str] = []
@@ -1701,12 +2136,45 @@ def _cache_coverage_for(
     symbol_coverage: dict[str, dict[str, Any]] = {}
 
     for symbol in eligible:
+        symbol_memberships = by_symbol[symbol]
+        if universe.mode == "static_snapshot":
+            required_start_for_symbol = None
+            required_end_for_symbol = cutoff
+            membership_status = "current_snapshot"
+        else:
+            required_start_for_symbol = min(item.entry for item in symbol_memberships)
+            interval_ends = [
+                min(cutoff, item.exit - pd.Timedelta(days=1))
+                if item.exit is not None
+                else cutoff
+                for item in symbol_memberships
+            ]
+            required_end_for_symbol = max(interval_ends)
+            membership_status = (
+                "active"
+                if any(item.exit is None or item.exit > cutoff for item in symbol_memberships)
+                else "exited"
+            )
+        if membership_status == "exited":
+            exited_symbols.append(symbol)
+        else:
+            active_symbols.append(symbol)
+        required = {
+            "required_start": (
+                required_start_for_symbol.date().isoformat()
+                if required_start_for_symbol is not None
+                else None
+            ),
+            "required_end": required_end_for_symbol.date().isoformat(),
+            "membership_status": membership_status,
+        }
         if not store.has(symbol):
             missing.append(symbol)
             symbol_coverage[symbol] = {
                 "first_date": None,
                 "last_date": None,
                 "issues": ["missing cache file"],
+                **required,
             }
             continue
         cached.append(symbol)
@@ -1718,13 +2186,14 @@ def _cache_coverage_for(
                 "first_date": None,
                 "last_date": None,
                 "issues": ["invalid cache file"],
+                **required,
             }
             continue
 
         dates = pd.DatetimeIndex(frame.index)
         dates = dates[dates <= cutoff]
         issues: set[str] = set()
-        for membership in by_symbol[symbol]:
+        for membership in symbol_memberships:
             interval_end = cutoff
             if universe.mode == "static_snapshot":
                 observed = dates[dates <= interval_end]
@@ -1749,18 +2218,41 @@ def _cache_coverage_for(
                 issues.add("history starts after the membership entry")
             if observed.max() < interval_end - _CACHE_EDGE_TOLERANCE:
                 stale.add(symbol)
-                issues.add("history ends before the membership interval")
+                issues.add(
+                    "history ends before the declared membership exit"
+                    if membership.exit is not None and membership.exit <= cutoff
+                    else "history ends before the active membership interval"
+                )
 
         symbol_coverage[symbol] = {
             "first_date": dates.min().date().isoformat() if len(dates) else None,
             "last_date": dates.max().date().isoformat() if len(dates) else None,
             "issues": sorted(issues),
+            **required,
         }
 
     incomplete = sorted(set(missing) | set(invalid) | uncovered | late_start | stale)
+    required_start = (
+        min((membership.entry for membership in memberships), default=None)
+        if universe.mode == "point_in_time"
+        else None
+    )
+    required_end = max(
+        (
+            cutoff
+            if universe.mode == "static_snapshot" or membership.exit is None
+            else min(cutoff, membership.exit - pd.Timedelta(days=1))
+            for membership in memberships
+        ),
+        default=cutoff,
+    )
     return {
         "as_of": cutoff.date().isoformat(),
+        "required_start": required_start.date().isoformat() if required_start is not None else None,
+        "required_end": required_end.date().isoformat(),
         "eligible_symbols": eligible,
+        "active_symbols": sorted(active_symbols),
+        "exited_symbols": sorted(exited_symbols),
         "cached_symbols": sorted(cached),
         "missing_symbols": sorted(missing),
         "invalid_symbols": sorted(invalid),
@@ -2048,6 +2540,7 @@ def _load_seed_factors(
                     [DType(t) for t in spec["arg_types"]],
                     DType(spec["out_type"]),
                     spec["body"],
+                    policy=spec.get("policy"),
                 )
             except (InvalidOperator, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2155,8 +2648,20 @@ def _substitute_formula_args(body: Node, arguments: list[Node]) -> Node:
 
 def _validate_formula_expansion(spec: FormulaSpec) -> None:
     """Apply the same expanded-expression safety ceiling used by tests and training seeds."""
+    arguments: list[Node] = []
+    for item in spec.inputs:
+        input_type = DType(item.type)
+        if input_type in {DType.SERIES, DType.SIGNAL}:
+            arguments.append(Node("close"))
+        elif input_type is DType.BOOL:
+            arguments.append(Node("gt", (Node("close"), Node("close"))))
+        elif input_type is DType.WINDOW:
+            arguments.append(Node("window", value=int(item.default or 1)))
+        else:
+            arguments.append(Node("const", value=float(item.default or 0.0)))
     try:
-        expand_all(tree_from_dict(spec.body))
+        body = _substitute_formula_args(tree_from_dict(spec.body), arguments)
+        expand_all(body)
     except (AttributeError, InvalidOperator, KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid formula expansion: {exc}") from exc
 
@@ -2497,7 +3002,15 @@ def _formula_test_result(
     else:
         scheme = RankProportional()
     costs = TransactionCostModel(req.commission_bps, req.slippage_bps)
-    reported = backtest_report(factor, panel, fwd, scheme, costs, report_dates)
+    reported = backtest_report(
+        factor,
+        panel,
+        fwd,
+        scheme,
+        costs,
+        report_dates,
+        horizon=req.horizon,
+    )
     if cancel.is_set():
         raise TrainingCancelled("formula test stopped")
     # This is research-only reporting, not a locked holdout read; it remains cancellable.
@@ -2853,16 +3366,47 @@ def delete_formula(name: str) -> dict[str, str]:
     return {"removed": normalized}
 
 
+def _normalized_category_order(values: object) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    items = values if isinstance(values, list) else []
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        category = item.strip()
+        if category.casefold() in _RESERVED_LEAF_CATEGORIES:
+            category = category.casefold()
+        if category not in seen:
+            seen.add(category)
+            normalized.append(category)
+    for category in core_categories.DEFAULT_CATEGORY_ORDER:
+        if category not in seen:
+            seen.add(category)
+            normalized.append(category)
+    return normalized
+
+
 def _category_settings() -> dict[str, Any]:
     """The persisted category list + overrides, seeded with defaults when absent."""
+    # Category overrides may target persisted formula runtimes. Register them before sanitizing
+    # so a fresh process does not mistake a valid formula override for an unknown primitive.
+    _load_persisted_formulas()
     stored = paths.read_categories()
-    order = stored.get("order")
-    if not isinstance(order, list) or not order:
-        order = list(core_categories.DEFAULT_CATEGORY_ORDER)
+    order = _normalized_category_order(stored.get("order"))
     overrides = stored.get("overrides")
     if not isinstance(overrides, dict):
         overrides = {}
-    return {"order": order, "overrides": overrides}
+    sanitized = {
+        primitive: category
+        for primitive, category in overrides.items()
+        if _category_override_allowed(primitive, category)
+    }
+    settings = {"order": order, "overrides": sanitized}
+    # One-time migration for legacy workspaces that placed operands in arbitrary groups or put a
+    # calculation under the reserved data/constant headings (the source of duplicate Data groups).
+    if settings != stored:
+        paths.write_categories(settings)
+    return settings
 
 
 @app.get("/categories")
@@ -2874,8 +3418,21 @@ def get_categories() -> dict[str, Any]:
 def put_categories(update: CategoryUpdate) -> dict[str, Any]:
     settings = _category_settings()
     if update.order is not None:
-        settings["order"] = update.order
+        settings["order"] = _normalized_category_order(update.order)
     if update.overrides is not None:
+        invalid = [
+            primitive
+            for primitive, category in update.overrides.items()
+            if not _category_override_allowed(primitive, category)
+        ]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "only calculation operators may be assigned to non-reserved categories: "
+                    + ", ".join(sorted(invalid))
+                ),
+            )
         settings["overrides"] = {**settings["overrides"], **update.overrides}
     # Any category referenced by an override but missing from the order is appended.
     for category in settings["overrides"].values():
@@ -2890,6 +3447,11 @@ def set_primitive_category(primitive: str, update: PrimitiveCategoryUpdate) -> d
     _load_persisted_formulas()
     if primitive not in REGISTRY:
         raise HTTPException(status_code=404, detail="unknown primitive")
+    if not _category_override_allowed(primitive, update.category):
+        raise HTTPException(
+            status_code=400,
+            detail="only calculation operators may be assigned to non-reserved categories",
+        )
     settings = _category_settings()
     settings["overrides"][primitive] = update.category
     if update.category not in settings["order"]:
@@ -3009,19 +3571,20 @@ def update_universe(name: str, spec: UniverseSpec) -> dict[str, Any]:
 def delete_universe(name: str) -> dict[str, str]:
     if name == _DEFAULT_UNIVERSE:
         raise HTTPException(status_code=400, detail="sample universes cannot be deleted")
-    _load_persisted_universes()
-    if name not in _universes and bundled_snapshot_name(name) is not None:
-        raise HTTPException(status_code=400, detail="bundled snapshots cannot be deleted")
-    try:
-        target = child_path(paths.universe_dir(), name, ".parquet", label="universe name")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if name not in _universes and not target.exists():
-        raise HTTPException(status_code=404, detail="unknown universe")
-    _universes.pop(name, None)
-    if target.exists():
-        target.unlink()
-    return {"removed": name}
+    with _universe_lifecycle_lock:
+        _load_persisted_universes()
+        if name not in _universes and bundled_snapshot_name(name) is not None:
+            raise HTTPException(status_code=400, detail="bundled snapshots cannot be deleted")
+        try:
+            target = child_path(paths.universe_dir(), name, ".parquet", label="universe name")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if name not in _universes and not target.exists():
+            raise HTTPException(status_code=404, detail="unknown universe")
+        _universes.pop(name, None)
+        if target.exists():
+            target.unlink()
+        return {"removed": name}
 
 
 @app.get("/workspaces", response_model=list[WorkspaceSummary])
@@ -3419,6 +3982,113 @@ def update_settings(update: SettingsUpdate) -> dict[str, Any]:
 
 
 # --- local data usage + cleanup --------------------------------------------------
+def _benchmark_definition(benchmark_id: str) -> dict[str, str]:
+    for item in _BENCHMARK_CATALOG:
+        if item["id"] == benchmark_id:
+            return item
+    raise HTTPException(status_code=404, detail="unknown benchmark")
+
+
+def _benchmark_series_payload(
+    benchmark: dict[str, str],
+    start: str,
+    end: str,
+) -> dict[str, Any]:
+    """Read a split-adjusted price-return benchmark without provider traffic.
+
+    Cash dividends are deliberately excluded; only split normalization is applied before the
+    cached close series is rebased to one.
+    """
+    symbol = benchmark["symbol"]
+    cache = ParquetCache()
+    coverage = _coverage_for_symbol(symbol, start, end, cache=cache)
+    payload: dict[str, Any] = {
+        **benchmark,
+        "return_type": "price_return",
+        "requested_start": start,
+        "requested_end": end,
+        "coverage": _model_dump(coverage),
+        "status": "needs_sync",
+        "message": "No cached benchmark prices cover this holdout.",
+        "normalized_equity": [],
+        "sync_request": {
+            "symbols": [symbol],
+            "start": start,
+            # yfinance treats ``end`` as exclusive; the extra day is harmless for inclusive
+            # providers and ensures the final holdout session can actually be cached.
+            "end": _next_day_iso(end),
+            "mode": "incremental",
+        },
+    }
+    if not coverage.cached:
+        return payload
+
+    frame = cache.load(symbol)
+    prices = split_adjusted_close(frame).loc[pd.Timestamp(start) : pd.Timestamp(end)]
+    prices = prices.replace([np.inf, -np.inf], np.nan).dropna()
+    prices = prices[prices > 0.0]
+    if prices.empty:
+        payload["message"] = "Cached prices contain no usable observations in this holdout."
+        return payload
+
+    # The requested end can be a weekend even though the last possible observation is Friday.
+    # Use the observed trading-date boundary instead of repeatedly requesting impossible rows.
+    observed_start = pd.Timestamp(prices.index.min()).normalize()
+    observed_end = pd.Timestamp(prices.index.max()).normalize()
+    required_end = pd.Timestamp(end)
+    while required_end.weekday() >= 5:
+        required_end -= pd.Timedelta(days=1)
+    edge_complete = (
+        observed_start <= pd.Timestamp(start)
+        and observed_end >= required_end
+    )
+    payload["coverage"]["needs_sync"] = not edge_complete
+    base = float(prices.iloc[0])
+    payload["normalized_equity"] = [
+        {
+            "date": pd.Timestamp(date).date().isoformat(),
+            "value": float(value) / base,
+        }
+        for date, value in prices.items()
+    ]
+    if not edge_complete:
+        payload["status"] = "partial"
+        payload["message"] = (
+            "Cached benchmark history is partial for this holdout. "
+            "The visible overlap is labelled and can be completed with Sync data."
+        )
+    else:
+        payload["status"] = "ready"
+        payload["message"] = None
+    return payload
+
+
+@app.get("/benchmarks")
+def list_benchmarks() -> list[dict[str, str]]:
+    """List supported comparison indices; this never downloads market data."""
+    return [{**item, "return_type": "price_return"} for item in _BENCHMARK_CATALOG]
+
+
+@app.get("/benchmarks/{benchmark_id}/series")
+def get_benchmark_series(
+    benchmark_id: str,
+    start: str,
+    end: str,
+) -> dict[str, Any]:
+    """Return cached split-adjusted price levels rebased to one over the holdout.
+
+    The series excludes cash dividends and therefore is a price-return, not total-return,
+    comparison.
+    """
+    clean_start, clean_end = _request_date_range(start, end)
+    assert clean_start is not None and clean_end is not None
+    return _benchmark_series_payload(
+        _benchmark_definition(benchmark_id),
+        clean_start,
+        clean_end,
+    )
+
+
 @app.get("/symbols/search", response_model=list[SymbolCandidate])
 def search_symbols(query: str, limit: int = 8) -> list[SymbolCandidate]:
     try:
@@ -3450,19 +4120,24 @@ def data_coverage(
 
 
 @app.post("/data/sync")
-def data_sync(req: DataSyncRequest) -> dict[str, str]:
+def data_sync(req: DataSyncRequest) -> dict[str, Any]:
     mode = req.mode.lower()
     if mode not in _SYNC_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_SYNC_MODES)}")
     start, end = _request_date_range(req.start, req.end)
     assert start is not None
     symbols = set(_market_symbols(req.symbols))
+    aliases: dict[str, str] = {}
     universe_pin = None
     resolved_universe = None
     if req.universe:
         universe = _resolve_universe(req.universe)
         resolved_universe = universe.name
         universe_pin = _universe_definition_pin(req.universe)
+        aliases = {
+            normalize_market_symbol(source): normalize_market_symbol(provider)
+            for source, provider in universe.aliases.items()
+        }
         if universe.mode == "static_snapshot":
             symbols.update(universe.all_symbols())
         else:
@@ -3478,6 +4153,7 @@ def data_sync(req: DataSyncRequest) -> dict[str, str]:
         start=start,
         end=end,
         mode=mode,
+        aliases={symbol: aliases.get(symbol, symbol) for symbol in sorted(symbols)},
     )
     progress = SyncProgress(total=len(symbols))
     cancel = threading.Event()
@@ -3492,13 +4168,25 @@ def data_sync(req: DataSyncRequest) -> dict[str, str]:
         "request": _model_dump(request),
         "universe_definition": universe_pin,
     }
-    job_id = _data_jobs.submit(
-        task,
-        progress=progress,
-        metadata=metadata,
-        cancel=cancel,
-    )
-    return {"job_id": job_id, "status": "queued"}
+    # Repeated clicks/navigation re-entry should attach to the same immutable request instead of
+    # launching duplicate provider traffic. The lock closes the check/submit race between clients.
+    with _data_sync_submit_lock:
+        for job in reversed(_data_jobs.list()):
+            if (
+                job.metadata.get("kind") == "data_sync"
+                and job.status in {"queued", "running"}
+                and not job.cancel.is_set()
+                and job.metadata.get("request") == metadata["request"]
+                and job.metadata.get("universe_definition") == universe_pin
+            ):
+                return {"job_id": job.id, "status": job.status, "reused": True}
+        job_id = _data_jobs.submit(
+            task,
+            progress=progress,
+            metadata=metadata,
+            cancel=cancel,
+        )
+    return {"job_id": job_id, "status": "queued", "reused": False}
 
 
 def _data_sync_job_payload(job: Any) -> dict[str, Any]:
@@ -3655,6 +4343,11 @@ def create_session(
     _validate_seeds(seeds, config)
 
     formula_revisions = _active_formula_operator_specs()
+    allowed = _allowed_operators(
+        config,
+        {str(item["name"]) for item in formula_revisions},
+        {spec.name for spec in req.operators},
+    )
     session = sessions.new_session(
         name=name,
         universe=str(universe_definition["name"]),
@@ -3671,11 +4364,6 @@ def create_session(
         resources=requested_resources.to_dict(),
     )
     session_id = session["id"]
-    allowed = _allowed_operators(
-        config,
-        {str(item["name"]) for item in formula_revisions},
-        {spec.name for spec in req.operators},
-    )
     progress = RunProgress(
         target_generations=config.generations,
         resources=resources.to_dict(),
@@ -3785,7 +4473,11 @@ def continue_session(
     for spec in req.operators:  # newly added operators for this segment
         try:
             ensure_operator(
-                spec.name, [DType(t) for t in spec.arg_types], DType(spec.out_type), spec.body
+                spec.name,
+                [DType(t) for t in spec.arg_types],
+                DType(spec.out_type),
+                spec.body,
+                policy=spec.policy,
             )
         except (InvalidOperator, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3797,6 +4489,7 @@ def continue_session(
                 [DType(t) for t in stored["arg_types"]],
                 DType(stored["out_type"]),
                 stored["body"],
+                policy=stored.get("policy"),
             )
         except (InvalidOperator, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3808,6 +4501,7 @@ def continue_session(
                 [DType(t) for t in stored["arg_types"]],
                 DType(stored["out_type"]),
                 stored["body"],
+                policy=_formula_policy(FormulaSpec(**stored)),
             )
         except (InvalidOperator, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3831,6 +4525,15 @@ def continue_session(
     extra_seeds, _, _ = _load_seed_factors(req.seed_factor_ids)
     _validate_seeds(extra_seeds, config)
 
+    effective_operator_names = {
+        str(item["name"]) for item in session.get("operators", [])
+    } | {spec.name for spec in req.operators}
+    allowed = _allowed_operators(
+        config,
+        {str(item["name"]) for item in pinned_formulas},
+        effective_operator_names,
+    )
+
     job_id = uuid.uuid4().hex
     if not sessions.claim_job(session_id, job_id):
         raise HTTPException(status_code=409, detail="a segment is already running")
@@ -3848,14 +4551,6 @@ def continue_session(
     session["resources"] = requested_resources.to_dict()
     sessions.save_session(session)
 
-    allowed = _allowed_operators(
-        config,
-        {str(item["name"]) for item in pinned_formulas},
-        {
-            str(item["name"])
-            for item in [*session.get("operators", []), *[_model_dump(s) for s in req.operators]]
-        },
-    )
     progress = RunProgress(
         target_generations=config.generations,
         resources=resources.to_dict(),

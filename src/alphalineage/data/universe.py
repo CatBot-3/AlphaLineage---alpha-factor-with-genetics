@@ -2,7 +2,7 @@
 
 A universe is a set of membership intervals ``[entry, exit)`` per symbol. Querying
 ``members_asof(date)`` returns only symbols whose interval contains ``date`` - so a
-symbol that entered the index later, or was delisted earlier, is correctly excluded.
+symbol that entered the index later, or left the selected universe earlier, is excluded.
 This is what prevents survivorship and look-ahead bias at the universe level.
 """
 
@@ -57,7 +57,7 @@ def _definition_fingerprint(
 
 @dataclass(frozen=True)
 class Membership:
-    """One symbol's point-in-time membership interval; ``exit is None`` means active."""
+    """One symbol's point-in-time interval; ``exit is None`` means membership is open."""
 
     symbol: str
     entry: pd.Timestamp
@@ -219,8 +219,16 @@ class Universe:
     def active(self) -> list[Membership]:
         return [m for m in self.memberships if m.is_active]
 
-    def delisted(self) -> list[Membership]:
+    def exited(self) -> list[Membership]:
+        """Membership intervals with a declared exit.
+
+        An index-membership exit does not by itself mean that the security was delisted.
+        """
         return [m for m in self.memberships if not m.is_active]
+
+    def delisted(self) -> list[Membership]:
+        """Deprecated alias for :meth:`exited`; no security-status inference is performed."""
+        return self.exited()
 
     # --- persistence -------------------------------------------------------------
     def to_frame(self) -> pd.DataFrame:
@@ -353,21 +361,27 @@ def bundled_universe(name: str) -> Universe:
 
 
 # --- sample data -----------------------------------------------------------------
-# TODO(human): real, survivorship-bias-free index constituent history requires a paid
-# data source (e.g. CRSP / index vendor). This small hand-built sample exists only so
-# the point-in-time logic and survivorship report are exercisable without that data.
-# It deliberately includes a delisted name (LEH) so the audit report is non-trivial.
+# This is a deliberately small *current* demonstration basket, not historical index
+# membership.  The stable ``sp500-lite`` id is retained for existing workspaces, but the
+# definition and UI describe what it actually is.  Every name was present in the bundled
+# 2026-07-15 S&P 500 snapshot; no exit date is inferred from price availability.
 _SAMPLE_UNIVERSES: dict[str, list[tuple[str, str, str | None]]] = {
     "sp500-lite": [
-        ("AAPL", "2000-01-03", None),
-        ("MSFT", "2000-01-03", None),
-        ("AMZN", "2000-01-03", None),
-        ("JPM", "2000-01-03", None),
-        ("XOM", "2000-01-03", None),
-        ("NVDA", "2000-01-03", None),
-        ("GOOGL", "2004-08-19", None),  # entered at IPO, not earlier
-        ("META", "2012-05-18", None),  # entered at IPO, not earlier
-        ("LEH", "2000-01-03", "2008-09-15"),  # delisted (bankruptcy)
+        ("AAPL", "2026-07-15", None),
+        ("MSFT", "2026-07-15", None),
+        ("NVDA", "2026-07-15", None),
+        ("AMZN", "2026-07-15", None),
+        ("GOOGL", "2026-07-15", None),
+        ("META", "2026-07-15", None),
+        ("AVGO", "2026-07-15", None),
+        ("TSLA", "2026-07-15", None),
+        ("JPM", "2026-07-15", None),
+        ("BRK.B", "2026-07-15", None),
+        ("V", "2026-07-15", None),
+        ("WMT", "2026-07-15", None),
+        ("XOM", "2026-07-15", None),
+        ("JNJ", "2026-07-15", None),
+        ("COST", "2026-07-15", None),
     ],
 }
 
@@ -375,21 +389,20 @@ _SAMPLE_UNIVERSES: dict[str, list[tuple[str, str, str | None]]] = {
 _PRESET_CATALOG: tuple[dict[str, Any], ...] = (
     {
         "id": "sp500-lite",
-        "display_name": "S&P 500 illustrative sample",
-        "benchmark": "S&P 500",
+        "display_name": "Popular US stocks sample",
+        "benchmark": "US large-cap demonstration basket",
         "status": "bundled_sample",
         "available": True,
         "snapshot_available": True,
         "snapshot_universe": "sp500-lite",
         "pit_import_name": "sp500-lite-pit",
-        "mode": "point_in_time",
-        "membership_history": "illustrative",
-        "coverage": "Nine hand-curated symbols; not the complete index",
+        "mode": "static_snapshot",
+        "membership_history": "static_snapshot",
+        "coverage": "15 recognizable, liquid US stocks in a dated offline sample",
         "research_ready": False,
-        "provenance": "Bundled AlphaLineage demonstration data",
+        "provenance": "Selected from the bundled 2026-07-15 S&P 500 snapshot",
         "warning": (
-            "This sample exercises point-in-time masking but is not authoritative "
-            "S&P 500 constituent history."
+            "This is a current demonstration basket, not historical index membership."
         ),
     },
     {
@@ -481,7 +494,7 @@ def universe_integrity(name: str, *, source: str) -> dict[str, Any]:
 
 
 def sample_universe(name: str = "sp500-lite") -> Universe:
-    """Return a small hand-built sample universe (prototype data only)."""
+    """Return the small bundled current-stock demonstration basket."""
     try:
         rows = _SAMPLE_UNIVERSES[name]
     except KeyError as exc:
@@ -493,17 +506,31 @@ def sample_universe(name: str = "sp500-lite") -> Universe:
     return Universe(
         name,
         memberships,
-        mode="point_in_time",
+        mode="static_snapshot",
         definition={
             "id": name,
-            "display_name": "S&P 500 illustrative sample",
-            "interval_semantics": "illustrative dated half-open [entry, exit) intervals",
+            "display_name": "Popular US stocks sample",
+            "snapshot_date": "2026-07-15",
+            "interval_semantics": (
+                "fixed 15-stock demonstration basket captured on snapshot_date and applied "
+                "unchanged to historical rows"
+            ),
             "member_count": len({membership.symbol for membership in memberships}),
+            "benchmark": "US large-cap demonstration basket",
         },
         provenance={
-            "provider": "AlphaLineage",
-            "source_url": None,
-            "retrieved_at": None,
-            "note": "Hand-curated demonstration memberships; not an index constituent history.",
+            "provider": "Wikipedia: List of S&P 500 companies",
+            "source_url": (
+                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            ),
+            "retrieved_at": "2026-07-15",
+            "attribution": "Wikipedia contributors",
+            "license": "CC BY-SA 4.0",
+            "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+            "terms_url": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+            "note": (
+                "Selected from the bundled dated S&P 500 constituent asset; current-stock "
+                "sample only, not point-in-time index history."
+            ),
         },
     )

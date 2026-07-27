@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FormulaDraft } from "../api/types";
@@ -80,9 +80,45 @@ function setup() {
   putCategories.mockResolvedValue({ order: ["data", "time_series", "custom"], overrides: {} });
 }
 
+function controlledResizeObserver() {
+  const observers: Array<{ callback: ResizeObserverCallback; targets: Set<Element>; instance: ResizeObserver }> = [];
+  class ControlledResizeObserver {
+    private readonly record: (typeof observers)[number];
+    constructor(next: ResizeObserverCallback) {
+      this.record = {
+        callback: next,
+        targets: new Set(),
+        instance: this as unknown as ResizeObserver,
+      };
+      observers.push(this.record);
+    }
+    observe(target: Element): void {
+      this.record.targets.add(target);
+    }
+    unobserve(target: Element): void {
+      this.record.targets.delete(target);
+    }
+    disconnect(): void {
+      this.record.targets.clear();
+    }
+  }
+  vi.stubGlobal("ResizeObserver", ControlledResizeObserver);
+  return (target: Element, width: number) => {
+    const observer = observers.find((candidate) => candidate.targets.has(target));
+    if (!observer) throw new Error("ResizeObserver was not initialized for the target.");
+    const entry = {
+      target,
+      contentRect: { width } as DOMRectReadOnly,
+    } as ResizeObserverEntry;
+    act(() => observer.callback([entry], observer.instance));
+  };
+}
+
 afterEach(() => {
+  window.sessionStorage.clear();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("FormulaEditorPage", () => {
@@ -93,6 +129,246 @@ describe("FormulaEditorPage", () => {
     expect(within(library).getByText("Moving average")).toBeInTheDocument();
     expect(within(library).getByText("Trailing arithmetic mean over a lookback window.")).toBeInTheDocument();
     expect(within(library).queryByLabelText("category-ts_mean")).not.toBeInTheDocument();
+  });
+
+  it("resizes, snap-collapses, and drags the building-block panel open from the workspace edge", async () => {
+    setup();
+    render(<FormulaEditorPage />);
+    const grid = screen.getByTestId("formula-editor-page").querySelector<HTMLElement>(".formula-workspace__grid")!;
+    const handle = screen.getByRole("separator", { name: "Resize building blocks panel" });
+
+    expect(screen.queryByRole("button", { name: /building blocks/i })).not.toBeInTheDocument();
+    expect(handle).toHaveAttribute("aria-valuenow", "300");
+    expect(grid.style.getPropertyValue("--formula-library-width")).toBe("300px");
+
+    fireEvent(handle, new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 300 }));
+    fireEvent(window, new MouseEvent("pointermove", { bubbles: true, clientX: 360 }));
+    fireEvent(window, new MouseEvent("pointerup", { bubbles: true, clientX: 360 }));
+    await waitFor(() => expect(handle).toHaveAttribute("aria-valuenow", "360"));
+    expect(grid.style.getPropertyValue("--formula-library-width")).toBe("360px");
+
+    fireEvent(handle, new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 360 }));
+    fireEvent(window, new MouseEvent("pointermove", { bubbles: true, clientX: 0 }));
+    fireEvent(window, new MouseEvent("pointerup", { bubbles: true, clientX: 0 }));
+    await waitFor(() => expect(handle).toHaveAttribute("aria-valuetext", "Collapsed"));
+    expect(grid).toHaveClass("is-library-collapsed");
+    expect(grid.style.getPropertyValue("--formula-library-width")).toBe("0px");
+
+    fireEvent(handle, new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }));
+    fireEvent(window, new MouseEvent("pointermove", { bubbles: true, clientX: 100 }));
+    fireEvent(window, new MouseEvent("pointerup", { bubbles: true, clientX: 100 }));
+    await waitFor(() => expect(handle).toHaveAttribute("aria-valuenow", "292"));
+    expect(grid).not.toHaveClass("is-library-collapsed");
+    expect(grid.style.getPropertyValue("--formula-library-width")).toBe("292px");
+  });
+
+  it("supports keyboard resizing and restores the session panel layout", async () => {
+    setup();
+    const first = render(<FormulaEditorPage />);
+    await screen.findByText("Moving average");
+    const handle = screen.getByRole("separator", { name: "Resize inspector panel" });
+
+    expect(handle).toHaveAttribute("aria-valuenow", "320");
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(handle).toHaveAttribute("aria-valuenow", "340");
+    fireEvent.keyDown(handle, { key: "Home" });
+    expect(handle).toHaveAttribute("aria-valuetext", "Collapsed");
+    fireEvent.keyDown(handle, { key: "Enter" });
+    expect(handle).toHaveAttribute("aria-valuenow", "340");
+
+    first.unmount();
+    render(<FormulaEditorPage />);
+    await screen.findByText("Moving average");
+    expect(screen.getByRole("separator", { name: "Resize inspector panel" })).toHaveAttribute("aria-valuenow", "340");
+  });
+
+  it("fits restored panel preferences to the container and restores them when space returns", async () => {
+    setup();
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(1440);
+    const resize = controlledResizeObserver();
+    window.sessionStorage.setItem("alphalineage.formula-builder.panel-layout.v1", JSON.stringify({
+      libraryWidth: 440,
+      inspectorWidth: 480,
+      libraryCollapsed: false,
+      inspectorCollapsed: false,
+    }));
+
+    render(<FormulaEditorPage />);
+    const grid = screen.getByTestId("formula-editor-page").querySelector<HTMLElement>(".formula-workspace__grid")!;
+    const libraryHandle = screen.getByRole("separator", { name: "Resize building blocks panel" });
+    const inspectorHandle = screen.getByRole("separator", { name: "Resize inspector panel" });
+
+    resize(grid, 1000);
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuenow", "270");
+      expect(inspectorHandle).toHaveAttribute("aria-valuenow", "293");
+    });
+    expect(1000 - 16 - 270 - 293).toBeGreaterThanOrEqual(420);
+    expect(JSON.parse(window.sessionStorage.getItem("alphalineage.formula-builder.panel-layout.v1")!)).toMatchObject({
+      libraryWidth: 440,
+      inspectorWidth: 480,
+      libraryCollapsed: false,
+      inspectorCollapsed: false,
+    });
+
+    resize(grid, 900);
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuenow", "240");
+      expect(inspectorHandle).toHaveAttribute("aria-valuetext", "Collapsed");
+    });
+    expect(grid).not.toHaveClass("is-library-collapsed");
+    expect(grid).toHaveClass("is-inspector-collapsed");
+
+    resize(grid, 650);
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuetext", "Collapsed");
+      expect(inspectorHandle).toHaveAttribute("aria-valuetext", "Collapsed");
+    });
+
+    resize(grid, 1400);
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuenow", "440");
+      expect(inspectorHandle).toHaveAttribute("aria-valuenow", "480");
+    });
+    expect(grid).not.toHaveClass("is-library-collapsed");
+    expect(grid).not.toHaveClass("is-inspector-collapsed");
+  });
+
+  it("prioritizes a clicked inspector at 900px and restores both preferred panels at 1400px", async () => {
+    setup();
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(1440);
+    const resize = controlledResizeObserver();
+
+    render(<FormulaEditorPage />);
+    const grid = screen.getByTestId("formula-editor-page")
+      .querySelector<HTMLElement>(".formula-workspace__grid")!;
+    const library = await screen.findByTestId("formula-library");
+    const libraryHandle = screen.getByRole("separator", { name: "Resize building blocks panel" });
+    const inspectorHandle = screen.getByRole("separator", { name: "Resize inspector panel" });
+
+    resize(grid, 900);
+    await waitFor(() => expect(inspectorHandle).toHaveAttribute("aria-valuetext", "Collapsed"));
+    const marketData = within(library).getByText("Market Data").closest("details")!;
+    fireEvent.click(within(marketData).getByText("Market Data"));
+    fireEvent.click(within(library).getByRole("button", { name: "Inspect Close" }));
+
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuetext", "Collapsed");
+      expect(inspectorHandle).toHaveAttribute("aria-valuenow", "320");
+    });
+    expect(within(screen.getByTestId("formula-inspector")).getByRole("heading", { name: "Close" }))
+      .toBeInTheDocument();
+
+    resize(grid, 1400);
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuenow", "300");
+      expect(inspectorHandle).toHaveAttribute("aria-valuenow", "320");
+    });
+  });
+
+  it("reopens the constrained inspector by dragging its workspace edge", async () => {
+    setup();
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(1440);
+    const resize = controlledResizeObserver();
+
+    render(<FormulaEditorPage />);
+    const grid = screen.getByTestId("formula-editor-page")
+      .querySelector<HTMLElement>(".formula-workspace__grid")!;
+    const libraryHandle = screen.getByRole("separator", { name: "Resize building blocks panel" });
+    const inspectorHandle = screen.getByRole("separator", { name: "Resize inspector panel" });
+
+    resize(grid, 900);
+    await waitFor(() => expect(inspectorHandle).toHaveAttribute("aria-valuetext", "Collapsed"));
+    fireEvent(
+      inspectorHandle,
+      new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 900 }),
+    );
+    fireEvent(window, new MouseEvent("pointermove", { bubbles: true, clientX: 800 }));
+    fireEvent(window, new MouseEvent("pointerup", { bubbles: true, clientX: 800 }));
+
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuetext", "Collapsed");
+      expect(inspectorHandle).toHaveAttribute("aria-valuenow", "312");
+    });
+
+    resize(grid, 1400);
+    await waitFor(() => {
+      expect(libraryHandle).toHaveAttribute("aria-valuenow", "300");
+      expect(inspectorHandle).toHaveAttribute("aria-valuenow", "312");
+    });
+  });
+
+  it("leaves tablet panel sizing to the responsive pane layout", () => {
+    setup();
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(1000);
+    const resize = controlledResizeObserver();
+    window.sessionStorage.setItem("alphalineage.formula-builder.panel-layout.v1", JSON.stringify({
+      libraryWidth: 440,
+      inspectorWidth: 480,
+      libraryCollapsed: false,
+      inspectorCollapsed: false,
+    }));
+
+    render(<FormulaEditorPage />);
+    const grid = screen.getByTestId("formula-editor-page").querySelector<HTMLElement>(".formula-workspace__grid")!;
+    resize(grid, 650);
+
+    expect(screen.getByRole("separator", { name: "Resize building blocks panel" })).toHaveAttribute("aria-valuenow", "440");
+    expect(screen.getByRole("separator", { name: "Resize inspector panel" })).toHaveAttribute("aria-valuenow", "480");
+    expect(grid).not.toHaveClass("is-library-collapsed");
+    expect(grid).not.toHaveClass("is-inspector-collapsed");
+  });
+
+  it("starts every palette section collapsed and restores manual state after search", async () => {
+    setup();
+    render(<FormulaEditorPage />);
+    const library = await screen.findByTestId("formula-library");
+    await waitFor(() => expect(within(library).getByText("Time Series")).toBeInTheDocument());
+
+    expect([...library.querySelectorAll("details")]).toHaveLength(4);
+    expect([...library.querySelectorAll("details")].every((details) => !details.open)).toBe(true);
+    expect(within(library).getAllByText("Market Data")).toHaveLength(1);
+
+    const timeSeries = within(library).getByText("Time Series").closest("details")!;
+    fireEvent.click(within(timeSeries).getByText("Time Series"));
+    await waitFor(() => expect(timeSeries.open).toBe(true));
+
+    const search = within(library).getByPlaceholderText("Search functions and fields");
+    fireEvent.change(search, { target: { value: "close" } });
+    const marketData = within(library).getByText("Market Data").closest("details")!;
+    expect(marketData.open).toBe(true);
+    expect(within(library).queryByText("Time Series")).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "" } });
+    await waitFor(() => expect(within(library).getByText("Time Series").closest("details")).toHaveProperty("open", true));
+    expect(within(library).getByText("Market Data").closest("details")).toHaveProperty("open", false);
+  });
+
+  it("uses card clicks for inspection and adds from the inspector", async () => {
+    setup();
+    const { container } = render(<FormulaEditorPage />);
+    const library = await screen.findByTestId("formula-library");
+    fireEvent.click(within(library).getByRole("button", { name: "Inspect Moving average", hidden: true }));
+
+    expect(container.querySelectorAll(".formula-block--function")).toHaveLength(0);
+    expect(within(library).queryByRole("button", { name: "Inspect" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add to formula" }));
+    expect(container.querySelectorAll(".formula-block--function")).toHaveLength(1);
+  });
+
+  it("keeps legacy data-category operators out of Market Data", async () => {
+    setup();
+    getPrimitives.mockResolvedValue([
+      ...PRIMS,
+      { name: "zscore", display_name: "Cross-sectional z-score", description: "Standardizes each date.", kind: "operator", arg_types: ["series"], inputs: [{ name: "series", type: "series", description: "Series." }], out_type: "signal", user: false, origin: "builtin", category: "data" },
+    ]);
+    render(<FormulaEditorPage />);
+    const library = await screen.findByTestId("formula-library");
+    expect(within(library).getAllByText("Market Data")).toHaveLength(1);
+    expect(within(library).getByText("Cross-sectional z-score").closest("details")?.querySelector("summary")).toHaveTextContent("Other");
+
+    fireEvent.click(within(library).getByRole("button", { name: "Inspect Close", hidden: true }));
+    expect(within(screen.getByTestId("formula-inspector")).queryByLabelText("Category")).not.toBeInTheDocument();
   });
 
   it("uses market data directly in the synchronized expression editor", async () => {
@@ -112,8 +388,9 @@ describe("FormulaEditorPage", () => {
     render(<FormulaEditorPage />);
     const library = await screen.findByTestId("formula-library");
     const item = within(library).getByText("Moving average").closest("article")!;
-    fireEvent.click(within(item).getByRole("button", { name: "Inspect" }));
+    fireEvent.click(within(item).getByRole("button", { name: "Inspect Moving average" }));
     expect(screen.getByText("Series to average.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add to formula" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Use as starting point" }));
     fireEvent.click(screen.getByRole("button", { name: "inspector" }));
     expect(screen.getByDisplayValue("ts_mean_custom")).toBeInTheDocument();
@@ -173,8 +450,8 @@ describe("FormulaEditorPage", () => {
     ]);
     render(<FormulaEditorPage />);
     const library = await screen.findByTestId("formula-library");
-    expect(within(library).getByText("Starter formulas")).toBeInTheDocument();
-    expect(within(library).queryByText("My formulas")).not.toBeInTheDocument();
+    expect(within(library).getByText("Starter Formulas")).toBeInTheDocument();
+    expect(within(library).queryByText("My Formulas")).not.toBeInTheDocument();
 
     fireEvent.change(within(library).getByPlaceholderText("Search functions and fields"), {
       target: { value: "mea" },
@@ -185,12 +462,130 @@ describe("FormulaEditorPage", () => {
       target: { value: "sma" },
     });
     const sma = within(library).getByText("SMA / Simple moving average").closest("article")!;
-    fireEvent.click(within(sma).getByRole("button", { name: "Open as editable copy" }));
+    fireEvent.click(within(sma).getByRole("button", { name: "Open" }));
     fireEvent.click(screen.getByRole("button", { name: "inspector" }));
     expect(screen.getByDisplayValue("sma_copy")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(addFormula).toHaveBeenCalled());
     expect(updateFormula).not.toHaveBeenCalled();
+  });
+
+  it("groups managed indicators stably and opens a concrete literal copy", async () => {
+    setup();
+    getPrimitives.mockResolvedValue([
+      ...PRIMS,
+      { name: "ts_ema", display_name: "Exponential moving average", description: "Trailing EMA.", kind: "operator", arg_types: ["series", "window"], inputs: [{ name: "series", type: "series", description: "Input." }, { name: "lookback", type: "window", description: "Period." }], out_type: "series", user: false, origin: "builtin", category: "time_series" },
+      { name: "sub", display_name: "Subtract", description: "Left minus right.", kind: "operator", arg_types: ["series", "series"], inputs: [{ name: "left", type: "series", description: "Left." }, { name: "right", type: "series", description: "Right." }], out_type: "series", user: false, origin: "builtin", category: "arithmetic" },
+    ]);
+    listFormulas.mockResolvedValue([
+      {
+        name: "ta_macd_histogram",
+        runtime_name: "ta_macd_histogram__r2",
+        display_name: "MACD Histogram",
+        description: "DIF minus DEA using canonical closing prices.",
+        arg_types: ["window", "window"],
+        inputs: [
+          { name: "fast", type: "window", description: "Fast EMA period.", default: 12, role: "parameter", tuning: { enabled: true, min: 8, max: 20, step: 1, radius: 1 } },
+          { name: "slow", type: "window", description: "Slow EMA period.", default: 26, role: "parameter", tuning: { enabled: true, min: 20, max: 40, step: 1, radius: 1 } },
+        ],
+        constraints: [{ left: "fast", operator: "lt", right: "slow" }],
+        out_type: "series",
+        body: {
+          name: "sub",
+          children: [
+            { name: "ts_ema", children: [{ name: "close" }, { name: "$arg", value: 0 }] },
+            { name: "ts_ema", children: [{ name: "close" }, { name: "$arg", value: 1 }] },
+          ],
+        },
+        category: "technical_indicators",
+        origin: "catalog_formula",
+        editable: false,
+        family: "macd",
+        family_order: 3,
+        status: "active",
+        revision: 2,
+        registered: true,
+      },
+      {
+        name: "ta_dif",
+        runtime_name: "ta_dif__r2",
+        display_name: "DIF / MACD Line",
+        description: "Fast EMA minus slow EMA.",
+        arg_types: ["window", "window"],
+        inputs: [
+          { name: "fast", type: "window", description: "Fast EMA period.", default: 12 },
+          { name: "slow", type: "window", description: "Slow EMA period.", default: 26 },
+        ],
+        constraints: [{ left: "fast", operator: "lt", right: "slow" }],
+        out_type: "series",
+        body: { name: "sub", children: [{ name: "close" }, { name: "close" }] },
+        category: "technical_indicators",
+        origin: "catalog_formula",
+        editable: false,
+        family: "macd",
+        family_order: 1,
+        status: "active",
+        revision: 2,
+        registered: true,
+      },
+      {
+        name: "ta_sma",
+        runtime_name: "ta_sma__r2",
+        display_name: "SMA",
+        description: "Simple moving average.",
+        arg_types: ["window"],
+        inputs: [{ name: "lookback", type: "window", description: "Period.", default: 20 }],
+        out_type: "series",
+        body: { name: "ts_mean", children: [{ name: "close" }, { name: "$arg", value: 0 }] },
+        category: "technical_indicators",
+        origin: "catalog_formula",
+        editable: false,
+        family: "moving_averages",
+        family_order: 1,
+        status: "active",
+        revision: 2,
+        registered: true,
+      },
+      {
+        name: "ta_macd_histogram_2x",
+        runtime_name: "ta_macd_histogram_2x",
+        display_name: "MACD Histogram (2x)",
+        description: "Retired.",
+        arg_types: [],
+        inputs: [],
+        out_type: "series",
+        body: { name: "close" },
+        category: "technical_indicators",
+        origin: "catalog_formula",
+        editable: false,
+        family: "macd",
+        status: "retired",
+        replacement: "ta_macd_histogram",
+        revision: 1,
+        registered: true,
+      },
+    ]);
+
+    render(<FormulaEditorPage />);
+    const library = await screen.findByTestId("formula-library");
+    fireEvent.change(within(library).getByPlaceholderText("Search functions and fields"), { target: { value: "macd" } });
+
+    expect(within(library).queryByText("MACD Histogram (2x)")).not.toBeInTheDocument();
+    const macdFamily = within(library).getByText("MACD").closest("details")!;
+    const indicatorNames = [...macdFamily.querySelectorAll("article strong")].map((element) => element.textContent);
+    expect(indicatorNames).toEqual(["DIF / MACD Line", "MACD Histogram"]);
+
+    const macd = within(library).getByRole("button", { name: "Inspect MACD Histogram" });
+    expect(macd).toHaveTextContent("fast 12, slow 26 · fast < slow");
+    fireEvent.click(macd);
+    expect(screen.getByText("Default: 12")).toBeInTheDocument();
+    expect(screen.getByText("Training range: 8–20, step 1, local radius 1")).toBeInTheDocument();
+    expect(screen.getByText("fast < slow")).toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId("formula-inspector")).getByRole("button", { name: "Open" }));
+    fireEvent.click(screen.getByRole("button", { name: "inspector" }));
+    expect(screen.queryByLabelText("Input 1 name")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Expression" }));
+    expect(screen.getByLabelText("Formula expression")).toHaveValue("sub(ts_ema(close, 12), ts_ema(close, 26))");
   });
 
   it("saves a market-data formula without artificial inputs", async () => {
@@ -248,7 +643,7 @@ describe("FormulaEditorPage", () => {
     render(<FormulaEditorPage />);
     const library = await screen.findByTestId("formula-library");
     const item = within(library).getByText("Shared alpha").closest("article")!;
-    fireEvent.click(within(item).getByRole("button", { name: "Edit" }));
+    fireEvent.click(within(item).getByRole("button", { name: "Open" }));
     fireEvent.click(screen.getByRole("tab", { name: "Expression" }));
     fireEvent.change(screen.getByLabelText("Formula expression"), { target: { value: "ts_mean($price, 10)" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -282,8 +677,8 @@ describe("FormulaEditorPage", () => {
     render(<FormulaEditorPage />);
     const library = await screen.findByTestId("formula-library");
     const item = within(library).getByText("Broken alpha").closest("article")!;
-    expect(within(item).getByRole("button", { name: /Broken alpha/ })).toBeDisabled();
-    fireEvent.click(within(item).getByRole("button", { name: "Repair" }));
+    expect(within(item).getByRole("button", { name: "Inspect Broken alpha" })).toBeEnabled();
+    fireEvent.click(within(item).getByRole("button", { name: "Open" }));
     fireEvent.click(screen.getByRole("button", { name: "inspector" }));
     expect(screen.getByDisplayValue("broken_alpha")).toBeInTheDocument();
   });
@@ -326,8 +721,8 @@ describe("FormulaEditorPage", () => {
     render(<FormulaEditorPage />);
     const library = await screen.findByTestId("formula-library");
     const item = within(library).getByText("Momentum Winner 2026").closest("article")!;
-    fireEvent.click(within(item).getByRole("button", { name: "Inspect" }));
-    fireEvent.click(screen.getByRole("button", { name: "Open as editable copy" }));
+    fireEvent.click(within(item).getByRole("button", { name: "Inspect Momentum Winner 2026" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
     fireEvent.click(screen.getByRole("button", { name: "inspector" }));
     expect(screen.getByDisplayValue("momentum_winner_2026_copy")).toBeInTheDocument();
     expect(screen.queryByLabelText("Input 1 name")).not.toBeInTheDocument();

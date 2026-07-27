@@ -61,8 +61,8 @@ describe("FormulaBacktestDrawer", () => {
     render(<FormulaBacktestDrawer open source={SOURCE} inputs={[]} formulas={[]} defaultName="Draft test" onClose={() => undefined} />);
 
     expect(await screen.findByDisplayValue("Sample universe")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("2020-01-02")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("2025-12-31")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("2020-01-02")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("2025-12-31")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Run backtest" }));
 
     await waitFor(() => expect(startFormulaTest).toHaveBeenCalledWith(expect.objectContaining({
@@ -158,6 +158,6 @@ describe("FormulaBacktestDrawer", () => {
     render(<FormulaBacktestDrawer open source={SOURCE} inputs={[]} formulas={[]} defaultName="Draft test" onDataSync={onDataSync} onClose={() => undefined} />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Data Sync" }));
-    expect(onDataSync).toHaveBeenCalledOnce();
+    expect(onDataSync).toHaveBeenCalledWith("sample");
   });
 });

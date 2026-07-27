@@ -7,7 +7,7 @@ from typing import Any
 
 from alphalineage.core import cpp
 from alphalineage.data.universe import bundled_snapshot_specs, bundled_universe
-from alphalineage.library.indicator_catalog import CATALOG_NAMES
+from alphalineage.library.indicator_catalog import ACTIVE_CATALOG_NAMES, CATALOG_NAMES
 
 _EXPECTED_SNAPSHOTS = {
     "builtin-sp500-current": 503,
@@ -20,6 +20,11 @@ def release_smoke() -> dict[str, Any]:
     """Fail fast when a release omits its accelerator or packaged catalogs."""
     if not cpp.available():
         raise RuntimeError(f"native evaluator unavailable: {cpp.unavailable_reason()}")
+    native_abi = cpp.native_abi_version()
+    if native_abi is None or native_abi < 5:
+        raise RuntimeError(
+            f"native evaluator ABI {native_abi!r} lacks the catalog-v2 cumulative kernel"
+        )
 
     specs = {str(item["id"]): item for item in bundled_snapshot_specs()}
     if specs.keys() != _EXPECTED_SNAPSHOTS.keys():
@@ -29,13 +34,18 @@ def release_smoke() -> dict[str, Any]:
     }
     if counts != _EXPECTED_SNAPSHOTS:
         raise RuntimeError(f"bundled universe counts do not match manifest: {counts}")
-    if len(CATALOG_NAMES) != 20:
-        raise RuntimeError(f"expected 20 starter formulas, found {len(CATALOG_NAMES)}")
+    if len(CATALOG_NAMES) != 37 or len(ACTIVE_CATALOG_NAMES) != 36:
+        raise RuntimeError(
+            "expected 37 starter formulas (36 active), found "
+            f"{len(CATALOG_NAMES)} ({len(ACTIVE_CATALOG_NAMES)} active)"
+        )
 
     return {
         "native_evaluator": True,
+        "native_abi": native_abi,
         "bundled_universes": counts,
         "starter_formulas": len(CATALOG_NAMES),
+        "active_starter_formulas": len(ACTIVE_CATALOG_NAMES),
     }
 
 

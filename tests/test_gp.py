@@ -7,6 +7,7 @@ import pytest
 from alphalineage.core.evaluate import evaluate
 from alphalineage.core.fitness import mean_ic
 from alphalineage.core.gp import (
+    EVOLUTION_VERSION,
     GP,
     MAX_GENERATIONS,
     MAX_HORIZON,
@@ -201,7 +202,7 @@ def test_seed_limits_apply_after_user_formula_expansion(signal_panel):
     try:
         compact = Node("expanded_seed_limit_test", (Node("close"),))
         assert compact.size() == 2
-        gp = GP(GPConfig(population_size=6, max_depth=6, max_nodes=3, seed=0), panel)
+        gp = GP(GPConfig(population_size=6, max_depth=6, max_nodes=2, seed=0), panel)
         with pytest.raises(ValueError, match="expanded expression size"):
             gp.initialize([compact])
     finally:
@@ -266,6 +267,62 @@ def test_legacy_macro_checkpoint_rescores_with_expanded_parsimony(signal_panel, 
         unregister_operator(name)
 
 
+def test_legacy_horizon_checkpoint_rescores_against_cumulative_target(signal_panel, tmp_path):
+    import json
+
+    from alphalineage.core.fitness import score_tree
+
+    panel, _ = signal_panel
+    horizon = 3
+    config = GPConfig(
+        population_size=6,
+        generations=1,
+        max_depth=4,
+        max_nodes=12,
+        horizon=horizon,
+        parsimony=0.0,
+        seed=73,
+    )
+    seed = Node("rank", (Node("volume"),))
+    original = GP(config, panel)
+    original.initialize([seed])
+    checkpoint = tmp_path / "legacy-horizon.json"
+    original.save_checkpoint(checkpoint)
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    state["scorer_version"] = SCORER_VERSION - 1
+    state["population"][0]["fitness"] = 123.0
+    checkpoint.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = GP.from_checkpoint(checkpoint, panel)
+    previous_trials = resumed.trial_count
+    assert resumed._requires_rescore
+    resumed.run(generations=resumed.generation)
+
+    cumulative_target = panel["close"].shift(-horizon).div(panel["close"]).sub(1.0)
+    expected = score_tree(
+        seed,
+        panel,
+        cumulative_target,
+        parsimony=config.parsimony,
+        min_names=config.min_names,
+    )
+    legacy_offset_target = panel["returns"].shift(-horizon)
+    legacy = score_tree(
+        seed,
+        panel,
+        legacy_offset_target,
+        parsimony=config.parsimony,
+        min_names=config.min_names,
+    )
+    restored = next(individual for individual in resumed.population if individual.tree == seed)
+
+    assert not resumed._requires_rescore
+    assert resumed.trial_count == previous_trials
+    assert expected[0] != pytest.approx(legacy[0], abs=1e-6)
+    assert restored.fitness == pytest.approx(expected[0], abs=1e-12)
+    assert restored.metrics == pytest.approx(expected[1], abs=1e-12)
+
+
 def test_checkpoint_carries_trial_count(signal_panel, tmp_path):
     panel, _ = signal_panel
     config = GPConfig(population_size=20, generations=3, max_depth=4, max_nodes=20, seed=5)
@@ -287,6 +344,7 @@ def test_checkpoint_carries_trial_count(signal_panel, tmp_path):
 
     saved = json.loads(ckpt.read_text(encoding="utf-8"))
     assert saved["scorer_version"] == SCORER_VERSION
+    assert saved["evolution_version"] == EVOLUTION_VERSION
     assert saved["scorer_backend"] == partial.scorer_backend
 
 

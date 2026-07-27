@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from alphalineage.data.adjust import adjust
+from alphalineage.data.adjust import adjust, adjusted_close, split_adjusted_close
 from alphalineage.data.cache import ParquetCache
 from alphalineage.data.schema import normalize
 from alphalineage.data.survivorship import survivorship_report
@@ -55,6 +55,33 @@ def test_split_continuity():
     # Raw close shows the artificial ~-0.69 split jump; adjusted close does not.
     assert abs(raw_logret.iloc[2]) > 0.6
     assert (adj_logret.abs() < 1e-9).all()
+
+
+def test_split_adjusted_close_excludes_dividends_but_normalizes_splits():
+    """Price-return levels keep ex-dividend drops while removing split discontinuities."""
+    idx = pd.date_range("2025-01-02", periods=4, freq="B")
+    raw = normalize(
+        pd.DataFrame(
+            {
+                "open": [100.0, 90.0, 45.0, 47.0],
+                "high": [100.0, 90.0, 45.0, 47.0],
+                "low": [100.0, 90.0, 45.0, 47.0],
+                "close": [100.0, 90.0, 45.0, 47.0],
+                "volume": np.full(4, 1e6),
+                "div_cash": [0.0, 10.0, 0.0, 0.0],
+                "split_factor": [1.0, 1.0, 2.0, 1.0],
+            },
+            index=idx,
+        )
+    )
+
+    price_levels = split_adjusted_close(raw)
+    total_return_levels = adjusted_close(raw)
+
+    assert price_levels.tolist() == pytest.approx([50.0, 45.0, 45.0, 47.0])
+    assert total_return_levels.tolist() == pytest.approx([45.0, 45.0, 45.0, 47.0])
+    assert price_levels.iloc[1] / price_levels.iloc[0] - 1.0 == pytest.approx(-0.1)
+    assert price_levels.iloc[2] / price_levels.iloc[1] - 1.0 == pytest.approx(0.0)
 
 
 def test_universe_point_in_time():
@@ -111,14 +138,17 @@ def test_universe_normalizes_aware_membership_and_query_dates_to_utc_naive():
 
 
 def test_survivorship_report():
-    """The report enumerates active vs delisted coverage and is non-empty."""
+    """The sample distinguishes membership evidence from security-status claims."""
     universe = sample_universe("sp500-lite")
     report = survivorship_report(universe)
 
     assert report.strip()
-    assert "active" in report.lower()
-    assert "delisted" in report.lower()
-    assert len(universe.delisted()) >= 1  # sample includes a delisted name
-    # Every delisted symbol is named in the report.
-    for member in universe.delisted():
-        assert member.symbol in report
+    assert "open membership intervals" in report.lower()
+    assert "declared membership exits" in report.lower()
+    assert "does not establish that the security was delisted" in report.lower()
+    assert universe.mode == "static_snapshot"
+    assert len(universe.active()) == 15
+    assert universe.exited() == []
+    assert "LEH" not in universe.all_symbols()
+    assert {"AAPL", "MSFT", "NVDA", "BRK-B", "COST"} <= set(universe.all_symbols())
+    assert "likely survivorship-biased" in report

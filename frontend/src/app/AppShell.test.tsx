@@ -54,6 +54,7 @@ describe("AppShell", () => {
 
     fireEvent.click(extend); // opens the dropdown rather than navigating
     expect(screen.getByTestId("extend-menu")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Sync Data" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Formula Builder" }));
     expect(onSelectExtendPage).toHaveBeenCalledWith("formula");
   });

@@ -173,6 +173,26 @@ def test_session_create_rejects_invalid_fields_synchronously(client, body):
     assert response.status_code == 400
 
 
+def test_invalid_formula_allow_list_does_not_persist_an_orphan_session(client):
+    from alphalineage.data import paths
+
+    response = client.post(
+        "/sessions",
+        json={
+            "name": "invalid allow list",
+            "universe": "sp500-lite",
+            "config": {
+                **_SMALL,
+                "enabled_categories": ["technical_indicators"],
+                "enabled_formula_names": ["not_a_formula"],
+            },
+        },
+    )
+    assert response.status_code == 400
+    root = paths.sessions_dir()
+    assert not root.exists() or not any(root.iterdir())
+
+
 def test_session_request_model_rejects_nonpositive_continue_and_embargo(client):
     assert client.post("/sessions/nope/continue", json={"generations": 0}).status_code == 422
     response = client.post("/sessions", json={"name": "s", "config": _SMALL, "embargo": 0})

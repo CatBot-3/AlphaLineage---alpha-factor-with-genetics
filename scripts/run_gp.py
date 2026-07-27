@@ -20,30 +20,27 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if _SRC.exists() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-import yaml  # noqa: E402
+import yaml  # type: ignore[import-untyped]  # noqa: E402
 
 from alphalineage.api.resources import (  # noqa: E402
     TRAINING_SCHEDULER,
     ResourcePolicy,
     resolve_resources,
 )
+from alphalineage.api.service import build_report  # noqa: E402
 from alphalineage.backtest.costs import TransactionCostModel  # noqa: E402
-from alphalineage.backtest.engine import (  # noqa: E402
-    compare_schemes,
-    comparison_frame,
-    net_return_fn,
-)
-from alphalineage.backtest.portfolio import QuantileLongShort, RankProportional  # noqa: E402
+from alphalineage.backtest.portfolio import QuantileLongShort  # noqa: E402
 from alphalineage.core import cpp  # noqa: E402
-from alphalineage.core.evaluate import evaluate  # noqa: E402
-from alphalineage.core.fitness import forward_returns  # noqa: E402
 from alphalineage.core.gp import GP, GPConfig  # noqa: E402
 from alphalineage.core.panel import Panel  # noqa: E402
 from alphalineage.data.universe import sample_universe  # noqa: E402
-from alphalineage.validation.pipeline import LockedTestSet, judge  # noqa: E402
 from alphalineage.validation.splits import Split, time_split  # noqa: E402
 
 _DISCLAIMER = "Not investment advice. Research output only; signals must survive costs (Phase 4)."
+
+
+def _metric(value: object) -> str:
+    return f"{value:.4f}" if isinstance(value, (int, float)) else "unavailable"
 
 
 def _train_panel(panel: Panel, split: Split) -> Panel:
@@ -159,39 +156,46 @@ def main(argv: list[str] | None = None) -> int:
         commission_bps=float(bt.get("commission_bps", 1.0)),
         slippage_bps=float(bt.get("slippage_bps", 5.0)),
     )
-    schemes = [QuantileLongShort(float(bt.get("quantile", 0.2))), RankProportional()]
-    fwd = forward_returns(panel, gp_config.horizon)
-    best_factor = evaluate(best.tree, panel)
+    scheme = QuantileLongShort(float(bt.get("quantile", 0.2)))
 
     print("\nbest factor:", best.tree)
-    print("\nweighting schemes on the locked test split (net of costs):")
-    results = compare_schemes(best_factor, panel, fwd, schemes, costs, dates=split.test)
-    print(comparison_frame(results).round(4).to_string(index=False))
-
-    # The default scheme drives the deflated verdict; the scheme count deflates it harder.
-    report = judge(
+    # ``build_report`` owns the sole LockedTestSet unlock and reuses that same factor evaluation
+    # for the rich holdout report. Do not inspect or compare the test split before this call.
+    report = build_report(
         best.tree,
         trials,
         split,
         panel,
-        LockedTestSet(split.test),
-        n_trials=gp.trial_count,
-        n_schemes=len(schemes),
-        returns_fn=net_return_fn(panel, fwd, schemes[0], costs),
-        fwd=fwd,
+        searched_trials=gp.trial_count,
         horizon=gp_config.horizon,
         ic_method=gp_config.ic_method,
         min_names=gp_config.min_names,
+        scheme=scheme,
+        costs=costs,
+    )
+    holdout = report.get("oos_backtest") or {}
+    holdout_metrics = holdout.get("metrics") or {}
+    print("\nlocked holdout portfolio (quantile long/short, net of costs):")
+    print(
+        "  "
+        f"net Sharpe={_metric(holdout_metrics.get('net_sharpe'))}  "
+        f"gross Sharpe={_metric(holdout_metrics.get('gross_sharpe'))}  "
+        f"drawdown={_metric(holdout_metrics.get('max_drawdown'))}  "
+        f"turnover={_metric(holdout_metrics.get('turnover'))}"
     )
     print(
-        f"\ntrials searched      = {report.n_trials}  "
-        f"({gp.trial_count} factors x {len(schemes)} schemes)"
+        f"\ntrials searched      = {report['n_trials']}  "
+        f"({gp.trial_count} factor candidates, one pinned scheme)"
     )
-    print(f"train    |rank IC|   = {report.train_ic:.4f}")
-    print(f"OOS test |rank IC|   = {report.oos_ic:.4f}   <- default, honest metric")
-    print(f"net deflated Sharpe  = {report.deflated_sharpe:.4f}   (>0.95 significant)")
-    print(f"PBO (net)            = {report.pbo:.4f}   (>=0.5 overfit red flag)")
-    verdict = "PLAUSIBLE" if report.significant else "NOT SIGNIFICANT (likely overfit / luck)"
+    print(f"train    |rank IC|   = {report['train_ic']:.4f}")
+    print(f"OOS test |rank IC|   = {report['oos_ic']:.4f}   <- default, honest metric")
+    print(f"net deflated Sharpe  = {report['deflated_sharpe']:.4f}   (>0.95 significant)")
+    print(f"PBO (net)            = {report['pbo']:.4f}   (>=0.5 overfit red flag)")
+    verdict = (
+        "PLAUSIBLE"
+        if report["significant"]
+        else "NOT SIGNIFICANT (likely overfit / luck)"
+    )
     print(f"verdict              = {verdict}")
     print("\n" + _DISCLAIMER)
     return 0

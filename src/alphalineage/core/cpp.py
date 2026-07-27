@@ -30,14 +30,14 @@ try:
 except ImportError:  # pragma: no cover - exercised only when unbuilt
     _EXT = None
 
-_NATIVE_ABI_VERSION = 4
+_NATIVE_ABI_VERSIONS = {4, 5}
 _MAX_PLAN_CACHE = 4096
 
 # Opcodes - must match cpp/evaluator.cpp.
 OP_LOAD = 0
 _BINARY = {"add": 1, "sub": 2, "mul": 3, "div": 4}
 _SCALAR = {"mul_scalar": 5, "add_scalar": 6, "signed_power": 7}
-_UNARY = {"log": 8, "abs": 9, "sign": 10, "neg": 11}
+_UNARY = {"log": 8, "abs": 9, "sign": 10, "neg": 11, "ts_cumsum": 38}
 _TS = {
     "ts_mean": 12,
     "ts_std": 13,
@@ -94,11 +94,17 @@ class _CompiledPlan:
         return (*self.arrays, self.root)
 
 
+def _plan_supported_by_loaded_abi(plan: _CompiledPlan) -> bool:
+    """ABI 4 remains valid for old operators; cumulative sum requires ABI 5."""
+    abi = int(getattr(_EXT, "ABI_VERSION", 0)) if _EXT is not None else 0
+    return abi >= 5 or all(instruction[0] != 38 for instruction in plan.instructions)
+
+
 def available() -> bool:
     """True when a compatible compiled evaluator extension is importable."""
     return (
         _EXT is not None
-        and getattr(_EXT, "ABI_VERSION", None) == _NATIVE_ABI_VERSION
+        and getattr(_EXT, "ABI_VERSION", None) in _NATIVE_ABI_VERSIONS
         and hasattr(_EXT, "evaluate_many")
         and hasattr(_EXT, "score_many")
     )
@@ -109,8 +115,9 @@ def unavailable_reason() -> str | None:
     if _EXT is None:
         return "native evaluator extension is not installed"
     abi = getattr(_EXT, "ABI_VERSION", None)
-    if abi != _NATIVE_ABI_VERSION:
-        return f"native evaluator ABI {abi!r} is incompatible (expected {_NATIVE_ABI_VERSION})"
+    if abi not in _NATIVE_ABI_VERSIONS:
+        expected = ", ".join(map(str, sorted(_NATIVE_ABI_VERSIONS)))
+        return f"native evaluator ABI {abi!r} is incompatible (expected one of {expected})"
     if not hasattr(_EXT, "evaluate_many"):
         return "native evaluator does not provide ordered batch evaluation"
     if not hasattr(_EXT, "score_many"):
@@ -123,6 +130,13 @@ def native_max_workers() -> int:
     if not available():
         return 1
     return max(1, int(getattr(_EXT, "MAX_WORKERS", 1)))
+
+
+def native_abi_version() -> int | None:
+    """Loaded evaluator ABI, included in the persisted scorer identity."""
+    if not available():
+        return None
+    return int(_EXT.ABI_VERSION)
 
 
 def supports_native_scoring(method: str) -> bool:
@@ -206,6 +220,7 @@ _OPCODE_NAMES = {opcode: name for name, opcode in CPP_OPCODES.items()}
 @lru_cache(maxsize=_MAX_PLAN_CACHE)
 def _compile_expanded(node: Node) -> _CompiledPlan | None:
     instrs: list[Instruction] = []
+    memo: dict[Node, int] = {}
 
     def emit(
         op: int, a: int = -1, b: int = -1, ival: int = 0, fval: float = 0.0, field: int = -1
@@ -214,24 +229,37 @@ def _compile_expanded(node: Node) -> _CompiledPlan | None:
         return len(instrs) - 1
 
     def visit(n: Node) -> int | None:
+        if n in memo:
+            return memo[n]
         name = n.name
         if name in _FIELD_INDEX:
-            return emit(OP_LOAD, field=_FIELD_INDEX[name])
+            field_result = emit(OP_LOAD, field=_FIELD_INDEX[name])
+            memo[n] = field_result
+            return field_result
         op = CPP_OPCODES.get(name)
         if op is None:
             return None  # unsupported op -> whole-tree fallback
+        result: int | None
         if name in _BINARY:
             a, b = visit(n.children[0]), visit(n.children[1])
-            return None if a is None or b is None else emit(op, a=a, b=b)
-        if name in _SCALAR:
+            result = None if a is None or b is None else emit(op, a=a, b=b)
+        elif name in _SCALAR:
             a = visit(n.children[0])
-            return None if a is None else emit(op, a=a, fval=checked_scalar(n.children[1].value))
-        if name in _TS:
+            result = (
+                None
+                if a is None
+                else emit(op, a=a, fval=checked_scalar(n.children[1].value))
+            )
+        elif name in _TS:
             a = visit(n.children[0])
-            return None if a is None else emit(op, a=a, ival=checked_window(n.children[1].value))
-        if name in _TS_INITIAL:
+            result = (
+                None
+                if a is None
+                else emit(op, a=a, ival=checked_window(n.children[1].value))
+            )
+        elif name in _TS_INITIAL:
             a = visit(n.children[0])
-            return (
+            result = (
                 None
                 if a is None
                 else emit(
@@ -241,26 +269,30 @@ def _compile_expanded(node: Node) -> _CompiledPlan | None:
                     fval=checked_scalar(n.children[2].value),
                 )
             )
-        if name in _BINARY_TS:
+        elif name in _BINARY_TS:
             a, b = visit(n.children[0]), visit(n.children[1])
-            return (
+            result = (
                 None
                 if a is None or b is None
                 else emit(op, a=a, b=b, ival=checked_window(n.children[2].value))
             )
-        if name in _COMPARISON or name in _LOGICAL_BINARY:
+        elif name in _COMPARISON or name in _LOGICAL_BINARY:
             a, b = visit(n.children[0]), visit(n.children[1])
-            return None if a is None or b is None else emit(op, a=a, b=b)
-        if name in _TERNARY:
+            result = None if a is None or b is None else emit(op, a=a, b=b)
+        elif name in _TERNARY:
             condition, when_true, when_false = (visit(child) for child in n.children)
-            return (
+            result = (
                 None
                 if condition is None or when_true is None or when_false is None
                 else emit(op, a=condition, b=when_true, ival=when_false)
             )
-        # unary or cross-sectional: one series child
-        a = visit(n.children[0])
-        return None if a is None else emit(op, a=a)
+        else:
+            # unary or cross-sectional: one series child
+            a = visit(n.children[0])
+            result = None if a is None else emit(op, a=a)
+        if result is not None:
+            memo[n] = result
+        return result
 
     root = visit(node)
     if root is None:
@@ -308,7 +340,7 @@ def evaluate_cpp(node: Node, panel: Panel) -> pd.DataFrame | None:
     if not available():
         return None
     plan = _compile(node)
-    if plan is None:
+    if plan is None or not _plan_supported_by_loaded_abi(plan):
         return None
     result = _EXT.evaluate(_panel_arrays(panel), *plan.arrays, plan.root)
     frame = pd.DataFrame(result, index=panel.dates, columns=panel.symbols)
@@ -344,7 +376,7 @@ def evaluate_many(
     supported: list[tuple[int, Node, _CompiledPlan]] = []
     for index, node in enumerate(materialized):
         plan = _compile(node)
-        if plan is not None:
+        if plan is not None and _plan_supported_by_loaded_abi(plan):
             supported.append((index, node, plan))
     if not supported:
         return results
@@ -432,8 +464,8 @@ def score_many(
     for index, node in enumerate(materialized):
         expanded = expand_all(node)
         plan = _compile_expanded(expanded)
-        if plan is not None:
-            supported.append((index, node, plan, expanded.size()))
+        if plan is not None and _plan_supported_by_loaded_abi(plan):
+            supported.append((index, node, plan, expanded.unique_size()))
     if not supported:
         return results
 

@@ -4,11 +4,13 @@ import {
   continueSession,
   createSession,
   fetchRun,
+  getBenchmarkSeries,
   getMembershipSync,
   getSession,
   getTrainingCapabilities,
   getUniverse,
   listDataSyncs,
+  listBenchmarks,
   listUniversePresets,
   listUniverses,
   putCategories,
@@ -40,6 +42,19 @@ afterEach(() => {
 });
 
 describe("session client", () => {
+  it("loads benchmark metadata and an explicitly bounded cached series", async () => {
+    let fetchSpy = mockFetch([{ id: "sp500", symbol: "^GSPC" }]);
+    await listBenchmarks();
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/benchmarks$/);
+
+    fetchSpy = mockFetch({ id: "sp500", status: "ready", normalized_equity: [] });
+    await getBenchmarkSeries("sp500", "2025-01-02", "2025-01-06");
+    const url = String(fetchSpy.mock.calls[0][0]);
+    expect(url).toContain("/benchmarks/sp500/series?");
+    expect(url).toContain("start=2025-01-02");
+    expect(url).toContain("end=2025-01-06");
+  });
+
   it("loads device-relative training capabilities", async () => {
     const fetchSpy = mockFetch({
       default_profile: "auto",

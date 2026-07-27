@@ -50,6 +50,14 @@ function applyNode(node?: { name: string; value?: number } | null): TreeNodeData
   return node ? { name: node.name, value: node.value } : null;
 }
 
+function defaultUniverseHistoryStart(universe: Awaited<ReturnType<typeof getUniverse>>): string {
+  if (universe.mode === "static_snapshot") return "2020-01-01";
+  return universe.memberships
+    .map((membership) => membership.entry)
+    .filter(Boolean)
+    .sort()[0] ?? "2020-01-01";
+}
+
 export function App() {
   const mode = getAppMode();
   const [initialWorkspace] = useState(() => readLocalWorkspace());
@@ -223,14 +231,16 @@ export function App() {
     setStatus(`Opened ${recovered.label}; the previous draft remains recoverable`);
   }
 
-  async function openUniverseEditor(universeName: string) {
+  async function openUniverseEditor(universeName: string, historyStart?: string) {
     try {
       const universe = await getUniverse(universeName);
       setUniverseDraft({
         name: universe.name,
         rows: rowsFromUniverse(universe),
-        selectedUniverse: universe.source === "custom" ? universe.name : "",
-        expectedStart: universeDraft?.expectedStart,
+        // Preserve the saved definition identity for bundled snapshots too. Price sync can then
+        // use the compact universe request and its pinned aliases/fingerprint.
+        selectedUniverse: universe.name,
+        expectedStart: historyStart ?? defaultUniverseHistoryStart(universe),
       });
     } catch (e) {
       setStatus(String(e));
@@ -380,10 +390,7 @@ export function App() {
                 onRunningChange={onRunningChange}
                 onOpenDashboard={() => setTab("dashboard")}
                 onOpenUniverseEditor={openUniverseEditor}
-                onOpenDataSync={() => {
-                  setExtendPage("sync");
-                  setTab("extend");
-                }}
+                onOpenDataSync={openUniverseEditor}
                 onOpenFormulaEditor={() => {
                   setExtendPage("formula");
                   setTab("extend");
@@ -396,7 +403,12 @@ export function App() {
         {run && tab === "dashboard" && (
           <section className="view-card" data-view="dashboard">
             <div className="view-body">
-              <Dashboard report={run.report} history={run.history} extra={run} />
+              <Dashboard
+                report={run.report}
+                history={run.history}
+                extra={run}
+                enableBenchmarks={mode === "app"}
+              />
             </div>
           </section>
         )}
@@ -455,7 +467,13 @@ export function App() {
                 onFormulaDraftChange={setFormulaDraft}
                 recoveredFormulaDrafts={recoveredFormulaDrafts}
                 onRecoverFormulaDraft={recoverFormulaDraft}
-                onOpenDataSync={() => setExtendPage("sync")}
+                onOpenDataSync={(universeName) => {
+                  if (universeName) {
+                    void openUniverseEditor(universeName);
+                  } else {
+                    setExtendPage("universe");
+                  }
+                }}
                 canSubmit={mode === "app"}
                 onDataPullProgressChange={setDataPullProgress}
               />

@@ -43,7 +43,13 @@ from alphalineage.api.service import (
     user_operator_count,
 )
 from alphalineage.core.extensions import expand_all
-from alphalineage.core.gp import GP, SCORER_VERSION, GPConfig, TrainingCancelled
+from alphalineage.core.gp import (
+    EVOLUTION_VERSION,
+    GP,
+    SCORER_VERSION,
+    GPConfig,
+    TrainingCancelled,
+)
 from alphalineage.core.panel import Panel
 from alphalineage.core.tree import Node, to_json
 from alphalineage.data import paths
@@ -139,6 +145,7 @@ def _report_cache_context(
     payload = {
         "version": _REPORT_CACHE_VERSION,
         "scorer_version": SCORER_VERSION,
+        "evolution_version": EVOLUTION_VERSION,
         "universe": session["universe"],
         "universe_fingerprint": (session.get("universe_definition") or {}).get("fingerprint"),
         "as_of": session["as_of"],

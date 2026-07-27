@@ -44,6 +44,16 @@ class Node:
     def size(self) -> int:
         return 1 + sum(c.size() for c in self.children)
 
+    def unique_size(self) -> int:
+        """Number of all structurally distinct nodes in this expression DAG."""
+        return len(set(self.iter_nodes()))
+
+    def unique_computation_size(self) -> int:
+        """Distinct calculation/value nodes; canonical field leaves spend no compute budget."""
+        return len(
+            {node for node in self.iter_nodes() if node.primitive.kind is not Kind.OPERAND}
+        )
+
     def iter_nodes(self) -> Iterator[Node]:
         yield self
         for child in self.children:
@@ -99,7 +109,51 @@ def validate(node: Node) -> Node:
             raise InvalidTree(
                 f"{node.name!r} arg expected {expected}, got {child.out_type} ({child.name!r})"
             )
+    _validate_macro_policy(node)
     return node
+
+
+def _validate_macro_policy(node: Node) -> None:
+    """Validate literal parameter bounds and cross-parameter constraints on a macro call."""
+    policy = node.primitive.macro_policy or {}
+    inputs = policy.get("inputs") or []
+    values: dict[str, float | int] = {}
+    for index, item in enumerate(inputs):
+        if index >= len(node.children) or not isinstance(item, dict):
+            continue
+        child = node.children[index]
+        if child.value is None:
+            continue
+        name = str(item.get("name") or f"input_{index + 1}")
+        values[name] = child.value
+        tuning = item.get("tuning")
+        if not isinstance(tuning, dict):
+            continue
+        minimum, maximum = tuning.get("min"), tuning.get("max")
+        if minimum is not None and child.value < minimum:
+            raise InvalidTree(f"{node.name!r} parameter {name!r} must be at least {minimum}")
+        if maximum is not None and child.value > maximum:
+            raise InvalidTree(f"{node.name!r} parameter {name!r} must be at most {maximum}")
+
+    comparisons = {
+        "lt": lambda left, right: left < right,
+        "le": lambda left, right: left <= right,
+        "gt": lambda left, right: left > right,
+        "ge": lambda left, right: left >= right,
+        "ne": lambda left, right: left != right,
+    }
+    for constraint in policy.get("constraints") or []:
+        if not isinstance(constraint, dict):
+            continue
+        left_name, right_name = str(constraint.get("left")), str(constraint.get("right"))
+        operator = str(constraint.get("operator"))
+        if left_name not in values or right_name not in values or operator not in comparisons:
+            continue
+        if not comparisons[operator](values[left_name], values[right_name]):
+            symbol = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=", "ne": "!="}[operator]
+            raise InvalidTree(
+                f"{node.name!r} requires {left_name} {symbol} {right_name}"
+            )
 
 
 def is_valid(node: Node) -> bool:

@@ -1,6 +1,8 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
 import type {
+  BenchmarkDefinition,
+  BenchmarkSeries,
   CategorySettings,
   DataCoverage,
   DataSyncJob,
@@ -99,6 +101,24 @@ export async function getRun(jobId: string): Promise<RunStatus> {
   const res = await fetch(`${BASE}/runs/${jobId}`);
   if (!res.ok) throw new Error(`status failed: ${res.status}`);
   return (await res.json()) as RunStatus;
+}
+
+export async function listBenchmarks(): Promise<BenchmarkDefinition[]> {
+  return jsonOrThrow(await fetch(`${BASE}/benchmarks`), "list benchmarks");
+}
+
+export async function getBenchmarkSeries(
+  benchmarkId: string,
+  start: string,
+  end: string,
+): Promise<BenchmarkSeries> {
+  const params = new URLSearchParams({ start, end });
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/benchmarks/${encodeURIComponent(benchmarkId)}/series?${params}`,
+    ),
+    "load benchmark prices",
+  );
 }
 
 export async function fetchRun(
@@ -308,7 +328,9 @@ export async function getDataCoverage(
   return jsonOrThrow(await fetch(`${BASE}/data/coverage?${params}`), "load data coverage");
 }
 
-export async function startDataSync(req: DataSyncRequest): Promise<{ job_id: string; status: string }> {
+export async function startDataSync(
+  req: DataSyncRequest,
+): Promise<{ job_id: string; status: string; reused?: boolean }> {
   return jsonOrThrow(await POST("/data/sync", req), "start data sync");
 }
 

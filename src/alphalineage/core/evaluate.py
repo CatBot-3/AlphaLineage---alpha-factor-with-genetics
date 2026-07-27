@@ -19,18 +19,28 @@ from alphalineage.core.tree import EvalResult, Node
 
 def evaluate_python(node: Node, panel: Panel) -> EvalResult:
     """Pure-Python recursive evaluation (the correctness baseline)."""
-    prim = node.primitive
-    if prim.macro_body is not None:  # user operator: expand the macro, then evaluate
-        return evaluate_python(expand(node, prim.macro_body), panel)
-    if prim.kind is Kind.OPERAND:
-        assert prim.panel_field is not None
-        return panel[prim.panel_field]
-    if prim.kind is Kind.EPHEMERAL:
-        assert node.value is not None
-        return node.value
-    assert prim.fn is not None
-    args = [evaluate_python(child, panel) for child in node.children]
-    return prim.fn(*args)
+    memo: dict[Node, EvalResult] = {}
+
+    def visit(current: Node) -> EvalResult:
+        cached = memo.get(current)
+        if cached is not None:
+            return cached
+        prim = current.primitive
+        if prim.macro_body is not None:  # formula: expand once and memoize its result
+            result = visit(expand(current, prim.macro_body))
+        elif prim.kind is Kind.OPERAND:
+            assert prim.panel_field is not None
+            result = panel[prim.panel_field]
+        elif prim.kind is Kind.EPHEMERAL:
+            assert current.value is not None
+            result = current.value
+        else:
+            assert prim.fn is not None
+            result = prim.fn(*(visit(child) for child in current.children))
+        memo[current] = result
+        return result
+
+    return visit(node)
 
 
 def evaluate(node: Node, panel: Panel) -> EvalResult:

@@ -48,14 +48,19 @@ MAX_TRAINING_WORKERS = 32
 # Checkpoints carry the scorer version separately from the scientific GP configuration.  A
 # worker-count change never invalidates a checkpoint, while an algorithm change does: continuing
 # an older checkpoint first re-scores its current population so one run cannot mix score kernels.
-SCORER_VERSION = 4
+SCORER_VERSION = 6
+# Variation semantics are versioned separately from numerical scoring.  Version 2 introduces
+# formula-owned local parameter policies and atomic cross-parameter constraints.
+EVOLUTION_VERSION = 2
 
 
 def active_scorer_backend(method: str) -> str:
     """Return the numerical kernel identity persisted beside ``SCORER_VERSION``."""
     from alphalineage.core import cpp
 
-    return "native_spearman" if cpp.supports_native_scoring(method) else "python"
+    if cpp.supports_native_scoring(method):
+        return f"native_spearman_abi{cpp.native_abi_version()}"
+    return "python"
 
 
 class TrainingCancelled(RuntimeError):
@@ -82,6 +87,8 @@ class GPConfig:
     time_budget_s: float | None = None
     # Operator categories the GP may draw from. ``None`` => the default pool (condition excluded).
     enabled_categories: list[str] | None = None
+    # Logical formula allow-list. ``None`` keeps legacy category-wide formula selection.
+    enabled_formula_names: list[str] | None = None
 
     def __post_init__(self) -> None:
         positive_ints = (
@@ -178,6 +185,22 @@ class GPConfig:
                 raise ValueError("enabled_categories may contain at most 64 names of 64 characters")
             if len(set(self.enabled_categories)) != len(self.enabled_categories):
                 raise ValueError("enabled_categories must not contain duplicates")
+        if self.enabled_formula_names is not None:
+            if not isinstance(self.enabled_formula_names, list) or any(
+                not isinstance(name, str) or not name.strip()
+                for name in self.enabled_formula_names
+            ):
+                raise ValueError(
+                    "enabled_formula_names must be a list of non-empty strings or None"
+                )
+            if len(self.enabled_formula_names) > 128 or any(
+                len(name) > 64 for name in self.enabled_formula_names
+            ):
+                raise ValueError(
+                    "enabled_formula_names may contain at most 128 names of 64 characters"
+                )
+            if len(set(self.enabled_formula_names)) != len(self.enabled_formula_names):
+                raise ValueError("enabled_formula_names must not contain duplicates")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -216,6 +239,30 @@ def iter_positions(tree: Node, root_type: DType) -> list[Position]:
     return out
 
 
+def iter_variation_positions(tree: Node, root_type: DType) -> list[Position]:
+    """Structural-edit positions, treating policy-owned parameter children as atomic."""
+    out: list[Position] = []
+
+    def walk(node: Node, path: tuple[int, ...], required: DType) -> None:
+        out.append((path, required, node))
+        prim = node.primitive
+        if prim.kind is not Kind.OPERATOR:
+            return
+        inputs = (prim.macro_policy or {}).get("inputs") or []
+        for index, child in enumerate(node.children):
+            item = (
+                inputs[index]
+                if index < len(inputs) and isinstance(inputs[index], dict)
+                else {}
+            )
+            if item.get("role") == "parameter":
+                continue
+            walk(child, (*path, index), prim.arg_types[index])
+
+    walk(tree, (), root_type)
+    return out
+
+
 def replace_at(tree: Node, path: tuple[int, ...], new: Node) -> Node:
     """Return a copy of ``tree`` with the subtree at ``path`` replaced by ``new``."""
     if not path:
@@ -240,8 +287,30 @@ def validate_seed(
         )
     # Limits apply after formula expansion. Otherwise a one-node saved formula could smuggle an
     # arbitrarily deep/large built-in expression into a tightly bounded GP run.
-    expand_all(tree, max_depth=max_depth, max_nodes=max_nodes)
+    compact_depth = tree.depth()
+    compact_size = tree.size()
+    if compact_depth > max_depth or compact_size > max_nodes:
+        raise ValueError(
+            f"seed compact expression exceeds depth/nodes {max_depth}/{max_nodes}"
+        )
+    expansion_depth = _expansion_depth_limit(tree, max_depth)
+    expand_all(tree, max_depth=expansion_depth, max_nodes=max_nodes)
     return tree
+
+
+def _expansion_depth_limit(tree: Node, configured: int) -> int:
+    """Give managed catalog calls their published intrinsic depth, up to the global guard.
+
+    The generator's compact tree still obeys the user's depth budget. This allowance only keeps a
+    single atomic indicator (RSI/KDJ/ADX/MFI) usable at the default depth six; expanded distinct
+    nodes still spend the ordinary node budget, so nesting cannot evade parsimony.
+    """
+    managed = any(
+        node.primitive.macro_body is not None
+        and (node.primitive.macro_policy or {}).get("catalog_revision") is not None
+        for node in tree.iter_nodes()
+    )
+    return MAX_TREE_DEPTH if managed else configured
 
 
 class GP:
@@ -412,20 +481,93 @@ class GP:
 
     def _fits_complexity(self, tree: Node) -> bool:
         try:
+            validate(tree)
+            if tree.depth() > self.config.max_depth or tree.size() > self.config.max_nodes:
+                return False
             expand_all(
                 tree,
-                max_depth=self.config.max_depth,
+                max_depth=_expansion_depth_limit(tree, self.config.max_depth),
                 max_nodes=self.config.max_nodes,
             )
-        except InvalidOperator:
+        except (InvalidOperator, ValueError):
             return False
         return True
 
+    @staticmethod
+    def _node_at(tree: Node, path: tuple[int, ...]) -> Node:
+        current = tree
+        for index in path:
+            current = current.children[index]
+        return current
+
+    def _mutate_policy_call(self, tree: Node, path: tuple[int, ...]) -> Node:
+        call = self._node_at(tree, path)
+        policy = call.primitive.macro_policy or {}
+        inputs = policy.get("inputs") or []
+        tunable = [
+            index
+            for index, item in enumerate(inputs)
+            if index < len(call.children)
+            and isinstance(item, dict)
+            and isinstance(item.get("tuning"), dict)
+            and item["tuning"].get("enabled", True)
+        ]
+        if not tunable:
+            return tree
+        index = self.rng.choice(tunable)
+        tuning = inputs[index]["tuning"]
+        child = call.children[index]
+        if child.value is None:
+            return tree
+        step = tuning["step"]
+        radius = max(1, int(tuning.get("radius", 1)))
+        deltas = [step * offset for offset in range(-radius, radius + 1) if offset]
+        self.rng.shuffle(deltas)
+        for delta in deltas:
+            value = child.value + delta
+            if value < tuning["min"] or value > tuning["max"]:
+                continue
+            value = int(value) if child.name == "window" else float(value)
+            children = list(call.children)
+            children[index] = Node(child.name, value=value)
+            candidate = replace_at(tree, path, Node(call.name, tuple(children)))
+            if self._fits_complexity(candidate):
+                return candidate
+        return tree
+
+    def _mutate_formula_coefficient(
+        self, tree: Node, path: tuple[int, ...], node: Node
+    ) -> Node | None:
+        """Locally tune a scalar weighting a formula subtree; None means not applicable."""
+        if node.name != "const" or not path or path[-1] != 1:
+            return None
+        parent = self._node_at(tree, path[:-1])
+        if parent.name != "mul_scalar" or parent.children[0].primitive.macro_body is None:
+            return None
+        # Scaling a standalone factor does not alter its ranks/IC and only wastes a trial. Weight
+        # tuning is meaningful when the weighted formula is one term in an add/sub combination.
+        if len(path) < 2:
+            return tree
+        combination = self._node_at(tree, path[:-2])
+        if combination.name not in {"add", "sub"}:
+            return tree
+        assert node.value is not None
+        deltas = [-0.25, 0.25]
+        self.rng.shuffle(deltas)
+        for delta in deltas:
+            value = max(-3.0, min(3.0, float(node.value) + delta))
+            if value == node.value:
+                continue
+            candidate = replace_at(tree, path, Node("const", value=value))
+            if self._fits_complexity(candidate):
+                return candidate
+        return tree
+
     def _crossover(self, a: Node, b: Node) -> Node:
-        path, required, _ = self.rng.choice(iter_positions(a, self.root_type))
+        path, required, _ = self.rng.choice(iter_variation_positions(a, self.root_type))
         donors = [
             sub
-            for (_, _, sub) in iter_positions(b, self.root_type)
+            for (_, _, sub) in iter_variation_positions(b, self.root_type)
             if is_subtype(sub.out_type, required)
         ]
         if not donors:
@@ -437,7 +579,7 @@ class GP:
         return a
 
     def _subtree_mutation(self, tree: Node) -> Node:
-        path, required, sub = self.rng.choice(iter_positions(tree, self.root_type))
+        path, required, sub = self.rng.choice(iter_variation_positions(tree, self.root_type))
         depth_budget = self.config.max_depth - len(path)
         node_budget = self.config.max_nodes - (tree.size() - sub.size())
         if depth_budget < 1 or node_budget < 1:
@@ -453,8 +595,24 @@ class GP:
 
     def _point_mutation(self, tree: Node) -> Node:
         path, _, node = self.rng.choice(iter_positions(tree, self.root_type))
+        # Selecting a managed call or one of its immediate parameters mutates that call as one
+        # unit, so constraints such as MACD fast < slow cannot be broken transiently.
+        if node.primitive.macro_policy:
+            mutated = self._mutate_policy_call(tree, path)
+            if mutated != tree:
+                return mutated
+        if path:
+            parent_path = path[:-1]
+            parent = self._node_at(tree, parent_path)
+            if parent.primitive.macro_policy:
+                mutated = self._mutate_policy_call(tree, parent_path)
+                if mutated != tree:
+                    return mutated
         prim = node.primitive
         if prim.kind is Kind.EPHEMERAL:
+            coefficient = self._mutate_formula_coefficient(tree, path, node)
+            if coefficient is not None:
+                return coefficient
             assert prim.sampler is not None
             candidate = replace_at(tree, path, Node(node.name, value=prim.sampler(self.rng)))
             return candidate if self._fits_complexity(candidate) else tree
@@ -712,14 +870,31 @@ class GP:
     # --- checkpointing -----------------------------------------------------------
     def save_checkpoint(self, path: Path_) -> None:
         version, internal, gauss = self.rng.getstate()
+        used_formula_policies: dict[str, dict[str, Any]] = {}
+
+        def collect_policy(node: Node) -> None:
+            if node.name == "$arg":
+                return
+            prim = node.primitive
+            if prim.macro_body is not None and prim.name not in used_formula_policies:
+                if prim.macro_policy is not None:
+                    used_formula_policies[prim.name] = prim.macro_policy
+                collect_policy(prim.macro_body)
+            for child in node.children:
+                collect_policy(child)
+
+        for individual in self.population:
+            collect_policy(individual.tree)
         state = {
             "scorer_version": SCORER_VERSION,
+            "evolution_version": EVOLUTION_VERSION,
             "scorer_backend": self.scorer_backend,
             "generation": self.generation,
             "rng_state": [version, list(internal), gauss],
             "config": self.config.to_dict(),
             "trials": self.trial_count,
             "history": self.history,
+            "formula_policies": used_formula_policies,
             "population": [
                 {"tree": to_dict(ind.tree), "fitness": ind.fitness, "metrics": ind.metrics}
                 for ind in self.population
@@ -757,10 +932,21 @@ class GP:
             Individual(from_dict(p["tree"]), float(p["fitness"]), dict(p["metrics"]))
             for p in state["population"]
         ]
+        for name, policy in (state.get("formula_policies") or {}).items():
+            primitive = OPERATORS.get(name)
+            if primitive is None or primitive.macro_policy != policy:
+                raise ValueError(
+                    f"checkpoint formula policy for {name!r} is unavailable or has changed"
+                )
         saved_trials = int(state.get("trials", 0))
         saved_scorer = int(state.get("scorer_version", 1))
+        saved_evolution = int(state.get("evolution_version", 1))
         saved_backend = state.get("scorer_backend")
-        if saved_scorer == SCORER_VERSION and saved_backend == gp.scorer_backend:
+        if (
+            saved_scorer == SCORER_VERSION
+            and saved_evolution == EVOLUTION_VERSION
+            and saved_backend == gp.scorer_backend
+        ):
             # Restore the current population into the memoization cache.  Older code retained
             # their scores on Individuals but threw away these free resume-time cache hits.
             for individual in gp.population:

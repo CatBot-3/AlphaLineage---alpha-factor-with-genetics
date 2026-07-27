@@ -122,7 +122,7 @@ export function FormulaBacktestDrawer({
   formulas: FormulaSpec[];
   defaultName: string;
   defaultUniverse?: string;
-  onDataSync?: () => void;
+  onDataSync?: (universeName: string) => void;
   onClose: () => void;
 }) {
   const [universes, setUniverses] = useState<UniverseInfo[]>([]);
@@ -321,7 +321,13 @@ export function FormulaBacktestDrawer({
         </div>
         {!coverageComplete && <div className="surface-message formula-backtest__coverage-warning">
           <span>This universe has incomplete cached data. Sync it before relying on the result.</span>
-          <button type="button" onClick={onDataSync} disabled={!onDataSync}>Data Sync</button>
+          <button
+            type="button"
+            onClick={() => onDataSync?.(universe)}
+            disabled={!onDataSync || !universe}
+          >
+            Data Sync
+          </button>
         </div>}
         {missingBindings.length > 0 && <p className="hint">Bind {missingBindings.map((input) => input.name).join(", ")} before running.</p>}
         <div className="actions">

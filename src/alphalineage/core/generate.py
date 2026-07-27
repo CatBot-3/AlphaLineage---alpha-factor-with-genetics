@@ -97,6 +97,23 @@ class RandomTreeGenerator:
             return Node(prim.name, value=prim.sampler(self.rng))
         return Node(prim.name)  # operand
 
+    @staticmethod
+    def _parameter_default(prim: Primitive, index: int) -> Node | None:
+        """Return a pinned formula-parameter default, leaving ordinary holes unchanged."""
+        policy = prim.macro_policy or {}
+        inputs = policy.get("inputs") or []
+        if index >= len(inputs) or not isinstance(inputs[index], dict):
+            return None
+        item = inputs[index]
+        default = item.get("default")
+        if item.get("role") != "parameter" or default is None:
+            return None
+        if item.get("type") == DType.WINDOW.value:
+            return Node("window", value=int(default))
+        if item.get("type") == DType.SCALAR.value:
+            return Node("const", value=float(default))
+        return None
+
     def _fits(self, op: Primitive, budget: int, depth_rem: int) -> bool:
         need_nodes = 1 + sum(self._min_nodes[a] for a in op.arg_types)
         need_depth = 1 + max((self._min_depth[a] for a in op.arg_types), default=0)
@@ -128,6 +145,12 @@ class RandomTreeGenerator:
         children: list[Node] = []
         n_args = prim.arity
         for i, arg_type in enumerate(prim.arg_types):
+            default_child = self._parameter_default(prim, i)
+            if default_child is not None:
+                children.append(default_child)
+                used += 1
+                remaining -= 1
+                continue
             reserve = sum(self._min_nodes[prim.arg_types[j]] for j in range(i + 1, n_args))
             child, used_c = self._build(arg_type, depth_rem - 1, remaining - reserve, grow)
             children.append(child)

@@ -1,30 +1,36 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const defineUniverse = vi.fn();
 const deleteUniverse = vi.fn();
+const getDataCoverage = vi.fn();
 const getDataSync = vi.fn();
 const getMembershipSync = vi.fn();
 const getUniverse = vi.fn();
 const listUniversePresets = vi.fn();
 const listUniverses = vi.fn();
+const listDataSyncs = vi.fn();
 const searchSymbols = vi.fn();
 const startDataSync = vi.fn();
 const startMembershipSync = vi.fn();
+const stopDataSync = vi.fn();
 const updateUniverse = vi.fn();
 const validateSymbol = vi.fn();
 
 vi.mock("../api/client", () => ({
   defineUniverse: (payload: unknown) => defineUniverse(payload),
   deleteUniverse: (name: string) => deleteUniverse(name),
+  getDataCoverage: (...args: unknown[]) => getDataCoverage(...args),
   getDataSync: (jobId: string) => getDataSync(jobId),
   getMembershipSync: (jobId: string) => getMembershipSync(jobId),
   getUniverse: (name: string) => getUniverse(name),
   listUniversePresets: () => listUniversePresets(),
   listUniverses: () => listUniverses(),
+  listDataSyncs: (...args: unknown[]) => listDataSyncs(...args),
   searchSymbols: (...args: unknown[]) => searchSymbols(...args),
   startDataSync: (payload: unknown) => startDataSync(payload),
   startMembershipSync: (payload: unknown) => startMembershipSync(payload),
+  stopDataSync: (jobId: string) => stopDataSync(jobId),
   updateUniverse: (name: string, payload: unknown) => updateUniverse(name, payload),
   validateSymbol: (payload: unknown) => validateSymbol(payload),
 }));
@@ -43,18 +49,29 @@ function candidate(symbol: string) {
 }
 
 function setupMocks() {
+  getDataCoverage.mockResolvedValue([]);
+  listDataSyncs.mockResolvedValue([]);
+  stopDataSync.mockResolvedValue({ stopping: true });
   listUniversePresets.mockResolvedValue([
     {
       id: "sp500-lite",
-      display_name: "S&P 500 illustrative sample",
-      benchmark: "S&P 500",
+      display_name: "Popular US stocks sample",
+      benchmark: "US large-cap demonstration basket",
       status: "bundled_sample",
       available: true,
-      membership_history: "illustrative",
-      coverage: "Nine hand-curated symbols",
+      mode: "static_snapshot",
+      membership_history: "static_snapshot",
+      coverage: "15 recognizable, liquid US stocks in a dated offline sample",
       research_ready: false,
-      provenance: "Bundled demonstration data",
-      warning: "Not authoritative S&P 500 constituent history.",
+      provenance: "Bundled current-stock demonstration data",
+      warning: "This is a current demonstration basket, not historical index membership.",
+      definition: {
+        id: "sp500-lite",
+        display_name: "Popular US stocks sample",
+        snapshot_date: "2026-07-15",
+        interval_semantics: "Fixed demonstration basket",
+        member_count: 15,
+      },
     },
     {
       id: "sp500",
@@ -363,7 +380,7 @@ describe("UniverseEditorPage", () => {
     expect(deleteButton).toHaveClass("danger-navy");
   });
 
-  it("syncs entry/exit dates and surfaces a removable delisted-symbol list", async () => {
+  it("preserves memberships when stale prices cannot verify a delisting", async () => {
     setupMocks();
     getMembershipSync.mockResolvedValue({
       job_id: "m-1",
@@ -371,26 +388,47 @@ describe("UniverseEditorPage", () => {
       result: {
         expected_start: "2020-01-01",
         results: [
-          { symbol: "AAPL", status: "resolved", entry: "2020-01-01", exit: null, delisted: false },
           {
-            symbol: "LEH",
+            symbol: "AAPL",
             status: "resolved",
-            entry: "2000-01-03",
-            exit: "2008-09-15",
-            delisted: true,
+            entry: null,
+            exit: null,
+            delisted: false,
+            first_date: "1999-11-01",
+            last_date: "2026-07-24",
+            note: "Observed price coverage only. Membership entry and exit were left unchanged.",
+          },
+          {
+            symbol: "STALE",
+            status: "unverified_stale",
+            entry: null,
+            exit: null,
+            delisted: false,
+            review_needed: true,
+            last_date: "2008-09-12",
+            note: "Membership was left unchanged; confirm any exit independently.",
+          },
+          {
+            symbol: "BAD",
+            status: "failed",
+            entry: null,
+            exit: null,
+            delisted: false,
+            error: "Provider rejected symbol",
           },
         ],
       },
       error: null,
-      progress: { done: 2, total: 2, current_symbol: "LEH" },
+      progress: { done: 2, total: 2, current_symbol: "STALE" },
     });
     render(
       <UniverseEditorPage
         draft={{
           name: "u",
           rows: [
-            { symbol: "AAPL", entry: "2019-01-01", exit: "" },
-            { symbol: "LEH", entry: "2000-01-01", exit: "" },
+            { symbol: "AAPL", entry: "2019-01-01", exit: "2024-01-01" },
+            { symbol: "STALE", entry: "2000-01-01", exit: "" },
+            { symbol: "BAD", entry: "2010-01-01", exit: "" },
           ],
         }}
       />,
@@ -398,20 +436,32 @@ describe("UniverseEditorPage", () => {
 
     fireEvent.click(screen.getByTestId("sync-membership-dates"));
 
-    await waitFor(() => expect(screen.getByLabelText("entry-1")).toHaveValue("2000-01-03"));
-    expect(screen.getByLabelText("exit-1")).toHaveValue("2008-09-15");
+    await waitFor(() => expect(screen.getByTestId("stale-membership-list")).toBeInTheDocument());
+    expect(screen.getByLabelText("entry-0")).toHaveValue("2019-01-01");
+    expect(screen.getByLabelText("exit-0")).toHaveValue("2024-01-01");
+    expect(screen.getByLabelText("entry-1")).toHaveValue("2000-01-01");
+    expect(screen.getByLabelText("exit-1")).toHaveValue("");
+    expect(screen.getByLabelText("entry-2")).toHaveValue("2010-01-01");
 
-    const delisted = await screen.findByTestId("delisted-list");
-    expect(within(delisted).getByText("LEH")).toBeInTheDocument();
-    fireEvent.click(within(delisted).getByText("Remove"));
+    const review = await screen.findByTestId("stale-membership-list");
+    expect(review).toHaveTextContent("1999-11-01 to 2026-07-24");
+    expect(within(review).getByText("STALE")).toBeInTheDocument();
+    expect(review).toHaveTextContent("Membership was left unchanged");
+    expect(within(review).getByText("BAD")).toBeInTheDocument();
+    expect(review).toHaveTextContent("Provider rejected symbol");
     expect(screen.queryByTestId("delisted-list")).not.toBeInTheDocument();
   });
 
-  it("prepares an empty import-required index without inventing constituents", async () => {
+  it("keeps snapshot bias disclosure compact while preparing a separate PIT import", async () => {
     setupMocks();
     render(<UniverseEditorPage />);
     const presets = await screen.findByTestId("universe-presets");
     const sp500 = within(presets).getByText("S&P 500", { selector: "strong" }).closest("article")!;
+    expect(within(sp500).getByText("Current members ⓘ")).toBeInTheDocument();
+    expect(within(sp500).queryByText(/current snapshot is not valid/i, {
+      selector: ".oos-warning",
+    })).not.toBeInTheDocument();
+    fireEvent.click(within(sp500).getByText("Source and research notes"));
     expect(within(sp500).getByText(/current snapshot is not valid/i)).toBeInTheDocument();
 
     fireEvent.click(within(sp500).getByRole("button", { name: "Import point-in-time history" }));
@@ -497,5 +547,247 @@ describe("UniverseEditorPage", () => {
     const coverage = await screen.findByTestId("universe-cache-coverage");
     expect(coverage).toHaveTextContent("Price history: needs attention");
     expect(coverage).toHaveTextContent("AAPL");
+  });
+
+  it("ignores a slower universe response after the user selects another definition", async () => {
+    setupMocks();
+    const slowUniverse = {
+      name: "slow-universe",
+      symbols: ["OLD"],
+      source: "custom",
+      mode: "point_in_time",
+      memberships: [{ symbol: "OLD", entry: "2000-01-01", exit: null }],
+    };
+    const fastUniverse = {
+      name: "fast-universe",
+      symbols: ["NEW"],
+      source: "custom",
+      mode: "point_in_time",
+      memberships: [{ symbol: "NEW", entry: "2020-01-01", exit: null }],
+    };
+    listUniverses.mockResolvedValue([slowUniverse, fastUniverse]);
+    let resolveSlow: (value: typeof slowUniverse) => void = () => undefined;
+    const slowResponse = new Promise<typeof slowUniverse>((resolve) => {
+      resolveSlow = resolve;
+    });
+    getUniverse.mockImplementation((universeName: string) => (
+      universeName === "slow-universe" ? slowResponse : Promise.resolve(fastUniverse)
+    ));
+
+    render(<UniverseEditorPage />);
+    await screen.findByRole("option", { name: "slow-universe (custom)" });
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: "slow-universe" },
+    });
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: "fast-universe" },
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Universe name")).toHaveValue("fast-universe"));
+    expect(screen.getByLabelText("symbol-0")).toHaveValue("NEW");
+    await act(async () => {
+      resolveSlow(slowUniverse);
+    });
+    expect(screen.getByLabelText("Universe name")).toHaveValue("fast-universe");
+    expect(screen.getByLabelText("symbol-0")).toHaveValue("NEW");
+  });
+
+  it("does not let saved-draft hydration replace a universe selected after reopen", async () => {
+    setupMocks();
+    const savedUniverse = {
+      name: "saved-universe",
+      symbols: ["OLD"],
+      source: "custom",
+      mode: "point_in_time",
+      memberships: [{ symbol: "OLD", entry: "2010-01-01", exit: null }],
+    };
+    const selectedUniverse = {
+      name: "selected-universe",
+      symbols: ["NEW"],
+      source: "custom",
+      mode: "point_in_time",
+      memberships: [{ symbol: "NEW", entry: "2020-01-01", exit: null }],
+    };
+    listUniverses.mockResolvedValue([savedUniverse, selectedUniverse]);
+    let resolveHydration!: (value: typeof savedUniverse) => void;
+    const hydration = new Promise<typeof savedUniverse>((resolve) => {
+      resolveHydration = resolve;
+    });
+    getUniverse.mockImplementation((universeName: string) => (
+      universeName === savedUniverse.name
+        ? hydration
+        : Promise.resolve(selectedUniverse)
+    ));
+
+    render(
+      <UniverseEditorPage
+        draft={{
+          name: savedUniverse.name,
+          selectedUniverse: savedUniverse.name,
+          expectedStart: "2010-01-01",
+          rows: [{ symbol: "OLD", entry: "2010-01-01", exit: "" }],
+        }}
+      />,
+    );
+    await screen.findByRole("option", { name: "selected-universe (custom)" });
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: selectedUniverse.name },
+    });
+    await waitFor(() => expect(screen.getByLabelText("Universe name"))
+      .toHaveValue(selectedUniverse.name));
+
+    await act(async () => {
+      resolveHydration(savedUniverse);
+    });
+
+    expect(screen.getByLabelText("Universe name")).toHaveValue(selectedUniverse.name);
+    expect(screen.getByLabelText("symbol-0")).toHaveValue("NEW");
+  });
+
+  it("stops direct membership polling when the selected universe changes", async () => {
+    setupMocks();
+    const first = {
+      name: "first-universe",
+      symbols: ["AAA"],
+      source: "custom",
+      mode: "point_in_time",
+      memberships: [{ symbol: "AAA", entry: "2020-01-01", exit: null }],
+    };
+    const second = {
+      name: "second-universe",
+      symbols: ["BBB"],
+      source: "custom",
+      mode: "point_in_time",
+      memberships: [{ symbol: "BBB", entry: "2020-01-01", exit: null }],
+    };
+    listUniverses.mockResolvedValue([first, second]);
+    getUniverse.mockImplementation(async (universeName: string) => (
+      universeName === first.name ? first : second
+    ));
+    let resolveMembership!: (value: {
+      job_id: string;
+      status: string;
+      result: null;
+      error: null;
+      progress: { done: number; total: number; current_symbol: string };
+    }) => void;
+    getMembershipSync.mockReturnValue(new Promise((resolve) => {
+      resolveMembership = resolve;
+    }));
+    const onPullProgress = vi.fn();
+
+    render(<UniverseEditorPage onPullProgress={onPullProgress} />);
+    await screen.findByRole("option", { name: "first-universe (custom)" });
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: first.name },
+    });
+    await waitFor(() => expect(screen.getByLabelText("symbol-0")).toHaveValue("AAA"));
+    fireEvent.click(screen.getByTestId("sync-membership-dates"));
+    await waitFor(() => expect(getMembershipSync).toHaveBeenCalledWith("m-1"));
+
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: second.name },
+    });
+    await waitFor(() => expect(screen.getByLabelText("symbol-0")).toHaveValue("BBB"));
+    await act(async () => {
+      resolveMembership({
+        job_id: "m-1",
+        status: "running",
+        result: null,
+        error: null,
+        progress: { done: 1, total: 2, current_symbol: "AAA" },
+      });
+    });
+
+    expect(onPullProgress).not.toHaveBeenCalledWith(
+      expect.objectContaining({ current_symbol: "AAA" }),
+    );
+    expect(getMembershipSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("syncs from the earliest PIT membership and refreshes the stale readiness card", async () => {
+    setupMocks();
+    const incomplete = {
+      name: "sp500-lite",
+      symbols: ["AAPL", "LEH"],
+      source: "sample",
+      mode: "point_in_time",
+      memberships: [
+        { symbol: "AAPL", entry: "2000-01-01", exit: null },
+        { symbol: "LEH", entry: "2000-01-01", exit: "2008-09-15" },
+      ],
+      cache_coverage: {
+        as_of: "2026-07-16",
+        required_start: "2000-01-01",
+        required_end: "2026-07-16",
+        eligible_symbols: ["AAPL", "LEH"],
+        active_symbols: ["AAPL"],
+        exited_symbols: ["LEH"],
+        cached_symbols: ["AAPL", "LEH"],
+        missing_symbols: [],
+        incomplete_symbols: ["AAPL", "LEH"],
+        complete: false,
+      },
+    };
+    const complete = {
+      ...incomplete,
+      cache_coverage: {
+        ...incomplete.cache_coverage,
+        incomplete_symbols: [],
+        complete: true,
+      },
+    };
+    getUniverse.mockReset();
+    getUniverse.mockResolvedValueOnce(incomplete).mockResolvedValueOnce(complete);
+    startDataSync.mockResolvedValue({ job_id: "sync-pit", status: "queued", reused: false });
+    getDataSync.mockResolvedValue({
+      job_id: "sync-pit",
+      status: "done",
+      request: { universe: "sp500-lite", start: "2000-01-01", mode: "incremental" },
+      result: {
+        universe: "sp500-lite",
+        mode: "incremental",
+        start: "2000-01-01",
+        results: [],
+        failed_count: 0,
+        succeeded_count: 2,
+      },
+      error: null,
+    });
+
+    render(<UniverseEditorPage />);
+    await screen.findByTestId("universe-presets");
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: "sp500-lite" },
+    });
+    await waitFor(() => expect(screen.getByLabelText("Sync start date")).toHaveValue("2000-01-01"));
+    expect(screen.getByTestId("universe-cache-coverage")).toHaveTextContent(
+      "1 exited membership requires prices only through",
+    );
+    fireEvent.click(screen.getByTestId("sync-universe"));
+
+    await waitFor(() => expect(startDataSync).toHaveBeenCalledWith({
+      universe: "sp500-lite",
+      start: "2000-01-01",
+      end: undefined,
+      mode: "incremental",
+    }));
+    await waitFor(() => expect(screen.getByTestId("universe-cache-coverage")).toHaveTextContent(
+      "Price history: complete",
+    ));
+  });
+
+  it("does not sync a saved identity while its displayed definition has unsaved edits", async () => {
+    setupMocks();
+    render(<UniverseEditorPage />);
+    await screen.findByTestId("universe-presets");
+    fireEvent.change(screen.getByLabelText("Load universe"), {
+      target: { value: "sp500-lite" },
+    });
+    await waitFor(() => expect(getUniverse).toHaveBeenCalledWith("sp500-lite"));
+    fireEvent.change(screen.getByLabelText("Universe name"), { target: { value: "edited-name" } });
+
+    expect(await screen.findByText(/Save this universe before syncing/i)).toBeInTheDocument();
+    expect(screen.getByTestId("sync-universe")).toBeDisabled();
   });
 });
