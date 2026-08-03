@@ -1,5 +1,10 @@
 import type { SessionRoundSummary } from "../api/types";
 
+/** Agent rounds are real rounds — same numbering, same finalization — but not the GP's work. */
+function isAgentRound(round: SessionRoundSummary): boolean {
+  return round.origin === "agent";
+}
+
 function roundEvidenceLabel(round: SessionRoundSummary): string {
   if (round.validity === "invalid_legacy_semantics") return "Invalid legacy evidence";
   if (round.finalization_available) return "Holdout finalized";
@@ -66,6 +71,11 @@ export function RoundNavigator({
           <strong>
             Round {selectedPosition + 1} of {available.length}
           </strong>
+          {isAgentRound(selected) && (
+            <span className="round-agent-badge" data-testid="agent-round-badge">
+              Agent
+            </span>
+          )}
           <span>{roundEvidenceLabel(selected)}</span>
         </div>
         <div className="round-navigator__dots" aria-label="Available training rounds">
@@ -73,8 +83,13 @@ export function RoundNavigator({
             <button
               type="button"
               key={round.index}
-              className={round.index === selected.index ? "is-current" : ""}
-              aria-label={`Open training round ${index + 1}`}
+              className={[
+                round.index === selected.index ? "is-current" : "",
+                isAgentRound(round) ? "is-agent" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              aria-label={`Open ${isAgentRound(round) ? "agent" : "training"} round ${index + 1}`}
               aria-current={round.index === selected.index ? "step" : undefined}
               onClick={() => onSelect(round.index)}
             />

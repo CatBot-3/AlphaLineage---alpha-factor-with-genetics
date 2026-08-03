@@ -14,6 +14,10 @@ dist/
 venv/
 
 .pytest_cache/
+# `pytest --basetemp=.pytest-<name>` leaves one of these behind per invocation.
+.pytest-*/
+.pytest_tmp*/
+.hypothesis/
 .mypy_cache/
 .ruff_cache/
 .runtime/
@@ -23,9 +27,15 @@ venv/
 coverage.xml
 htmlcov/
 
+# Left behind by tests/test_api.py::test_static_dir_served_when_configured when it is run
+# with the repo root as cwd.
+test_static/
+
+node_modules/
+frontend/dist/
+
 cpp/build/
 src/alphalineage/_evaluator*.pyd
 src/alphalineage/_evaluator*.so
 
 CLAUDE.md
-DEVELOPMENT_PLAN.md

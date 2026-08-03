@@ -219,4 +219,27 @@ describe("RunConfigForm function space", () => {
     const req = onStart.mock.calls[0][0] as RunRequestForm;
     expect(req.resources).toEqual({ profile: "custom", cpu_budget_percent: 70 });
   });
+
+  // The dice is a convenience, not an optimisation step: re-rolling the seed until the search
+  // looks good is seed-hacking, which is why the agent is refused this key and why this stays a
+  // deliberate, human click rather than anything automatic.
+  it("re-rolls the seed on demand and submits the new value", async () => {
+    const onStart = vi.fn();
+    render(<RunConfigForm onStart={onStart} />);
+
+    const seed = (await screen.findByLabelText("Seed")) as HTMLInputElement;
+    const before = seed.value;
+
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.123456);
+    fireEvent.click(screen.getByTestId("randomize-seed"));
+    random.mockRestore();
+
+    expect(seed.value).toBe("123456");
+    expect(seed.value).not.toBe(before);
+
+    fireEvent.submit(screen.getByTestId("run-config-form"));
+    const req = onStart.mock.calls[0][0] as RunRequestForm;
+    expect(req.config.seed).toBe(123456);
+  });
 });
+

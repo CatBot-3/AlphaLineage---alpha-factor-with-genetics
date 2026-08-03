@@ -1,6 +1,10 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
 import type {
+  AgentJob,
+  Conversation,
+  AgentMessageRequest,
+  AgentToolCatalog,
   BenchmarkDefinition,
   BenchmarkSeries,
   CategorySettings,
@@ -706,6 +710,71 @@ export async function getDataUsage(): Promise<DataUsageRow[]> {
 
 export async function clearData(category: string): Promise<DataUsageRow> {
   return jsonOrThrow(await POST("/data/clear", { category }), "clear data");
+}
+
+// --- P11: the agent ------------------------------------------------------------
+/** The complete tool catalog. Shown before a message so the user sees what they authorize. */
+export async function getAgentTools(): Promise<AgentToolCatalog> {
+  return jsonOrThrow(await fetch(`${BASE}/agent/tools`), "load agent tools");
+}
+
+export async function getConversation(sessionId: string): Promise<Conversation> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/agent/conversations/${sessionId}`),
+    "load conversation",
+  );
+}
+
+export async function clearConversation(sessionId: string): Promise<{ cleared: boolean }> {
+  const res = await fetch(`${BASE}/agent/conversations/${sessionId}`, { method: "DELETE" });
+  return jsonOrThrow(res, "clear conversation");
+}
+
+export async function sendAgentMessage(
+  sessionId: string,
+  req: AgentMessageRequest,
+): Promise<{ job_id: string }> {
+  return jsonOrThrow(
+    await POST(`/agent/conversations/${sessionId}/messages`, req),
+    "send message",
+  );
+}
+
+export async function getAgentJob(jobId: string): Promise<AgentJob> {
+  return jsonOrThrow(await fetch(`${BASE}/agent/jobs/${jobId}`), "load agent job");
+}
+
+export async function stopAgentTurn(jobId: string): Promise<{ stopping: boolean }> {
+  return jsonOrThrow(await POST(`/agent/jobs/${jobId}/stop`, {}), "stop agent");
+}
+
+/**
+ * The approval gate for a factor: runs the session's real validation pass, folds the agent's
+ * trials into the session, and writes a new round.
+ */
+export async function promoteAgentProposal(
+  sessionId: string,
+  proposalId: string,
+): Promise<{ job_id: string }> {
+  return jsonOrThrow(
+    await POST(`/agent/conversations/${sessionId}/proposals/${proposalId}/promote`, {}),
+    "promote proposal",
+  );
+}
+
+export async function applyAgentConfig(
+  sessionId: string,
+  proposalId: string,
+): Promise<Record<string, unknown>> {
+  return jsonOrThrow(
+    await POST(`/agent/conversations/${sessionId}/proposals/${proposalId}/apply-config`, {}),
+    "apply config patch",
+  );
+}
+
+export async function deleteSession(sessionId: string): Promise<Record<string, unknown>> {
+  const res = await fetch(`${BASE}/sessions/${sessionId}`, { method: "DELETE" });
+  return jsonOrThrow(res, "delete session");
 }
 
 // --- shutdown (single-process launcher Quit) -----------------------------------

@@ -6,6 +6,15 @@ import { clearData, getDataUsage, getSettings, putSettings } from "../api/client
 import type { AppMode, DataUsageRow, Settings } from "../api/types";
 import { CompactSection } from "./CompactSection";
 
+// Kept in step with `alphalineage.explain.providers.PROVIDERS`. Labels only — the backend is
+// still the authority on which providers exist and what they may call.
+const LLM_PROVIDERS = [
+  { id: "openai", label: "OpenAI" },
+  { id: "anthropic", label: "Anthropic" },
+  { id: "deepseek", label: "DeepSeek" },
+  { id: "openai_compatible", label: "OpenAI-compatible endpoint (custom)" },
+];
+
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB"];
@@ -39,6 +48,10 @@ export function SettingsMenu({
   const [usage, setUsage] = useState<DataUsageRow[]>([]);
   const [tiingoKey, setTiingoKey] = useState("");
   const [factorsDir, setFactorsDir] = useState("");
+  const [llmProvider, setLlmProvider] = useState("openai");
+  const [llmModel, setLlmModel] = useState("");
+  const [llmBaseUrl, setLlmBaseUrl] = useState("");
+  const [llmKey, setLlmKey] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
@@ -60,6 +73,9 @@ export function SettingsMenu({
     if (settingsResult.status === "fulfilled") {
       setSettings(settingsResult.value);
       setFactorsDir(settingsResult.value.factors_dir);
+      setLlmProvider(settingsResult.value.llm_provider || "openai");
+      setLlmModel(settingsResult.value.llm_model ?? "");
+      setLlmBaseUrl(settingsResult.value.llm_base_url ?? "");
     } else {
       setSettings(null);
       setError("Settings could not be loaded. Check the backend connection and try again.");
@@ -147,6 +163,26 @@ export function SettingsMenu({
     await updateSettings("storage", { factors_dir: factorsDir });
   }
 
+  async function saveLlm() {
+    const next = await updateSettings("llm", {
+      llm_provider: llmProvider,
+      llm_model: llmModel,
+      llm_base_url: llmBaseUrl,
+      // Only send the key when one was typed, so saving a model change never clears it.
+      ...(llmKey.trim() ? { llm_api_key: llmKey, llm_api_key_provider: llmProvider } : {}),
+    });
+    if (next) setLlmKey("");
+  }
+
+  async function removeLlmKey() {
+    if (!window.confirm("Remove the stored explanation API key?")) return;
+    await updateSettings("llm-remove", {
+      llm_api_key: "",
+      llm_api_key_provider: llmProvider,
+    });
+    setLlmKey("");
+  }
+
   async function clearCategory(row: DataUsageRow) {
     if (!window.confirm(`Delete all ${row.label.toLowerCase()}? This cannot be undone.`)) return;
     setSaving(`clear-${row.key}`);
@@ -173,6 +209,11 @@ export function SettingsMenu({
       : storedKeySet
         ? "Key: stored"
         : "Key: not configured";
+
+  const llmKeySource = settings?.llm_api_key_source ?? "none";
+  const llmSummary = settings?.llm_configured
+    ? `${settings.llm_provider} / ${settings.llm_model}`
+    : "Not configured";
 
   return (
     <div className="settings-menu" ref={ref}>
@@ -388,6 +429,106 @@ export function SettingsMenu({
                     ? "Settings are unavailable until the backend reconnects."
                     : "Backend settings are available when the local backend is running."}
               </p>
+            )}
+          </CompactSection>
+
+          <CompactSection
+            title="Explanation model"
+            summary={backend && settings ? llmSummary : "Backend only"}
+            className="settings-section"
+          >
+            {backend && settings ? (
+              <>
+                <p className="settings-help">
+                  Optional. Used only to explain a discovered factor and suggest changes; it
+                  never runs a search or touches your data. The key is sent to the provider you
+                  pick and is never written into a saved explanation.
+                </p>
+                <label className="settings-control">
+                  <span className="settings-control__label">Provider</span>
+                  <select
+                    aria-label="Explanation provider"
+                    value={llmProvider}
+                    onChange={(e) => setLlmProvider(e.target.value)}
+                  >
+                    {LLM_PROVIDERS.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="settings-control">
+                  <span className="settings-control__label">Model</span>
+                  <input
+                    aria-label="Explanation model"
+                    value={llmModel}
+                    placeholder="e.g. gpt-4o"
+                    onChange={(e) => setLlmModel(e.target.value)}
+                  />
+                </label>
+                {llmProvider === "openai_compatible" && (
+                  <label className="settings-control">
+                    <span className="settings-control__label">Base URL</span>
+                    <input
+                      aria-label="Explanation base URL"
+                      value={llmBaseUrl}
+                      placeholder="https://host/v1"
+                      onChange={(e) => setLlmBaseUrl(e.target.value)}
+                    />
+                  </label>
+                )}
+                <div className="settings-control settings-key">
+                  <div className="settings-control__label-row">
+                    <span className="settings-control__label">API key</span>
+                    <span className={`settings-status settings-status--${llmKeySource}`}>
+                      {llmKeySource === "environment"
+                        ? "Environment"
+                        : llmKeySource === "stored"
+                          ? "Stored"
+                          : "Not configured"}
+                    </span>
+                  </div>
+                  {llmKeySource === "environment" ? (
+                    <p className="settings-help">
+                      Provided through the process environment. Edit that source and restart
+                      AlphaLineage to change it.
+                    </p>
+                  ) : (
+                    <label className="settings-control">
+                      <input
+                        type="password"
+                        aria-label="Explanation API key"
+                        value={llmKey}
+                        placeholder="paste a key"
+                        onChange={(e) => setLlmKey(e.target.value)}
+                      />
+                    </label>
+                  )}
+                </div>
+                <div className="settings-workspace-actions">
+                  <button
+                    type="button"
+                    className="settings-action settings-action--primary"
+                    disabled={saving === "llm"}
+                    onClick={() => void saveLlm()}
+                  >
+                    {saving === "llm" ? "Saving…" : "Save"}
+                  </button>
+                  {settings.llm_api_key_set && llmKeySource === "stored" && (
+                    <button
+                      type="button"
+                      className="settings-action settings-action--danger"
+                      disabled={saving === "llm-remove"}
+                      onClick={() => void removeLlmKey()}
+                    >
+                      {saving === "llm-remove" ? "Removing…" : "Remove stored key"}
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : (
+              <p className="panel-note">An explanation model requires the local backend.</p>
             )}
           </CompactSection>
 

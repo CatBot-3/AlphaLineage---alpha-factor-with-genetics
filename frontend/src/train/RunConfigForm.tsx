@@ -41,6 +41,40 @@ function localToday(): string {
   return new Date(now.getTime() - offset).toISOString().slice(0, 10);
 }
 
+/**
+ * The GP seed with a re-roll button.
+ *
+ * Deliberately manual. Re-rolling the seed to find a luckier trajectory is seed-hacking — it is
+ * on the agent's refused list for exactly that reason — so this makes it one click for a human
+ * making the choice knowingly, and never something that happens on its own.
+ */
+function seedField(value: number, onChange: (v: number) => void) {
+  return (
+    <label key="seed" className="field field--seed">
+      <span className="field-label">Seed</span>
+      <div className="field-seed-row">
+        <input
+          type="number"
+          step="any"
+          value={value}
+          aria-label="Seed"
+          onChange={(event) => onChange(Number(event.target.value))}
+        />
+        <button
+          type="button"
+          className="seed-dice"
+          title="Pick a new random seed"
+          aria-label="Randomize seed"
+          onClick={() => onChange(Math.floor(Math.random() * 1_000_000))}
+          data-testid="randomize-seed"
+        >
+          ⚄
+        </button>
+      </div>
+    </label>
+  );
+}
+
 function numberField(key: keyof GpConfig, value: number, onChange: (v: number) => void, label: string) {
   return (
     <label key={String(key)} className="field">
@@ -377,7 +411,9 @@ export function RunConfigForm({
         </div>
         <div className="search-budget-grid">
           {CORE_FIELDS.map((f) =>
-            numberField(f.key, config[f.key] as number, set(f.key), f.label),
+            f.key === "seed"
+              ? seedField(config.seed as number, set("seed"))
+              : numberField(f.key, config[f.key] as number, set(f.key), f.label),
           )}
         </div>
       </section>

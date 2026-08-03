@@ -45,8 +45,16 @@ describe("AppShell", () => {
       "Best Formula Result",
       "Genealogy",
       "Library",
+      "AgentBeta", // the Beta mark is a child span, so it joins the tab's text content
       "Extend",
     ]);
+  });
+
+  it("marks Agent as beta in the navigation", () => {
+    renderShell("app");
+    const agent = screen.getByRole("button", { name: /Agent/ });
+    expect(within(agent).getByText("Beta")).toBeInTheDocument();
+    expect(agent).toHaveClass("nav__link--beta");
   });
 
   it("opens the Extend dropdown and selects a sub-page instead of a plain tab switch", () => {

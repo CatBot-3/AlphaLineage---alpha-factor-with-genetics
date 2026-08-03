@@ -5,16 +5,38 @@ import { DataPullProgress } from "./DataPullProgress";
 import { ExtendMenu } from "./ExtendMenu";
 import { SettingsMenu } from "./SettingsMenu";
 
-export type Tab = "train" | "dashboard" | "factor" | "genealogy" | "library" | "extend";
+export type Tab =
+  | "train"
+  | "dashboard"
+  | "factor"
+  | "genealogy"
+  | "library"
+  | "agent"
+  | "extend";
 
-const TABS: Array<{ id: Tab; label: string; backendOnly?: boolean }> = [
+const TABS: Array<{ id: Tab; label: string; backendOnly?: boolean; beta?: boolean }> = [
   { id: "train", label: "Train", backendOnly: true },
   { id: "dashboard", label: "Metrics" },
   { id: "factor", label: "Best Formula Result" },
   { id: "genealogy", label: "Genealogy" },
   { id: "library", label: "Library", backendOnly: true },
+  // Beta: the guards and the measurements are stable, but everything the model writes depends
+  // on a third-party model, so the label sets expectations honestly.
+  { id: "agent", label: "Agent", backendOnly: true, beta: true },
   { id: "extend", label: "Extend" },
 ];
+
+/**
+ * Is this string a tab that still exists?
+ *
+ * A saved workspace is untrusted input: it was written by whatever version of the app the user
+ * last ran, and TypeScript's belief that `ui.selectedTab` is a `Tab` stops at the JSON boundary.
+ * Renaming a tab once left restored sessions pointing at a tab that no longer existed, which
+ * blanked the whole page — so restoring UI state goes through this, never straight into `setTab`.
+ */
+export function isTab(value: unknown): value is Tab {
+  return TABS.some((tab) => tab.id === value);
+}
 
 export function AppShell({
   mode,
@@ -67,7 +89,7 @@ export function AppShell({
               ) : (
                 <button
                   key={item.id}
-                  className="nav__link"
+                  className={`nav__link${item.beta ? " nav__link--beta" : ""}`}
                   type="button"
                   aria-current={tab === item.id ? "page" : undefined}
                   aria-disabled={item.backendOnly && !backend ? "true" : undefined}
@@ -79,6 +101,7 @@ export function AppShell({
                   }
                 >
                   {item.label}
+                  {item.beta && <span className="nav__beta">Beta</span>}
                 </button>
               ),
             )}

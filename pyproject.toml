@@ -21,6 +21,13 @@ dependencies = [
     "pyyaml>=6.0",
     "fastapi>=0.110",
     "uvicorn>=0.27",
+    # Phase 10 agent loop only. The non-agentic explanation path (Phase 9) deliberately stays on
+    # plain `requests` — see docs/AGENT.md §7. Upper bounds are explicit because
+    # LangChain's public API has broken across minor versions before.
+    "langgraph>=1.0,<2",
+    "langchain-core>=1.0,<2",
+    "langchain-openai>=1.0,<2",
+    "langchain-anthropic>=1.0,<2",
 ]
 
 [project.optional-dependencies]

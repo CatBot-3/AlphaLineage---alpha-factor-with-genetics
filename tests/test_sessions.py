@@ -745,14 +745,29 @@ def test_cancelled_finalization_does_not_publish_partial_evidence(client, monkey
         json={},
     )
     stopped = _poll_job(client, request.json()["job_id"])
-    assert stopped["status"] == "stopped"
+
+    # Evidence first, status last. What actually matters here is that a cancelled finalization
+    # publishes nothing and burns no holdout read; the job's reported status is the weaker
+    # claim. Asserting status first would abort the test before the evidence checks ran, which
+    # is exactly when you most need to know whether anything leaked.
     assert client.get(f"/sessions/{session_id}/rounds").json()
-    assert client.get(f"/sessions/{session_id}/finalizations").json() == []
+    assert client.get(f"/sessions/{session_id}/finalizations").json() == [], (
+        "a cancelled finalization published an artifact"
+    )
     state_payload = client.get(f"/sessions/{session_id}").json()
     assert state_payload["result"]["round_index"] == 0
-    assert state_payload["test_reads"] == 0
+    assert state_payload["test_reads"] == 0, "a cancelled finalization consumed a holdout read"
     state = api_app.sessions.load_session(session_id)
-    assert state["active_finalization_job_id"] is None
+    assert state["active_finalization_job_id"] is None, "the finalization reservation was leaked"
+
+    # The cancellation must reach the job runner as `stopped`, not be absorbed into a `done`
+    # with a partial result. Carry the payload into the message: if this ever fails, the
+    # termination_reason and error are what tell you where it was swallowed.
+    assert stopped["status"] == "stopped", (
+        f"expected the finalize job to report stopped, got {stopped['status']!r} "
+        f"(termination_reason={stopped.get('termination_reason')!r}, "
+        f"error={stopped.get('error')!r}, result_is_none={stopped.get('result') is None})"
+    )
 
 
 def test_failed_attempt_is_retained_without_a_round(client, monkeypatch):

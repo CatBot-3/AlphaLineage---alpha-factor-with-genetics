@@ -402,6 +402,10 @@ export interface SessionSegment {
 export interface SessionRoundSummary {
   index: number;
   segment_index: number;
+  /** Present on rounds the agent authored; absent on GP segments. */
+  origin?: "agent";
+  agent_expression?: string;
+  parent_round_index?: number | null;
   report_available: boolean;
   test_read_index: number | null;
   evidence_status: EvidenceStatus;
@@ -769,12 +773,25 @@ export interface Settings {
   tiingo_stored_key_set?: boolean;
   evaluator: "auto" | "python" | "cpp";
   cpp_available: boolean;
+  /** The agent's model. Optional for the same rolling-upgrade reason. */
+  llm_provider?: string;
+  llm_model?: string;
+  llm_base_url?: string;
+  llm_api_key_set?: boolean;
+  llm_api_key_source?: "environment" | "stored" | "none";
+  llm_configured?: boolean;
 }
 
 export interface SettingsUpdate {
   factors_dir?: string;
   tiingo_api_key?: string;
   evaluator?: "auto" | "python" | "cpp";
+  llm_provider?: string;
+  llm_model?: string;
+  llm_base_url?: string;
+  /** An empty string clears the stored key, matching the Tiingo contract. */
+  llm_api_key?: string;
+  llm_api_key_provider?: string;
 }
 
 export interface DataUsageRow {
@@ -1212,7 +1229,7 @@ export interface OperatorComposerDraft {
 }
 
 export interface WorkspaceUiState {
-  selectedTab?: "train" | "dashboard" | "factor" | "genealogy" | "extend" | "library";
+  selectedTab?: "train" | "dashboard" | "factor" | "genealogy" | "extend" | "library" | "agent";
   selectedFactorNode?: { name: string; value?: number } | null;
   selectedLineage?: number | null;
   sessionId?: string | null;
@@ -1238,4 +1255,92 @@ export interface WorkspaceSummary {
   name: string;
   savedAt: string;
   hasRun: boolean;
+}
+
+// --- P11: the agent -----------------------------------------------------------
+export type ToolSafety = "read" | "evaluate" | "propose" | "annotate";
+
+export interface AgentToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  safety: ToolSafety;
+}
+
+export interface AgentToolCatalog {
+  tools: AgentToolSpec[];
+  tunable_config_keys: string[];
+  protected_config_keys: Record<string, string>;
+  defaults: { max_tool_calls: number; max_evaluations: number; max_seconds: number };
+  unavailable_reason: string;
+  disclaimer: string;
+}
+
+export interface AgentToolCall {
+  tool: string;
+  arguments: Record<string, unknown>;
+  result: Record<string, unknown>;
+  safety: ToolSafety | "unknown";
+  ok: boolean;
+}
+
+export interface AgentLabel {
+  name: string;
+  evidence?: string;
+  reading?: string;
+  risk?: string;
+}
+
+export interface AgentProposal {
+  id: string;
+  kind: "factor" | "config";
+  rationale: string;
+  payload: {
+    name?: string;
+    expression?: string;
+    tree?: FactorNode;
+    patch?: Record<string, unknown>;
+    diff?: { key: string; from: unknown; to: unknown }[];
+  };
+  applied: boolean;
+  round_index?: number;
+}
+
+export interface AgentTurn {
+  role: "user" | "assistant";
+  text: string;
+  at: string;
+  calls: AgentToolCall[];
+  labels: AgentLabel[];
+  proposals: AgentProposal[];
+  usage: Record<string, unknown>;
+  stop_reason: string;
+  error: string;
+}
+
+export interface Conversation {
+  session_id: string;
+  session_name: string;
+  created_at: string;
+  updated_at: string;
+  turns: AgentTurn[];
+  summary: string;
+  summarised_through: number;
+  disclaimer: string;
+}
+
+export interface AgentMessageRequest {
+  message: string;
+  round_index?: number;
+  provider?: string;
+  model?: string;
+  base_url?: string;
+  budget?: { max_tool_calls: number; max_evaluations: number; max_seconds: number };
+}
+
+export interface AgentJob {
+  job_id: string;
+  status: "queued" | "running" | "done" | "failed" | "stopped";
+  error: string | null;
+  result: Record<string, unknown> | null;
 }

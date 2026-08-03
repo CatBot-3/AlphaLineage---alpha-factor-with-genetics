@@ -1,4 +1,4 @@
-"""Phase 0 acceptance tests (DEVELOPMENT_PLAN §6, Phase 0)."""
+"""Phase 0 acceptance tests: the data layer's point-in-time and adjustment guarantees."""
 
 from __future__ import annotations
 

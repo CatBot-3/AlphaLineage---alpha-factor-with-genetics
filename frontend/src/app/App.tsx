@@ -27,6 +27,7 @@ import {
   type WorkspaceSnapshot,
 } from "../api/types";
 import { Dashboard } from "../dashboard/Dashboard";
+import { AgentPage } from "../agent/AgentPage";
 import { ExtendPanel, type ExtendPage } from "../extend/ExtendPanel";
 import { rowsFromUniverse } from "../extend/toUniversePayload";
 import { BestFormulaResultPage } from "../factor/BestFormulaResultPage";
@@ -35,7 +36,7 @@ import { Genealogy } from "../genealogy/Genealogy";
 import { LibraryPanel } from "../library/LibraryPanel";
 import { TrainPanel } from "../train/TrainPanel";
 import { useSession } from "../train/useSession";
-import { AppShell, type Tab } from "./AppShell";
+import { AppShell, isTab, type Tab } from "./AppShell";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { EvaluationNavigator } from "./EvaluationNavigator";
 import { getAppMode } from "./mode";
@@ -69,10 +70,16 @@ const PAGE_COPY: Record<Exclude<Tab, "extend">, { title: string; description: st
     title: "Formula Results",
     description: "Review saved training and backtest evidence, or seed a new search from selected results.",
   },
+  agent: {
+    title: "Agent",
+    description: "Ask about a discovered formula, or put a model to work improving it. It proposes; you decide.",
+  },
 };
 
 function tabFromWorkspace(snapshot: WorkspaceSnapshot | null, mode: string): Tab {
-  if (snapshot?.ui.selectedTab) return snapshot.ui.selectedTab;
+  // Checked rather than trusted: a workspace saved by an older build can name a tab that has
+  // since been renamed or removed, and a bad value here reaches PAGE_COPY below.
+  if (isTab(snapshot?.ui.selectedTab)) return snapshot.ui.selectedTab;
   // App mode with nothing loaded starts at the run launcher; demo opens on metrics.
   return mode === "app" && !snapshot?.run ? "train" : "dashboard";
 }
@@ -184,7 +191,7 @@ export function App() {
 
   const applyWorkspace = useCallback((snapshot: WorkspaceSnapshot) => {
     setRun(snapshot.run);
-    setTab(snapshot.ui.selectedTab ?? "dashboard");
+    setTab(isTab(snapshot.ui.selectedTab) ? snapshot.ui.selectedTab : "dashboard");
     setSelectedNode(applyNode(snapshot.ui.selectedFactorNode));
     setSelectedLineage(snapshot.ui.selectedLineage ?? null);
     setUniverseDraft(snapshot.universeDraft);
@@ -652,6 +659,11 @@ export function App() {
 
   const factor = run ? parseFactor(run.best_factor) : null;
 
+  // The agent works from a session: it needs the frozen split boundaries and the search history,
+  // neither of which an ad-hoc expression has.
+  const agentSessionId = sessionController.sessionId ?? run?.session_id ?? null;
+  const agentRoundIndex = selectedRound ?? run?.round_index ?? run?.segment ?? null;
+
   if (shutDown) {
     return (
       <div className="goodbye" data-testid="goodbye">
@@ -688,8 +700,17 @@ export function App() {
       <section className="app-page">
         {tab !== "extend" && (
           <PageHeader
-            title={PAGE_COPY[tab].title}
-            description={PAGE_COPY[tab].description}
+            // Defence in depth. `tab` is validated on the way in, so a miss here means a tab was
+            // added without copy — which should look like a bare heading, not a white screen.
+            title={PAGE_COPY[tab]?.title ?? tab}
+            description={PAGE_COPY[tab]?.description ?? ""}
+            actions={
+              tab === "agent" ? (
+                <span className="beta-badge" data-testid="agent-beta">
+                  Beta
+                </span>
+              ) : undefined
+            }
           />
         )}
 
@@ -782,6 +803,22 @@ export function App() {
           <section className="view-card" data-view="library">
             <div className="view-body">
               <LibraryPanel onSeed={startSeededSession} />
+            </div>
+          </section>
+        )}
+
+        {tab === "agent" && (
+          <section className="view-card" data-view="agent">
+            <div className="view-body">
+              <AgentPage
+                sessionId={mode === "app" ? (agentSessionId ?? undefined) : undefined}
+                sessionName={sessionController.state?.name}
+                roundIndex={agentRoundIndex ?? undefined}
+                onRoundsChanged={() => {
+                  const id = sessionController.sessionId ?? run?.session_id;
+                  if (id) void listSessionRounds(id).then(setRounds).catch(() => {});
+                }}
+              />
             </div>
           </section>
         )}

@@ -1,0 +1,386 @@
+/* P11 - the Agent page: one chat thread, collapsible work, staged proposals. */
+
+.agent-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-height: 0;
+}
+
+/* --- the thread --------------------------------------------------------------- */
+.agent-thread {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-2) 0;
+}
+
+.agent-empty p {
+  max-width: 74ch;
+}
+
+.agent-empty ul {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-5);
+}
+
+.agent-turn {
+  max-width: 84ch;
+}
+
+.agent-turn--user {
+  align-self: flex-end;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md, 8px);
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  white-space: pre-wrap;
+}
+
+.agent-turn--assistant {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.agent-turn__text {
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+.agent-thinking {
+  color: var(--color-muted);
+  font-size: 0.88rem;
+}
+
+/* --- the working block -------------------------------------------------------- */
+.agent-work__toggle,
+.agent-call__head {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--color-muted);
+  cursor: pointer;
+  text-align: left;
+}
+
+.agent-work__toggle {
+  font-size: 0.85rem;
+}
+
+.agent-calls {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0 0 0 var(--space-3);
+  border-left: 2px solid color-mix(in srgb, var(--color-ink) 12%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.agent-calls li[data-ok="false"] .agent-call__head code {
+  color: var(--color-danger);
+}
+
+.agent-call__chevron {
+  width: 1ch;
+}
+
+.agent-call__args {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.agent-call__headline {
+  margin: 2px 0 0 calc(1ch + var(--space-2));
+}
+
+.agent-call__result {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2);
+  max-height: 320px;
+  overflow: auto;
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+  border-radius: var(--radius-sm, 6px);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+/* Safety class is the thing to read at a glance: did it look, or did it spend? */
+.agent-safety {
+  padding: 1px var(--space-2);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.agent-safety--read {
+  background: color-mix(in srgb, var(--color-ink) 10%, transparent);
+  color: var(--color-muted);
+}
+
+.agent-safety--evaluate {
+  background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+  color: color-mix(in srgb, var(--color-accent) 60%, var(--color-ink));
+}
+
+.agent-safety--propose {
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: var(--color-primary);
+}
+
+.agent-safety--annotate {
+  background: color-mix(in srgb, var(--color-ok) 14%, transparent);
+  color: var(--color-ok);
+}
+
+/* --- labels (from the model, not a fixed list) -------------------------------- */
+.agent-labels {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.agent-labels li {
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid color-mix(in srgb, var(--color-ok) 55%, transparent);
+  background: color-mix(in srgb, var(--color-ok) 6%, transparent);
+  border-radius: var(--radius-sm, 6px);
+}
+
+.agent-labels p {
+  margin: 2px 0 0;
+  max-width: 76ch;
+}
+
+.agent-label__name {
+  font-weight: 600;
+}
+
+.agent-label__evidence {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--color-muted);
+}
+
+/* --- proposals ---------------------------------------------------------------- */
+.agent-proposals {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.agent-proposal {
+  border: 1px solid color-mix(in srgb, var(--color-ink) 16%, transparent);
+  border-radius: var(--radius-sm, 6px);
+  padding: var(--space-3);
+}
+
+.agent-proposal header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.agent-proposal h5 {
+  margin: 0 0 var(--space-2);
+  font-size: 0.95rem;
+}
+
+.agent-proposal__kind {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-muted);
+}
+
+.agent-proposal pre {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-3);
+  overflow-x: auto;
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+  border-radius: var(--radius-sm, 6px);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.agent-proposal__rationale {
+  margin: 0 0 var(--space-3);
+  max-width: 78ch;
+}
+
+.agent-proposal__actions .hint {
+  margin-top: var(--space-2);
+  max-width: 78ch;
+}
+
+.agent-proposal__applied {
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--color-ok);
+  background: color-mix(in srgb, var(--color-ok) 8%, transparent);
+  border-radius: var(--radius-sm, 6px);
+}
+
+.agent-diff {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  margin-bottom: var(--space-2);
+}
+
+.agent-diff th,
+.agent-diff td {
+  text-align: left;
+  padding: var(--space-2);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-ink) 12%, transparent);
+}
+
+/* --- the composer ------------------------------------------------------------- */
+.agent-composer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  background: var(--color-bg);
+  border-top: 1px solid color-mix(in srgb, var(--color-ink) 12%, transparent);
+}
+
+.agent-composer textarea {
+  font-family: inherit;
+  font-size: 0.95rem;
+  resize: vertical;
+}
+
+.agent-composer__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.agent-composer__row label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: 0.8rem;
+  color: var(--color-muted);
+}
+
+.agent-composer__row input {
+  width: 8ch;
+}
+
+.agent-capability ul {
+  list-style: none;
+  margin: var(--space-2) 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.agent-capability li p {
+  margin: 2px 0 0;
+  max-width: 78ch;
+}
+
+.link-action {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--color-primary);
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+
+.explanation-warning {
+  font-size: 0.8rem;
+  color: var(--color-danger);
+}
+
+/* --- beta marks --------------------------------------------------------------- */
+/* Superscripted off the nav label so the tab keeps its baseline with the others. */
+.nav__link--beta {
+  padding-right: 26px;
+}
+
+.nav__beta {
+  position: absolute;
+  top: 2px;
+  right: 0;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+
+.beta-badge {
+  display: inline-block;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-accent);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-accent) 70%, var(--color-ink));
+  white-space: nowrap;
+}
+
+/* --- outside the agent page --------------------------------------------------- */
+
+/* An agent round sits in the same numbering as the GP's, so it needs to read
+   differently at a glance without implying it is worth less. */
+.round-agent-badge {
+  padding: 1px var(--space-2);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: color-mix(in srgb, var(--color-primary) 16%, transparent);
+  color: var(--color-primary);
+}
+
+.round-navigator__dots button.is-agent {
+  background: color-mix(in srgb, var(--color-primary) 45%, transparent);
+  border-color: var(--color-primary);
+}
+
+/* Re-rolling the seed is a deliberate act, so the control is visible but plain. */
+.field-seed-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.field-seed-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.seed-dice {
+  flex-shrink: 0;
+  padding: 2px var(--space-2);
+  font-size: 16px;
+  line-height: 1.2;
+  cursor: pointer;
+}

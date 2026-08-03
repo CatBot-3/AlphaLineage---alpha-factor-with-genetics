@@ -387,8 +387,10 @@ The **⚙** button in the top-right opens the control menu (backend/app mode onl
 - **Quality gates** (run before changing anything): `pytest -q`, `ruff check .`, `mypy src`, and in
   `frontend/`, `npm run typecheck && npm test`. The two load-bearing tests are synthetic-signal
   recovery and noise rejection; if either regresses, fix it before proceeding.
-- **Architecture and invariants:** [`CLAUDE.md`](../CLAUDE.md) and
-  [`DEVELOPMENT_PLAN.md`](../DEVELOPMENT_PLAN.md).
+- **Architecture and invariants:** [`CLAUDE.md`](../CLAUDE.md).
+- **The Agent tab:** [`AGENT.md`](AGENT.md) for the design and its rationale,
+  [`AGENT_WALKTHROUGH.md`](AGENT_WALKTHROUGH.md) for a step-by-step trace of what happens when you
+  send a message.
 - **Static demo:** `cd frontend && npm run build:demo`, then deploy `dist/`. Regenerate the snapshot
   from a real run with `python scripts/export_demo.py --workspace run-<id> --out
   frontend/public/demo-run.json`.

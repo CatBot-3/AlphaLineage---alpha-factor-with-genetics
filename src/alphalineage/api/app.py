@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from alphalineage.agent import service as agent_service
+from alphalineage.agent import tools as agent_tools
+from alphalineage.agent.conversation import ConversationStore
+from alphalineage.agent.guards import (
+    DEFAULT_MAX_EVALUATIONS,
+    DEFAULT_MAX_SECONDS,
+    DEFAULT_MAX_TOOL_CALLS,
+    MAX_EVALUATIONS_CEILING,
+    MAX_SECONDS_CEILING,
+    MAX_TOOL_CALLS_CEILING,
+    PROTECTED_KEYS,
+    TUNABLE_KEYS,
+    GuardViolation,
+)
+from alphalineage.agent.guards import Budget as AgentBudget
 from alphalineage.api import sessions
 from alphalineage.api.jobs import JobStore
 from alphalineage.api.progress import RunProgress, SyncProgress
@@ -104,6 +120,8 @@ from alphalineage.data.universe import (
     universe_presets,
 )
 from alphalineage.data.yfinance_provider import YFinanceProvider
+from alphalineage.explain import credentials as explain_credentials
+from alphalineage.explain.providers import LLMError
 from alphalineage.library.factors import DISCLAIMER, FactorStore
 from alphalineage.library.indicator_catalog import (
     CATALOG_NAMES,
@@ -361,6 +379,15 @@ class SettingsUpdate(BaseModel):
     factors_dir: str | None = None
     tiingo_api_key: str | None = None
     evaluator: str | None = None
+    # P9 explanation layer. The key follows the Tiingo contract exactly: an empty string clears
+    # it, and it is never echoed back by GET /settings.
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    #: Which provider the key belongs to, when setting a key for a provider other than the
+    #: currently selected one.
+    llm_api_key_provider: str | None = None
 
 
 class DataClearRequest(BaseModel):
@@ -4047,6 +4074,8 @@ def get_settings() -> dict[str, Any]:
         "tiingo_stored_key_set": stored_key_set,
         "evaluator": stored.get("evaluator", "auto"),
         "cpp_available": cpp.available(),
+        # The LLM key is reported the same way: presence and source only, never the value.
+        **explain_credentials.load_config(settings=stored).public_dict(),
     }
 
 
@@ -4074,6 +4103,26 @@ def update_settings(update: SettingsUpdate) -> dict[str, Any]:
             )
         settings["evaluator"] = evaluator
         cpp.set_backend(evaluator)
+    if any(
+        value is not None
+        for value in (
+            update.llm_provider,
+            update.llm_model,
+            update.llm_base_url,
+            update.llm_api_key,
+        )
+    ):
+        try:
+            explain_credentials.update_settings(
+                settings,
+                provider=update.llm_provider,
+                model=update.llm_model,
+                base_url=update.llm_base_url,
+                api_key=update.llm_api_key,
+                api_key_provider=update.llm_api_key_provider,
+            )
+        except LLMError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     paths.write_settings(settings)
     return get_settings()
 
@@ -5259,6 +5308,38 @@ def get_session_finalization(
     return payload
 
 
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str) -> dict[str, Any]:
+    """Remove a session and everything that belongs to it.
+
+    The agent conversation, its memory, and its tool-call history live inside the session
+    directory precisely so this one removal takes them with it — there is no second cleanup path
+    that could be forgotten. A running segment or finalization blocks the delete rather than
+    being killed underneath itself.
+    """
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    session = sessions.load_session(session_id)
+    if _live_session_job(session) is not None:
+        raise HTTPException(status_code=409, detail="stop the running segment before deleting")
+    for key in ("active_finalization_job_id", "active_strategy_comparison_job_id"):
+        active = _jobs.get(str(session.get(key) or ""))
+        if active is not None and active.status in {"queued", "running"}:
+            raise HTTPException(
+                status_code=409, detail="wait for the running holdout job before deleting"
+            )
+
+    directory = sessions.session_dir(session_id)
+    had_conversation = (directory / "conversation.json").exists()
+    shutil.rmtree(directory, ignore_errors=True)
+    if directory.exists():
+        raise HTTPException(status_code=500, detail="the session directory could not be removed")
+    return {
+        "deleted": session_id,
+        "conversation_deleted": had_conversation,
+    }
+
+
 @app.post("/sessions/{session_id}/stop")
 def stop_session(session_id: str) -> dict[str, bool]:
     if not _session_exists(session_id):
@@ -5274,6 +5355,203 @@ def stop_session(session_id: str) -> dict[str, bool]:
     if comparison_id and _jobs.cancel(comparison_id):
         return {"stopping": True}
     return {"stopping": False}
+
+
+# --- P11: the agent ---------------------------------------------------------------
+# One conversational surface. The model's reach is defined by the tool registry and nothing else:
+# its evaluation tool takes no date argument, and the panel it is handed is truncated at the
+# session's frozen train_end, so the validation window and the locked holdout are absent rather
+# than merely forbidden (invariant 1). Every mutation stops at an explicit human action —
+# promoting a factor, or applying a config patch.
+_agent_jobs = JobStore()
+
+
+class AgentBudgetRequest(BaseModel):
+    max_tool_calls: int = Field(default=DEFAULT_MAX_TOOL_CALLS, ge=1, le=MAX_TOOL_CALLS_CEILING)
+    max_evaluations: int = Field(
+        default=DEFAULT_MAX_EVALUATIONS, ge=1, le=MAX_EVALUATIONS_CEILING
+    )
+    max_seconds: float = Field(default=DEFAULT_MAX_SECONDS, gt=0, le=MAX_SECONDS_CEILING)
+
+
+class AgentMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    round_index: int | None = Field(default=None, ge=0)
+    provider: str = ""
+    model: str = ""
+    base_url: str = ""
+    budget: AgentBudgetRequest | None = None
+
+
+def _conversation_store() -> ConversationStore:
+    return ConversationStore()
+
+
+@app.get("/agent/tools")
+def list_agent_tools() -> dict[str, Any]:
+    """The complete tool catalog. This is the agent's entire capability, shown before use."""
+    return {
+        "tools": agent_tools.catalog(),
+        "tunable_config_keys": sorted(TUNABLE_KEYS),
+        "protected_config_keys": dict(sorted(PROTECTED_KEYS.items())),
+        "defaults": {
+            "max_tool_calls": DEFAULT_MAX_TOOL_CALLS,
+            "max_evaluations": DEFAULT_MAX_EVALUATIONS,
+            "max_seconds": DEFAULT_MAX_SECONDS,
+        },
+        "unavailable_reason": agent_service.unavailable_reason(),
+        "disclaimer": DISCLAIMER,
+    }
+
+
+@app.get("/agent/conversations")
+def list_conversations() -> list[dict[str, Any]]:
+    return _conversation_store().list()
+
+
+@app.get("/agent/conversations/{session_id}")
+def get_conversation(session_id: str) -> dict[str, Any]:
+    """The thread for one training session. Empty rather than 404 when nothing has been said."""
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    session = sessions.load_session(session_id)
+    conversation = _conversation_store().load_or_create(
+        session_id, str(session.get("name") or session_id)
+    )
+    return conversation.to_dict()
+
+
+@app.delete("/agent/conversations/{session_id}")
+def clear_conversation(session_id: str) -> dict[str, bool]:
+    """Clear the thread without deleting the training session it belongs to."""
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    return {"cleared": _conversation_store().delete(session_id)}
+
+
+@app.post("/agent/conversations/{session_id}/messages", response_model=JobResponse)
+def send_agent_message(
+    session_id: str,
+    req: AgentMessageRequest,
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
+) -> JobResponse:
+    """Send one message. The model decides which tools the request needs."""
+    _load_persisted_formulas()
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    session = sessions.load_session(session_id)
+    universe = _resolve_universe(str(session.get("universe") or ""))
+    as_of = str(session.get("as_of") or _today_iso())
+    run_panel = _panel_for_universe(universe.name, as_of, panel)
+
+    budget_request = req.budget or AgentBudgetRequest()
+    try:
+        context = agent_service.build_context(
+            session_id,
+            panel=run_panel,
+            round_index=req.round_index,
+            budget=AgentBudget(
+                max_tool_calls=budget_request.max_tool_calls,
+                max_evaluations=budget_request.max_evaluations,
+                max_seconds=budget_request.max_seconds,
+            ),
+        )
+    except (agent_service.AgentError, GuardViolation, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    config = explain_credentials.load_config(
+        provider=req.provider, model=req.model, base_url=req.base_url
+    )
+    if not config.key.is_set:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"no API key configured for provider '{config.provider}'. Add one in Settings "
+                "or set the provider's environment variable."
+            ),
+        )
+
+    def _task() -> dict[str, Any]:
+        return agent_service.send_message(
+            session_id,
+            context,
+            message=req.message,
+            provider=req.provider,
+            model=req.model,
+            base_url=req.base_url,
+            store=_conversation_store(),
+        )
+
+    return JobResponse(job_id=_agent_jobs.submit(_task), status="queued")
+
+
+@app.get("/agent/jobs/{job_id}")
+def get_agent_job(job_id: str) -> dict[str, Any]:
+    job = _agent_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown agent job")
+    return {"job_id": job.id, "status": job.status, "error": job.error, "result": job.result}
+
+
+@app.post("/agent/jobs/{job_id}/stop")
+def stop_agent_job(job_id: str) -> dict[str, bool]:
+    if _agent_jobs.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="unknown agent job")
+    return {"stopping": _agent_jobs.cancel(job_id)}
+
+
+@app.post(
+    "/agent/conversations/{session_id}/proposals/{proposal_id}/promote",
+    response_model=JobResponse,
+)
+def promote_agent_proposal(
+    session_id: str,
+    proposal_id: str,
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
+) -> JobResponse:
+    """Promote a staged factor into a real round.
+
+    Runs the session's actual validation pass first — the agent only ever saw an inner holdout
+    inside the training window, and a round carrying only that number would look like a peer of
+    rounds that have been properly validated. Async because that validation is real work.
+    """
+    _load_persisted_formulas()
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    session = sessions.load_session(session_id)
+    universe = _resolve_universe(str(session.get("universe") or ""))
+    as_of = str(session.get("as_of") or _today_iso())
+    run_panel = _panel_for_universe(universe.name, as_of, panel)
+
+    try:
+        plan = agent_service.plan_promotion(session_id, proposal_id, store=_conversation_store())
+    except agent_service.AgentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    progress = RunProgress(target_generations=0)
+
+    def _task() -> dict[str, Any]:
+        return agent_service.promote(
+            session_id,
+            proposal_id,
+            panel=run_panel,
+            store=_conversation_store(),
+            progress=progress,
+        )
+
+    del plan  # validated up front so a bad id is a 400 rather than a failed job
+    return JobResponse(job_id=_agent_jobs.submit(_task, progress=progress), status="queued")
+
+
+@app.post("/agent/conversations/{session_id}/proposals/{proposal_id}/apply-config")
+def apply_agent_config(session_id: str, proposal_id: str) -> dict[str, Any]:
+    """Merge a staged config patch into the session for the next segment."""
+    try:
+        return agent_service.apply_config(
+            session_id, proposal_id, store=_conversation_store()
+        )
+    except agent_service.AgentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --- static frontend (single-image Docker serving) -------------------------------
