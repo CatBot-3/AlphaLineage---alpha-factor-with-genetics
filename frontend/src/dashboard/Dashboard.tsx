@@ -8,7 +8,9 @@ import type {
 } from "../api/types";
 import { BenchmarkComparison } from "./BenchmarkComparison";
 import { LineChart } from "./LineChart";
+import { FactorOverlapPanel } from "./FactorOverlapPanel";
 import { StrategyComparisonPanel } from "./StrategyComparisonPanel";
+import { executionTimingLabel } from "../train/defaults";
 
 function decimal(value: number | null | undefined, digits = 3): string {
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
@@ -58,6 +60,8 @@ function RunContextLine({ result }: { result?: RunResult }) {
       boundaries?.test_end &&
       `Frozen holdout ${boundaries.test_start}–${boundaries.test_end}`,
     context.horizon != null && `Horizon ${context.horizon}d`,
+    // Contexts written before execution timing existed used the same-close assumption.
+    context.boundaries && `Trade at: ${executionTimingLabel(context.execution)}`,
     context.weighting_scheme && context.weighting_scheme.replace(/_/g, " "),
     context.commission_bps != null &&
       context.slippage_bps != null &&
@@ -587,6 +591,13 @@ export function Dashboard({
             />
           </details>
         )}
+
+      {extra?.session_id && (extra.round_index ?? extra.segment) !== undefined && (
+        <FactorOverlapPanel
+          sessionId={extra.session_id}
+          roundIndex={(extra.round_index ?? extra.segment) as number}
+        />
+      )}
 
       <section className="dashboard-section history" data-testid="search-convergence">
         <header className="dashboard-section__head">

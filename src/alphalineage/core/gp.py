@@ -29,6 +29,7 @@ from alphalineage.core.fitness import (
     DEFAULT_NORMALIZED_COMPLEXITY_PENALTY,
     forward_returns,
     score_trees,
+    validate_execution,
 )
 from alphalineage.core.generate import GenerationError, RandomTreeGenerator, operator_allowed
 from alphalineage.core.panel import Panel
@@ -152,6 +153,9 @@ class GPConfig:
     ic_method: str = "spearman"
     min_names: int = 5
     horizon: int = 1
+    # When a signal is traded (see ``fitness.EXECUTION_TIMINGS``). Missing means the legacy
+    # same-close assumption, so stored sessions and checkpoints keep their exact meaning.
+    execution: str = "close"
     min_depth: int = 2
     seed: int = 0
     time_budget_s: float | None = None
@@ -255,6 +259,7 @@ class GPConfig:
             raise ValueError(
                 "complexity_penalty_value must be a finite non-negative number or None"
             )
+        validate_execution(self.execution)
         if self.ic_method not in {"pearson", "spearman"}:
             raise ValueError("ic_method must be 'pearson' or 'spearman'")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -457,7 +462,11 @@ class GP:
             raise ValueError("memory_budget_bytes must be a positive integer or None")
         self.config = config
         self.panel = panel
-        self.fwd = fwd if fwd is not None else forward_returns(panel, config.horizon)
+        self.fwd = (
+            fwd
+            if fwd is not None
+            else forward_returns(panel, config.horizon, config.execution)
+        )
         self.root_type = root_type
         # Optional lineage recorder (duck-typed: on_init(trees), on_generation(gen, entries)).
         self.recorder = recorder
@@ -2249,7 +2258,11 @@ class GP:
         """
         self._prior_trials += len(self._cache)
         self._cache.clear()
-        self.fwd = fwd if fwd is not None else forward_returns(self.panel, self.config.horizon)
+        self.fwd = (
+            fwd
+            if fwd is not None
+            else forward_returns(self.panel, self.config.horizon, self.config.execution)
+        )
         scored_population = self._individuals(
             [self._validate_seed(individual.tree) for individual in self.population],
             phase="initializing",

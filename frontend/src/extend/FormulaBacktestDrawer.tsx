@@ -10,6 +10,7 @@ import {
   stopFormulaTest,
 } from "../api/client";
 import type {
+  ExecutionTiming,
   FormulaInputSpec,
   FormulaResult,
   FormulaResultSeriesPoint,
@@ -25,6 +26,7 @@ import {
   PORTFOLIO_STRATEGIES,
   portfolioStrategyLabel,
 } from "../dashboard/StrategyComparisonPanel";
+import { EXECUTION_TIMING_OPTIONS } from "../train/defaults";
 
 const DATA_FIELDS = ["open", "high", "low", "close", "volume", "vwap", "returns"];
 const COLORS = ["#0f1c4a", "#a97700", "#0f5b3d", "#9f1d20"];
@@ -140,6 +142,7 @@ export function FormulaBacktestDrawer({
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [horizon, setHorizon] = useState(1);
+  const [execution, setExecution] = useState<ExecutionTiming>("next_open");
   const [strategyIds, setStrategyIds] = useState<string[]>([
     "quantile_ls_20",
     "rank_proportional",
@@ -276,6 +279,7 @@ export function FormulaBacktestDrawer({
         start: start || null,
         end,
         horizon,
+        execution,
         strategies,
         // Compatibility aliases keep the request valid against an older local backend.
         weighting_scheme: primary.scheme,
@@ -349,6 +353,7 @@ export function FormulaBacktestDrawer({
           <label className="field"><span className="field-label">Start</span><input type="date" value={start} onChange={(event) => setStart(event.target.value)} /></label>
           <label className="field"><span className="field-label">End</span><input type="date" value={end} onChange={(event) => setEnd(event.target.value)} /></label>
           <label className="field"><span className="field-label">Forward horizon</span><input type="number" min={1} value={horizon} onChange={(event) => setHorizon(Math.max(1, Number(event.target.value) || 1))} /></label>
+          <label className="field"><span className="field-label">Execution timing</span><select aria-label="Execution timing" value={execution} onChange={(event) => setExecution(event.target.value as ExecutionTiming)}>{EXECUTION_TIMING_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.short}</option>)}</select></label>
           <label className="field"><span className="field-label">Commission (bps)</span><input type="number" min={0} step={0.1} value={commission} onChange={(event) => setCommission(Number(event.target.value))} /></label>
           <label className="field"><span className="field-label">Slippage (bps)</span><input type="number" min={0} step={0.1} value={slippage} onChange={(event) => setSlippage(Number(event.target.value))} /></label>
         </div>

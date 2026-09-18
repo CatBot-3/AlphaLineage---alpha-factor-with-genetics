@@ -28,6 +28,28 @@ def test_cache_roundtrip(synthetic_prices):
     assert cache.has("AAPL")
 
 
+def test_cache_store_is_atomic_when_a_write_is_interrupted(synthetic_prices, monkeypatch):
+    """A killed download must never leave a truncated Parquet file that blocks later runs."""
+    cache = ParquetCache()
+    frame = normalize(synthetic_prices)
+    cache.store("AAPL", frame)
+    before = cache.path_for("AAPL").read_bytes()
+
+    def interrupted(self, path, *args, **kwargs):
+        with open(path, "wb") as handle:
+            handle.write(b"PAR1-partial")
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patched:
+        patched.setattr(pd.DataFrame, "to_parquet", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            cache.store("AAPL", frame.iloc[:5])
+
+    assert cache.path_for("AAPL").read_bytes() == before
+    assert len(cache.load("AAPL")) == len(frame)
+    assert not list(cache.root.glob("*.tmp"))
+
+
 def test_split_continuity():
     """Across a 2:1 split, the adjusted close has no discontinuity (raw does)."""
     idx = pd.date_range("2020-01-01", periods=6, freq="B")

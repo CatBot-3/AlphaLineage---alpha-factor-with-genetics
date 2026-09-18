@@ -1,4 +1,4 @@
-import type { GpConfig } from "../api/types";
+import type { ExecutionTiming, GpConfig } from "../api/types";
 
 // A light, interactive preset (the full dev.yaml defaults are 200x25; that is too slow for a
 // click-and-watch first run). Every field is editable in the form, so users can scale up.
@@ -21,6 +21,7 @@ export const DEFAULT_CONFIG: GpConfig = {
   ic_method: "spearman",
   min_names: 5,
   horizon: 1,
+  execution: "next_open",
   min_depth: 2,
   seed: 0,
   time_budget_s: null,
@@ -47,3 +48,42 @@ export const ADVANCED_FIELDS: Array<{ key: keyof GpConfig; label: string }> = [
   { key: "min_names", label: "Min names" },
   { key: "horizon", label: "Horizon" },
 ];
+
+export const EXECUTION_TIMING_OPTIONS: Array<{
+  value: ExecutionTiming;
+  label: string;
+  short: string;
+  description: string;
+}> = [
+  {
+    value: "next_open",
+    label: "Next day's open (recommended)",
+    short: "Next open",
+    description:
+      "Signals are computed after today's close and traded at tomorrow's opening auction, " +
+      "then held open to open. Matches an end-of-day workflow. The open is a noisy, wide-spread " +
+      "price, so keep costs conservative.",
+  },
+  {
+    value: "next_close",
+    label: "Next day's close (one-day delay)",
+    short: "Next close",
+    description:
+      "Signals are traded in tomorrow's closing auction and held close to close. The most " +
+      "conservative choice: anything that survives a full day's delay is not a same-day artifact.",
+  },
+  {
+    value: "close",
+    label: "Same close (optimistic, legacy)",
+    short: "Same close",
+    description:
+      "Assumes you can trade at the very close that produced the signal. Useful for comparing " +
+      "with older sessions, but it overstates fast signals, which often feed on closing-price " +
+      "noise that reverses overnight.",
+  },
+];
+
+export function executionTimingLabel(value: ExecutionTiming | undefined | null): string {
+  const resolved = value ?? "close";
+  return EXECUTION_TIMING_OPTIONS.find((option) => option.value === resolved)?.short ?? resolved;
+}

@@ -34,7 +34,7 @@ from alphalineage.backtest.costs import TransactionCostModel
 from alphalineage.backtest.engine import backtest
 from alphalineage.backtest.portfolio import get_scheme
 from alphalineage.core.evaluate import evaluate
-from alphalineage.core.fitness import forward_returns, score_tree
+from alphalineage.core.fitness import forward_returns, label_span, score_tree
 from alphalineage.core.panel import Panel
 from alphalineage.core.tree import Node
 
@@ -177,7 +177,7 @@ def score_candidate(
     context.guard.assert_within(context.panel.dates, what="agent candidate scoring")
     split = inner_split(
         context.train_dates,
-        horizon=context.horizon,
+        horizon=label_span(context.horizon, context.execution),
         embargo=int(context.boundaries.embargo),
     )
     context.guard.assert_within(split.holdout, what="agent inner holdout")
@@ -186,7 +186,7 @@ def score_candidate(
     for name, window in (("inner_train", split.train), ("inner_holdout", split.holdout)):
         window_panel = _slice(context.panel, window)
         context.guard.assert_within(window_panel.dates, what=f"agent {name} panel")
-        fwd = forward_returns(window_panel, context.horizon).reindex(window)
+        fwd = forward_returns(window_panel, context.horizon, context.execution).reindex(window)
         _, metrics = score_tree(
             tree,
             window_panel,
@@ -231,7 +231,7 @@ def _inner_backtest(tree: Node, context: AgentContext, split: InnerSplit) -> dic
     factor = evaluate(tree, window_panel)
     if not isinstance(factor, pd.DataFrame):
         return {"integrity_issues": ["the expression did not evaluate to a panel"]}
-    fwd = forward_returns(window_panel, context.horizon)
+    fwd = forward_returns(window_panel, context.horizon, context.execution)
     scheme = get_scheme(
         context.weighting_scheme,
         **({"quantile": context.quantile} if context.weighting_scheme == "quantile_ls" else {}),
@@ -244,6 +244,7 @@ def _inner_backtest(tree: Node, context: AgentContext, split: InnerSplit) -> dic
         TransactionCostModel(context.commission_bps, context.slippage_bps),
         dates=split.holdout,
         horizon=context.horizon,
+        execution=context.execution,
     )
     return {
         "scheme": report.scheme,

@@ -79,6 +79,7 @@ def judge(
     n_trials: int,
     ic_method: str = "spearman",
     horizon: int = 1,
+    execution: str = "close",
     fwd: pd.DataFrame | None = None,
     min_names: int = 5,
     n_blocks: int = 16,
@@ -112,7 +113,7 @@ def judge(
     ``returns_from_factor`` lets the best tree reuse the factor frame already evaluated for IC.
     """
     if fwd is None:
-        fwd = forward_returns(panel, horizon)
+        fwd = forward_returns(panel, horizon, execution)
     factor = evaluate(best_tree, panel)
     if not isinstance(factor, pd.DataFrame):
         raise TypeError("best_tree must evaluate to a panel (SERIES/SIGNAL)")

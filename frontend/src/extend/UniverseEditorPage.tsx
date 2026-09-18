@@ -7,6 +7,7 @@ import {
   getDataSync,
   getMembershipSync,
   getUniverse,
+  listUniverseFolders,
   listUniversePresets,
   listUniverses,
   searchSymbols,
@@ -21,6 +22,7 @@ import type {
   SymbolValidation,
   SyncProgressSnapshot,
   UniverseDraft,
+  UniverseFolder,
   UniverseInfo,
   UniversePreset,
 } from "../api/types";
@@ -28,6 +30,7 @@ import { CompactSection } from "../app/CompactSection";
 import { UniverseDataSync } from "./SyncDataPage";
 import { rowsFromUniverse, toUniversePayload, uniqueSymbols, type UniverseRow } from "./toUniversePayload";
 import { parseMembershipImport } from "./membershipImport";
+import { UniverseTree } from "./UniverseTree";
 
 const EMPTY: UniverseRow = { symbol: "", entry: "", exit: "" };
 const DEFAULT_EXPECTED_START = "2020-01-01";
@@ -96,6 +99,8 @@ export function UniverseEditorPage({
   const [selectedUniverse, setSelectedUniverse] = useState(draft?.selectedUniverse ?? "");
   const [expectedStart, setExpectedStart] = useState(draft?.expectedStart ?? DEFAULT_EXPECTED_START);
   const [universeOptions, setUniverseOptions] = useState<UniverseInfo[]>([]);
+  // `null` means the backend has no folder API (older build): the tree then groups read-only.
+  const [universeFolders, setUniverseFolders] = useState<UniverseFolder[] | null>(null);
   const [loadedUniverse, setLoadedUniverse] = useState<UniverseInfo | null>(null);
   const [presets, setPresets] = useState<UniversePreset[]>([]);
   const [presetError, setPresetError] = useState<string | null>(null);
@@ -198,6 +203,14 @@ export function UniverseEditorPage({
       .catch(() => {
         if (!cancelled) setUniverseOptions([]);
       });
+    Promise.resolve()
+      .then(() => listUniverseFolders())
+      .then((tree) => {
+        if (!cancelled) setUniverseFolders(tree.folders);
+      })
+      .catch(() => {
+        if (!cancelled) setUniverseFolders(null);
+      });
     listUniversePresets()
       .then((items) => {
         if (!cancelled) {
@@ -269,10 +282,12 @@ export function UniverseEditorPage({
 
   async function refreshUniverses() {
     if (!canSubmit) return;
-    const [universesResult, presetsResult] = await Promise.allSettled([
+    const [universesResult, presetsResult, foldersResult] = await Promise.allSettled([
       listUniverses({ summary: true }),
       listUniversePresets(),
+      Promise.resolve().then(() => listUniverseFolders()),
     ]);
+    setUniverseFolders(foldersResult.status === "fulfilled" ? foldersResult.value.folders : null);
     if (presetsResult.status === "fulfilled") {
       setPresets(presetsResult.value);
       setPresetError(null);
@@ -669,21 +684,28 @@ export function UniverseEditorPage({
       {presetError && <p className="error">Could not load index templates: {presetError}</p>}
 
       {canSubmit && (
-        <label className="field">
-          <span className="field-label">Load universe</span>
-          <select
-            aria-label="Load universe"
-            value={selectedUniverse}
-            onChange={(event) => loadUniverse(event.target.value)}
-          >
-            <option value="">Draft only</option>
-            {universeOptions.map((universe) => (
-              <option key={universe.name} value={universe.name}>
-                {universe.display_name ?? universe.name} ({universe.source})
-              </option>
-            ))}
-          </select>
-        </label>
+        <CompactSection
+          title="Universe library"
+          summary={selectedInfo
+            ? `Loaded: ${selectedInfo.display_name ?? selectedInfo.name}`
+            : `${universeOptions.length} universes · draft only`}
+          defaultOpen
+          className="universe-library"
+        >
+          <p className="hint">
+            Pick a universe to load it. Sector and theme universes live in folders; open a folder
+            to see them. Folders only organize this list: moving a universe never changes its
+            members or the sessions that use it.
+          </p>
+          <UniverseTree
+            universes={universeOptions}
+            folders={universeFolders}
+            selected={selectedUniverse}
+            onSelect={(universeName) => void loadUniverse(universeName)}
+            editable
+            onChanged={() => refreshUniverses().catch((error) => setUniverseError(String(error)))}
+          />
+        </CompactSection>
       )}
 
       {selectedDetail && (

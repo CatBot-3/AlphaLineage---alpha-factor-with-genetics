@@ -11,5 +11,6 @@ def test_release_smoke_sees_native_evaluator_and_packaged_catalogs() -> None:
         "builtin-djia-current": 30,
         "builtin-nasdaq100-current": 103,
     }
-    assert result["starter_formulas"] == 37
-    assert result["active_starter_formulas"] == 36
+    assert result["classification_subsets"] == 31
+    assert result["starter_formulas"] == 96
+    assert result["active_starter_formulas"] == 95

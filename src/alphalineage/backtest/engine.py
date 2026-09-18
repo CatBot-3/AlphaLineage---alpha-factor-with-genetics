@@ -26,6 +26,7 @@ from alphalineage.backtest.portfolio import (
     validate_portfolio_weights,
 )
 from alphalineage.core.evaluate import evaluate
+from alphalineage.core.fitness import LEGACY_EXECUTION, execution_delay
 from alphalineage.core.panel import Panel
 from alphalineage.core.tree import Node
 
@@ -134,20 +135,30 @@ def _staggered_portfolio_path(
     scheme: WeightingScheme,
     costs: TransactionCostModel,
     horizon: int,
+    execution: str = LEGACY_EXECUTION,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-    """Return signal-indexed P&L from next-session, overlapping holdings.
+    """Return signal-indexed P&L from overlapping holdings entered at the execution time.
 
-    A signal observed at session ``t`` can first earn the close-to-close return labelled
-    ``t + 1`` in :class:`Panel`. For a horizon of ``h``, each signal cohort remains active
-    for ``h`` sessions and the live book is the equal-weight average of available cohorts.
+    ``close``: a signal observed at session ``t`` first earns the close-to-close return labelled
+    ``t + 1``. ``next_close``: it is traded at the close of ``t + 1`` and first earns the return
+    labelled ``t + 2``. ``next_open``: it is traded at the open of ``t + 1`` and earns
+    open-to-open returns, the first labelled ``t + 2``. For a horizon of ``h``, each signal
+    cohort remains active for ``h`` sessions and the live book is the equal-weight average of
+    available cohorts.
     """
     if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
         raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
+    lag = 1 + execution_delay(execution)
+    if execution == "next_open":
+        opens = panel["open"]
+        period_returns = opens.div(opens.shift(1)).sub(1.0)
+    else:
+        period_returns = panel["returns"]
 
     signal_weights = validate_portfolio_weights(scheme.weights(factor))
-    signal_weights, realized_returns = signal_weights.align(panel["returns"], join="inner")
+    signal_weights, realized_returns = signal_weights.align(period_returns, join="inner")
     realized_weights = (
-        signal_weights.shift(1).rolling(window=horizon, min_periods=1).mean().fillna(0.0)
+        signal_weights.shift(lag).rolling(window=horizon, min_periods=1).mean().fillna(0.0)
     )
 
     active = realized_weights.ne(0.0)
@@ -172,16 +183,16 @@ def _staggered_portfolio_path(
 
     # Validation partitions are defined on signal dates. Retain that stable index while carrying
     # the actual market realization date explicitly for reporting and benchmark alignment.
-    gross_by_signal = gross_realized.shift(-1)
-    net_by_signal = net_realized.shift(-1)
-    weights_by_signal = realized_weights.shift(-1)
-    traded_by_signal = traded_realized.shift(-1)
-    costs_by_signal = costs_realized.shift(-1)
+    gross_by_signal = gross_realized.shift(-lag)
+    net_by_signal = net_realized.shift(-lag)
+    weights_by_signal = realized_weights.shift(-lag)
+    traded_by_signal = traded_realized.shift(-lag)
+    costs_by_signal = costs_realized.shift(-lag)
     realization_dates = pd.Series(
         pd.DatetimeIndex(signal_weights.index),
         index=signal_weights.index,
         dtype="datetime64[ns]",
-    ).shift(-1)
+    ).shift(-lag)
     return (
         gross_by_signal,
         net_by_signal,
@@ -202,6 +213,7 @@ def backtest(
     periods: int = 252,
     dates: pd.DatetimeIndex | None = None,
     horizon: int = 1,
+    execution: str = LEGACY_EXECUTION,
 ) -> BacktestResult:
     """Run ``scheme`` over ``factor``; optionally report metrics on signal ``dates``.
 
@@ -217,7 +229,7 @@ def backtest(
         realization_dates,
         traded_notional,
         transaction_costs,
-    ) = _staggered_portfolio_path(factor, panel, scheme, costs, horizon)
+    ) = _staggered_portfolio_path(factor, panel, scheme, costs, horizon, execution)
 
     if dates is not None:
         mask = gross.index.isin(dates)
@@ -285,6 +297,7 @@ def compare_schemes(
     periods: int = 252,
     dates: pd.DatetimeIndex | None = None,
     horizon: int = 1,
+    execution: str = LEGACY_EXECUTION,
 ) -> list[BacktestResult]:
     """Run every scheme on the same factor + window for a side-by-side comparison."""
     return [
@@ -297,6 +310,7 @@ def compare_schemes(
             periods=periods,
             dates=dates,
             horizon=horizon,
+            execution=execution,
         )
         for scheme in schemes
     ]
@@ -332,6 +346,7 @@ def net_return_fn(
     costs: TransactionCostModel,
     *,
     horizon: int = 1,
+    execution: str = LEGACY_EXECUTION,
 ) -> Callable[[Node], pd.Series]:
     """A ``tree -> net (after-cost) return Series`` closure for the validation verdict."""
 
@@ -346,6 +361,7 @@ def net_return_fn(
             costs,
             panel=panel,
             horizon=horizon,
+            execution=execution,
         )
 
     return fn
@@ -359,6 +375,7 @@ def net_returns_for_factor(
     *,
     panel: Panel | None = None,
     horizon: int = 1,
+    execution: str = LEGACY_EXECUTION,
 ) -> pd.Series:
     """Net returns for an already-evaluated factor, avoiding duplicate evaluation.
 
@@ -367,9 +384,11 @@ def net_returns_for_factor(
     """
     if panel is not None:
         _, net, _, _, _, _ = _staggered_portfolio_path(
-            factor, panel, scheme, costs, horizon
+            factor, panel, scheme, costs, horizon, execution
         )
         return net
+    if execution != LEGACY_EXECUTION:
+        raise ValueError("a delayed execution timing requires the panel for its return path")
     weights = validate_portfolio_weights(scheme.weights(factor))
     weights, returns = weights.align(fwd, join="inner")
     gross = (weights * returns).sum(axis=1, min_count=1)

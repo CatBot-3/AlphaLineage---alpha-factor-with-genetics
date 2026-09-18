@@ -29,6 +29,12 @@ definition so readiness is visible before training begins.
 <sub>The LEH row shown in the import example deliberately demonstrates a historical exited
 constituent. It is not a member of the bundled live-stock sample.</sub>
 
+The **Universe library** also ships the S&P 500 snapshot split into its 11 GICS sectors and 20
+sub-industry themes (semiconductors, banks, pharma & biotech, agriculture & food, REITs, ...). They
+start inside collapsed folders so the list stays short; create, rename, nest and delete folders, and
+move any universe in or out with the folder menus or drag and drop. Folders only organize the list:
+a universe's members, fingerprint and the sessions pinned to it never change when it moves.
+
 ### 2. Build formulas from formulas
 
 The Formula Builder uses the same typed expression model as training and backtesting. Market fields,
@@ -41,6 +47,13 @@ saved, nested inside another formula, backtested as a draft, or opened as an edi
 
 <sub>An expanded RSI graph is shown here to demonstrate a deeply composed formula; smaller formulas
 remain compact.</sub>
+
+Starter formulas include a **Classic Alpha Factors** category: a faithful subset of the WorldQuant
+"101 Formulaic Alphas" (Kakushadze, 2016), candlestick and rolling features from Microsoft Qlib's
+Alpha158, and price/volume anomalies from the academic literature (12-1 momentum, short- and
+long-term reversal, 52-week high, low volatility, MAX, realized skewness, Amihud illiquidity,
+abnormal volume, overnight and intraday returns). The category is opt-in per run, like technical
+indicators. Deviations are stated on each formula (for example, `vwap` here is HLC3).
 
 ### 3. Validate before opening the holdout
 
@@ -308,6 +321,27 @@ Bundled current-index snapshots are convenient static universes: they apply one 
 across the chosen period and are therefore survivorship-biased. For historically honest membership,
 import point-in-time entry and exit dates. Market data is cached under `data_cache/`; Tiingo can be
 configured in `.env`, with yfinance available as a fallback.
+
+Provider allowances are treated as a stop signal. Tiingo's free plan allows about 50 requests per
+hour, 1,000 per day and 500 unique symbols per month; when Tiingo reports an exhausted allowance, an
+in-app sync or `scripts/download_universe.py` stops immediately (no retries, no silent switch to
+another source) and reports what was not fetched. Re-running resumes from the cache:
+
+```bash
+python scripts/download_universe.py --group sectors --years 20       # all 11 sector universes
+python scripts/download_universe.py --universe sp500-semiconductors  # one theme
+```
+
+Each training session fixes an **execution timing** when it is created: trade at the same close that
+produced the signal (optimistic, the legacy behavior), at the next day's open (the default for new
+sessions), or at the next day's close. Fitness, validation, backtests and the holdout all use it.
+`scripts/execution_timing_study.py` re-scores the published alpha factors under each timing to show
+how much IC depends on trading at the same close the factor observed.
+
+The dashboard's **Overlap with known factors** panel checks whether a selected formula is a known
+factor in disguise: it ranks every starter formula, user formula and saved result by rank
+correlation with the formula, then splits the formula's IC into the part those known factors
+explain and the unique remainder. It runs on the training window only.
 
 ## Disclaimer
 

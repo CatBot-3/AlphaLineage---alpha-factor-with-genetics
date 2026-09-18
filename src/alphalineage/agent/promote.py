@@ -100,7 +100,7 @@ def promote_factor(
         progress.set_phase("validating")
 
     # Training metrics first: polarity is fixed by training, never by validation.
-    fwd = forward_returns(panel, config.horizon)
+    fwd = forward_returns(panel, config.horizon, config.execution)
     train_panel = _slice(panel, split.train)
     train_fitness, train_metrics = score_tree(
         tree,
@@ -237,6 +237,7 @@ def _round_context(session: dict[str, Any], boundaries: Any, config: GPConfig) -
     return {
         "boundaries": boundaries.to_dict(),
         "horizon": config.horizon,
+        "execution": config.execution,
         "ic_method": config.ic_method,
         "weighting_scheme": "quantile_ls",
         "quantile": 0.2,

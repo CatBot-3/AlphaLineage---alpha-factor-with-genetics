@@ -7,6 +7,8 @@ never called inside the GP loop: the loop only ever reads the cache.
 
 from __future__ import annotations
 
+import contextlib
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -97,7 +99,18 @@ class ParquetCache:
             price_basis=basis,
             provider=provider,
         )
-        persisted.to_parquet(self.path_for(symbol))
+        target = self.path_for(symbol)
+        # Write beside the target and swap it in: a process killed mid-write (a stopped sync, a
+        # closed terminal) must leave the previous file or no file, never a truncated Parquet
+        # that ``has()`` reports as cached and every later load fails to read.
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            persisted.to_parquet(temporary)
+            os.replace(temporary, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            raise
 
     def metadata(self, symbol: str) -> dict[str, object]:
         """Effective provider/basis metadata, including legacy inference state."""

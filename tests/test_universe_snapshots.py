@@ -93,11 +93,16 @@ def test_bundled_snapshots_are_loadable_immutable_definitions(name: str, count: 
 
 def test_bundled_manifest_aliases_and_vendor_symbols_are_stable() -> None:
     specs = {str(item["id"]): item for item in bundled_snapshot_specs()}
+    index_snapshots = {name for name, item in specs.items() if not item.get("parent")}
 
-    assert set(specs) == {
+    assert index_snapshots == {
         "builtin-sp500-current",
         "builtin-djia-current",
         "builtin-nasdaq100-current",
+    }
+    # Every other bundled definition is a classification subset of the S&P 500 snapshot.
+    assert {item["parent"] for name, item in specs.items() if name not in index_snapshots} == {
+        "builtin-sp500-current"
     }
     assert bundled_snapshot_name("S&P500") == "builtin-sp500-current"
     assert bundled_snapshot_name("^DJI") == "builtin-djia-current"

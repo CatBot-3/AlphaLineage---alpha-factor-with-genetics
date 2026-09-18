@@ -76,7 +76,7 @@ from alphalineage.core.extensions import (
     register_operator,
     unregister_operator,
 )
-from alphalineage.core.fitness import forward_returns
+from alphalineage.core.fitness import forward_returns, label_span
 from alphalineage.core.gp import (
     MAX_GENERATIONS,
     MAX_HORIZON,
@@ -90,13 +90,14 @@ from alphalineage.core.primitive_docs import primitive_doc
 from alphalineage.core.primitives import OPERATORS, REGISTRY, Primitive
 from alphalineage.core.tree import Node
 from alphalineage.core.tree import from_dict as tree_from_dict
+from alphalineage.core.tree import from_json as tree_from_json
 from alphalineage.core.tree import to_dict as tree_to_dict
 from alphalineage.core.tree import to_json as tree_to_json
 from alphalineage.core.tree import validate as validate_tree
 from alphalineage.core.types import DType, is_subtype
 
 # ``schema`` remains re-exported from this module for older integrations/tests.
-from alphalineage.data import paths, schema, usage  # noqa: F401
+from alphalineage.data import paths, schema, universe_folders, usage  # noqa: F401
 from alphalineage.data.adjust import split_adjusted_close
 from alphalineage.data.cache import ParquetCache, merge_price_frames
 from alphalineage.data.identifiers import (
@@ -106,7 +107,7 @@ from alphalineage.data.identifiers import (
 from alphalineage.data.identifiers import (
     validate_symbol as validate_market_symbol,
 )
-from alphalineage.data.provider import FallbackProvider, PriceProvider
+from alphalineage.data.provider import FallbackProvider, PriceProvider, QuotaExceededError
 from alphalineage.data.tiingo_client import TiingoProvider
 from alphalineage.data.universe import (
     Membership,
@@ -129,6 +130,12 @@ from alphalineage.library.indicator_catalog import (
     CATALOG_REVISION,
     INDICATOR_CATALOG,
     LEGACY_CATALOG_REPLACEMENTS,
+)
+from alphalineage.library.overlap import (
+    OVERLAP_VERSION,
+    ReferenceFactor,
+    overlap_report,
+    references_from_formulas,
 )
 from alphalineage.validation.splits import time_split
 
@@ -274,6 +281,23 @@ class UniverseSpec(BaseModel):
     memberships: list[MembershipSpec]
 
 
+class UniverseFolderCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    parent: str | None = Field(default=None, max_length=120)
+
+
+class UniverseFolderUpdate(BaseModel):
+    """Rename and/or move a folder. Omit a field to keep it; ``parent: null`` moves to the top."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    parent: str | None = Field(default=None, max_length=120)
+
+
+class UniversePlacementUpdate(BaseModel):
+    universes: list[str] = Field(min_length=1, max_length=1_000)
+    folder: str | None = Field(default=None, max_length=120)
+
+
 class TrainingResourcesRequest(BaseModel):
     """Visible, device-relative CPU policy; execution settings never alter GP semantics."""
 
@@ -360,6 +384,9 @@ class FormulaTestRequest(BaseModel):
     start: str | None = Field(default=None, max_length=64)
     end: str | None = Field(default=None, max_length=64)
     horizon: int = Field(default=1, ge=1, le=MAX_HORIZON)
+    # Same meaning as the session setting; the formula test is exploratory, so the legacy
+    # same-close default is kept for existing saved results and API callers.
+    execution: Literal["close", "next_open", "next_close"] = "close"
     weighting_scheme: Literal["quantile_ls", "rank_proportional"] = "quantile_ls"
     quantile: float = Field(default=0.2, ge=0.01, le=0.49)
     commission_bps: float = Field(default=1.0, ge=0.0, le=10_000.0)
@@ -453,6 +480,7 @@ class DataSyncResult(BaseModel):
     last_date: str | None = None
     provider: str | None = None
     error: str | None = None
+    quota_scope: str | None = None
 
 
 class MembershipSyncRequest(BaseModel):
@@ -1791,6 +1819,16 @@ def _sync_one_symbol(
             last_date=_date_iso(stored.index.max()),
             provider=_provider_source(provider, provider_clean),
         )
+    except QuotaExceededError as exc:
+        # An exhausted allowance is a batch-level stop, reported distinctly from a symbol failure.
+        return DataSyncResult(
+            symbol=clean,
+            provider_symbol=provider_clean,
+            status="quota_exceeded",
+            provider=exc.provider or provider.name,
+            error=str(exc),
+            quota_scope=exc.scope,
+        )
     except Exception as exc:  # noqa: BLE001 - one failed symbol should not abort the batch
         return DataSyncResult(
             symbol=clean,
@@ -1808,38 +1846,53 @@ def _run_data_sync(
 ) -> dict[str, Any]:
     provider = _price_provider()
     cache = ParquetCache()
-    results = []
+    results: list[DataSyncResult] = []
     stopped = False
-    for symbol in req.symbols:
+    quota: dict[str, str] | None = None
+    symbols = [symbol for symbol in req.symbols if symbol.strip()]
+    attempted = 0
+    for symbol in symbols:
         if stop is not None and stop():
             stopped = True
             break
-        if not symbol.strip():
-            continue
-        results.append(
-            _sync_one_symbol(
-                symbol,
-                provider_symbol=req.aliases.get(symbol, symbol),
-                start=req.start,
-                end=req.end,
-                mode=req.mode,
-                provider=provider,
-                cache=cache,
-            )
+        attempted += 1
+        result = _sync_one_symbol(
+            symbol,
+            provider_symbol=req.aliases.get(symbol, symbol),
+            start=req.start,
+            end=req.end,
+            mode=req.mode,
+            provider=provider,
+            cache=cache,
         )
+        results.append(result)
         if progress is not None:
             progress.advance(symbol)
+        if result.status == "quota_exceeded":
+            quota = {
+                "provider": result.provider or provider.name,
+                "scope": result.quota_scope or "unknown",
+                "message": result.error or "",
+            }
+            break
     failed_count = sum(result.status == "failed" for result in results)
-    return {
+    succeeded_count = sum(result.status in {"fetched", "skipped"} for result in results)
+    payload: dict[str, Any] = {
         "mode": req.mode,
         "universe": req.universe,
         "start": req.start,
         "end": req.end,
         "results": [_model_dump(result) for result in results],
         "failed_count": failed_count,
-        "succeeded_count": len(results) - failed_count,
-        "termination_reason": "user_stopped" if stopped else "completed",
+        "succeeded_count": succeeded_count,
+        "termination_reason": (
+            "quota_exceeded" if quota is not None else "user_stopped" if stopped else "completed"
+        ),
     }
+    if quota is not None:
+        payload["quota"] = quota
+        payload["not_attempted"] = symbols[attempted:]
+    return payload
 
 
 # Weekends, market holidays, and ordinary provider lag can leave a short price tail.  A
@@ -1858,6 +1911,8 @@ def _resolve_membership_dates(
         return MembershipSyncResult(symbol=symbol.strip().upper(), status="failed", error=str(exc))
     try:
         frame = provider.get_prices(clean, _EARLIEST_HISTORY_START, _today_iso())
+    except QuotaExceededError:
+        raise
     except Exception as exc:  # noqa: BLE001 - one symbol's failure must not abort the batch
         return MembershipSyncResult(symbol=clean, status="failed", error=str(exc))
     if frame.empty:
@@ -1913,16 +1968,25 @@ def _run_membership_sync(
 ) -> dict[str, Any]:
     provider = _price_provider()
     results = []
+    quota: dict[str, str] | None = None
     for symbol in req.symbols:
         if not symbol.strip():
             continue
-        results.append(_resolve_membership_dates(symbol, req.expected_start, provider))
+        try:
+            results.append(_resolve_membership_dates(symbol, req.expected_start, provider))
+        except QuotaExceededError as exc:
+            quota = {"provider": exc.provider, "scope": exc.scope, "message": str(exc)}
+            break
         if progress is not None:
             progress.advance(symbol)
-    return {
+    payload: dict[str, Any] = {
         "expected_start": req.expected_start,
         "results": [_model_dump(result) for result in results],
     }
+    if quota is not None:
+        payload["termination_reason"] = "quota_exceeded"
+        payload["quota"] = quota
+    return payload
 
 
 def _now_iso() -> str:
@@ -2662,7 +2726,7 @@ def _preflight_split(
             train=train,
             valid=valid,
             embargo=embargo,
-            horizon=config.horizon,
+            horizon=label_span(config.horizon, config.execution),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"invalid time split: {exc}") from exc
@@ -2998,7 +3062,7 @@ def _slice_formula_test_panel(
     report_dates = report_dates[report_keep]
     if report_dates.empty:
         raise HTTPException(status_code=400, detail="formula test date range has no cached data")
-    if len(warmup_panel.dates) <= req.horizon:
+    if len(warmup_panel.dates) <= label_span(req.horizon, req.execution):
         raise HTTPException(
             status_code=400,
             detail="formula test date range is shorter than the forward-return horizon",
@@ -3069,7 +3133,7 @@ def _formula_test_result(
     if cancel.is_set():
         raise TrainingCancelled("formula test stopped")
     progress.set_phase("backtesting")
-    fwd = forward_returns(panel, req.horizon)
+    fwd = forward_returns(panel, req.horizon, req.execution)
     if req.strategies is not None:
         strategy_specs = [item.to_spec() for item in req.strategies]
     else:
@@ -3096,6 +3160,7 @@ def _formula_test_result(
             costs,
             report_dates,
             horizon=req.horizon,
+            execution=req.execution,
         )
         strategy_results.append(
             {
@@ -3129,6 +3194,7 @@ def _formula_test_result(
         "start": data_coverage["start"],
         "end": data_coverage["end"],
         "horizon": req.horizon,
+        "execution": req.execution,
         "weighting_scheme": primary_strategy.scheme,
         "quantile": primary_strategy.quantile,
         "commission_bps": req.commission_bps,
@@ -3594,11 +3660,77 @@ def list_universes(
         _universe_api_payload(universe, source="custom", summary=summary_view)
         for universe in sorted(_universes.values(), key=lambda u: u.name)
     ]
-    return [
+    items = [
         _universe_api_payload(sample, source="sample", summary=summary_view),
         *bundled,
         *custom,
     ]
+    layout = universe_folders.tree(item["name"] for item in items)
+    for item in items:
+        folder_id = layout["placements"].get(item["name"])
+        item["folder_id"] = folder_id
+        item["folder_path"] = universe_folders.folder_path(layout["folders"], folder_id)
+    return items
+
+
+def _known_universe_names() -> list[str]:
+    _load_persisted_universes()
+    names = [_DEFAULT_UNIVERSE]
+    names.extend(str(spec["id"]) for spec in bundled_snapshot_specs())
+    names.extend(sorted(_universes))
+    return list(dict.fromkeys(names))
+
+
+def _folder_http_error(exc: universe_folders.FolderError) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=str(exc))
+
+
+@app.get("/universe-folders")
+def list_universe_folders() -> dict[str, Any]:
+    """Presentation folders and the folder of every known universe (``null`` = top level)."""
+    return universe_folders.tree(_known_universe_names())
+
+
+@app.post("/universe-folders")
+def create_universe_folder(req: UniverseFolderCreate) -> dict[str, Any]:
+    try:
+        return universe_folders.create_folder(req.name, req.parent)
+    except universe_folders.FolderError as exc:
+        raise _folder_http_error(exc) from exc
+
+
+@app.patch("/universe-folders/{folder_id}")
+def update_universe_folder(folder_id: str, req: UniverseFolderUpdate) -> dict[str, Any]:
+    fields: set[str] = set(getattr(req, "model_fields_set", set()))
+    changes: dict[str, Any] = {}
+    if "name" in fields and req.name is not None:
+        changes["name"] = req.name
+    if "parent" in fields:
+        changes["parent"] = req.parent
+    try:
+        return universe_folders.update_folder(folder_id, **changes)
+    except universe_folders.FolderError as exc:
+        raise _folder_http_error(exc) from exc
+
+
+@app.delete("/universe-folders/{folder_id}")
+def delete_universe_folder(folder_id: str) -> dict[str, Any]:
+    try:
+        return universe_folders.delete_folder(folder_id, _known_universe_names())
+    except universe_folders.FolderError as exc:
+        raise _folder_http_error(exc) from exc
+
+
+@app.put("/universe-folders/placements")
+def move_universes_to_folder(req: UniversePlacementUpdate) -> dict[str, Any]:
+    known = set(_known_universe_names())
+    unknown = [name for name in req.universes if name not in known]
+    if unknown:
+        raise HTTPException(status_code=404, detail=f"unknown universe(s): {', '.join(unknown)}")
+    try:
+        return universe_folders.move_universes(req.universes, req.folder)
+    except universe_folders.FolderError as exc:
+        raise _folder_http_error(exc) from exc
 
 
 @app.get("/universe-presets")
@@ -3660,7 +3792,9 @@ def get_universe(name: str) -> dict[str, Any]:
         source = "custom"
     else:
         source = "bundled"
-    return _universe_api_payload(universe, source=source)
+    payload = _universe_api_payload(universe, source=source)
+    payload["folder_id"] = universe_folders.tree([universe.name])["placements"][universe.name]
+    return payload
 
 
 @app.get("/universes/{name}/coverage")
@@ -3696,6 +3830,7 @@ def delete_universe(name: str) -> dict[str, str]:
         _universes.pop(name, None)
         if target.exists():
             target.unlink()
+        universe_folders.forget_universe(name)
         return {"removed": name}
 
 
@@ -4521,7 +4656,7 @@ def create_session(
             train=req.train,
             valid=req.valid,
             embargo=req.embargo,
-            horizon=config.horizon,
+            horizon=label_span(config.horizon, config.execution),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -4676,12 +4811,23 @@ def continue_session(
             ),
         )
     boundaries = sessions.Boundaries.from_dict(session["boundaries"])
-    if config.horizon > boundaries.embargo:
+    if config.execution != stored_config.execution:
+        # Execution timing defines what every stored IC, backtest and holdout fingerprint in this
+        # session measures. Changing it mid-session would silently mix incomparable evidence.
         raise HTTPException(
             status_code=400,
             detail=(
-                f"horizon ({config.horizon}) exceeds the session's frozen embargo "
-                f"({boundaries.embargo})"
+                f"execution timing is frozen for this session ({stored_config.execution}); "
+                "start a new session to research a different timing"
+            ),
+        )
+    span = label_span(config.horizon, config.execution)
+    if span > boundaries.embargo:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"horizon ({config.horizon}) plus the execution delay ({span - config.horizon}) "
+                f"exceeds the session's frozen embargo ({boundaries.embargo})"
             ),
         )
 
@@ -5072,6 +5218,235 @@ def get_session_round_strategy_comparison(
     if payload is None or int(payload.get("round_index", -1)) != round_index:
         raise HTTPException(status_code=404, detail="unknown strategy comparison")
     return payload
+
+
+# --- overlap with known factors ---------------------------------------------------------------
+class SessionOverlapRequest(BaseModel):
+    include_saved_results: bool = True
+    top_k: int = Field(default=5, ge=0, le=10)
+
+
+def _overlap_path(session_id: str, round_index: int) -> Path:
+    return sessions.session_dir(session_id) / "overlap" / f"round-{round_index:04d}.json"
+
+
+def _ensure_session_operators(session: dict[str, Any]) -> None:
+    """Register the formula store plus the session's own operators so its trees evaluate."""
+    _load_persisted_formulas()
+    pinned = [
+        *(session.get("formula_revisions") or []),
+        *(session.get("operators") or []),
+    ]
+    for stored in pinned:
+        try:
+            ensure_operator(
+                stored.get("runtime_name") or stored["name"],
+                [DType(t) for t in stored["arg_types"]],
+                DType(stored["out_type"]),
+                stored["body"],
+                policy=stored.get("policy")
+                if "runtime_name" not in stored
+                else _formula_policy(FormulaSpec(**stored)),
+            )
+        except (InvalidOperator, ValueError, KeyError, TypeError):
+            # A pinned revision that no longer registers only affects references using it; the
+            # candidate's own evaluation reports the failure explicitly.
+            continue
+
+
+def _overlap_references(include_saved_results: bool) -> list[ReferenceFactor]:
+    references = references_from_formulas(_load_persisted_formulas())
+    if include_saved_results:
+        for factor in _factor_store().list():
+            references.append(
+                ReferenceFactor(
+                    key=f"result:{factor.id}",
+                    name=factor.id,
+                    display_name=factor.name,
+                    group="saved_results",
+                    family=str(factor.kind or "formula_result"),
+                    tree=factor.expanded_tree or factor.tree,
+                )
+            )
+    return references
+
+
+def _reference_signature(references: list[ReferenceFactor]) -> str:
+    digest = hashlib.sha256()
+    for reference in sorted(references, key=lambda item: item.key):
+        digest.update(reference.key.encode("utf-8"))
+        digest.update(tree_to_json(reference.tree).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _run_round_overlap(
+    session_id: str,
+    round_index: int,
+    *,
+    panel: Panel,
+    request: SessionOverlapRequest,
+    progress: RunProgress,
+    stop: Any,
+) -> dict[str, Any]:
+    session = sessions.load_session(session_id)
+    round_payload = sessions.load_round(session_id, round_index)
+    if round_payload is None or not isinstance(round_payload.get("best_factor"), str):
+        raise ValueError("round has no selected formula")
+    metadata = dict(round_payload.get("round_metadata") or {})
+    config = GPConfig.from_dict(metadata.get("config") or session["config"])
+    boundaries = sessions.Boundaries.from_dict(session["boundaries"])
+    train_end = pd.Timestamp(boundaries.train_end)
+    keep = pd.DatetimeIndex(panel.dates) <= train_end
+    if not bool(keep.any()):
+        raise ValueError("the session's training window has no cached dates")
+    # Physically truncated: labels near the boundary are missing, never read from validation.
+    train_panel = Panel({name: frame.loc[keep] for name, frame in panel.fields.items()})
+    train_dates = sessions.split_from_boundaries(panel.dates, boundaries).train
+
+    progress.set_phase("evaluating")
+    _ensure_session_operators(session)
+    candidate_tree = tree_from_json(str(round_payload["best_factor"]))
+    candidate = evaluate(expand_all(candidate_tree), train_panel)
+    if not isinstance(candidate, pd.DataFrame):
+        raise ValueError("the selected formula did not evaluate to a panel")
+    references = _overlap_references(request.include_saved_results)
+    evaluated: list[tuple[ReferenceFactor, pd.DataFrame | None, str | None]] = []
+    for done, reference in enumerate(references, start=1):
+        if stop():
+            raise TrainingCancelled("overlap check stopped")
+        try:
+            value = evaluate(expand_all(reference.tree), train_panel)
+            if isinstance(value, pd.DataFrame):
+                evaluated.append((reference, value, None))
+            else:
+                evaluated.append((reference, None, "did not evaluate to a panel"))
+        except Exception as exc:  # noqa: BLE001 - one broken reference must not end the check
+            evaluated.append((reference, None, str(exc)[:200]))
+        progress.set_report_progress(done, len(references) * 2)
+
+    def measured(done: int, total: int) -> None:
+        if stop():
+            raise TrainingCancelled("overlap check stopped")
+        progress.set_report_progress(total + done, total * 2)
+
+    report = overlap_report(
+        candidate,
+        evaluated,
+        forward_returns(train_panel, config.horizon, config.execution),
+        train_dates,
+        min_names=config.min_names,
+        top_k=request.top_k,
+        progress=measured,
+    )
+    payload = {
+        **report,
+        "session_id": session_id,
+        "round_index": round_index,
+        "best_factor": round_payload["best_factor"],
+        "horizon": config.horizon,
+        "execution": config.execution,
+        "include_saved_results": request.include_saved_results,
+        "reference_signature": _reference_signature(references),
+        "computed_at": _now_iso(),
+        "disclaimer": DISCLAIMER,
+    }
+    target = _overlap_path(session_id, round_index)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    safe = _json_finite(payload)
+    atomic_write_text(target, json.dumps(safe, allow_nan=False, sort_keys=True))
+    return safe
+
+
+def _json_finite(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_finite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_finite(item) for item in value]
+    return value
+
+
+@app.post("/sessions/{session_id}/rounds/{round_index}/overlap")
+def start_round_overlap(
+    session_id: str,
+    round_index: int,
+    req: SessionOverlapRequest | None = None,
+    panel: Panel | None = Depends(get_panel),  # noqa: B008
+) -> dict[str, Any]:
+    """Compare a round's selected formula with known factors on the training window only."""
+    request = req or SessionOverlapRequest()
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    round_payload = sessions.load_round(session_id, round_index)
+    if round_index < 0 or round_payload is None:
+        raise HTTPException(status_code=404, detail="unknown round")
+    if not isinstance(round_payload.get("best_factor"), str):
+        raise HTTPException(status_code=409, detail="round has no selected formula")
+    session = sessions.load_session(session_id)
+    context = dict(round_payload.get("context") or {})
+    universe = str(context.get("universe") or session["universe"])
+    as_of = str(context.get("as_of") or session["as_of"])
+    resolved_panel = _panel_for_universe(universe, as_of, panel)
+    for job in _jobs.list():
+        if (
+            job.metadata.get("kind") == "round_overlap"
+            and job.metadata.get("session_id") == session_id
+            and job.metadata.get("round_index") == round_index
+            and job.status in {"queued", "running"}
+        ):
+            return {"job_id": job.id, "status": job.status, "reused": True}
+    progress = RunProgress(target_generations=0)
+    cancel = threading.Event()
+    job_id = uuid.uuid4().hex
+
+    def _task() -> dict[str, Any]:
+        return _run_round_overlap(
+            session_id,
+            round_index,
+            panel=resolved_panel,
+            request=request,
+            progress=progress,
+            stop=cancel.is_set,
+        )
+
+    _jobs.submit(
+        _task,
+        job_id=job_id,
+        progress=progress,
+        metadata={"kind": "round_overlap", "session_id": session_id, "round_index": round_index},
+        cancel=cancel,
+    )
+    return {"job_id": job_id, "status": "queued", "reused": False}
+
+
+@app.get("/sessions/{session_id}/rounds/{round_index}/overlap")
+def get_round_overlap(session_id: str, round_index: int) -> dict[str, Any]:
+    """The last completed overlap check for a round, flagged stale if its inputs changed."""
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="unknown session")
+    round_payload = sessions.load_round(session_id, round_index)
+    if round_index < 0 or round_payload is None:
+        raise HTTPException(status_code=404, detail="unknown round")
+    path = _overlap_path(session_id, round_index)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="no overlap check yet")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail="no readable overlap check") from exc
+    stale_reasons: list[str] = []
+    if payload.get("overlap_version") != OVERLAP_VERSION:
+        stale_reasons.append("computed by an older overlap method")
+    if payload.get("best_factor") != round_payload.get("best_factor"):
+        stale_reasons.append("the round's selected formula changed")
+    try:
+        references = _overlap_references(bool(payload.get("include_saved_results", True)))
+        if payload.get("reference_signature") != _reference_signature(references):
+            stale_reasons.append("formulas or saved results changed since this check")
+    except Exception:  # noqa: BLE001 - staleness is advisory; never hide the stored result
+        stale_reasons.append("reference factors could not be re-read")
+    return {**payload, "stale": bool(stale_reasons), "stale_reasons": stale_reasons}
 
 
 @app.post("/sessions/{session_id}/rounds/{round_index}/finalization-plans")

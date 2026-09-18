@@ -109,3 +109,77 @@ def test_fallback_raises_when_all_fail():
 
     with pytest.raises(ProviderError):
         FallbackProvider([_Boom()]).get_prices("AAPL")
+
+
+# --- quota handling ------------------------------------------------------------------------
+_MONTHLY_TEXT = (
+    "You have run over your 500 symbol look up for this month. Please upgrade at "
+    "https://api.tiingo.com/pricing to have your limits increased."
+)
+
+
+def test_tiingo_monthly_symbol_quota_plain_text_200_is_not_retried(requests_mock):
+    from alphalineage.data.provider import QuotaExceededError
+
+    adapter = requests_mock.get(
+        "https://api.tiingo.com/tiingo/daily/AAPL/prices",
+        status_code=200,
+        text=_MONTHLY_TEXT,
+    )
+    provider = TiingoProvider(api_key="k", sleep=lambda _s: None)
+    with pytest.raises(QuotaExceededError) as caught:
+        provider.get_prices("AAPL")
+
+    # A quota rejection must stop immediately: every retry would spend more of the allowance.
+    assert adapter.call_count == 1
+    assert isinstance(caught.value, TiingoError)
+    assert caught.value.scope == "monthly"
+    assert "k" not in str(caught.value).split()
+
+
+def test_tiingo_hourly_429_without_short_retry_after_raises_quota(requests_mock):
+    from alphalineage.data.provider import QuotaExceededError
+
+    adapter = requests_mock.get(
+        "https://api.tiingo.com/tiingo/daily/AAPL/prices",
+        status_code=429,
+        json={"detail": "Error: You have run over your hourly request allocation."},
+    )
+    provider = TiingoProvider(api_key="k", sleep=lambda _s: None)
+    with pytest.raises(QuotaExceededError) as caught:
+        provider.get_prices("AAPL")
+    assert adapter.call_count == 1
+    assert caught.value.scope == "hourly"
+
+
+def test_tiingo_non_json_body_is_a_readable_non_retried_error(requests_mock):
+    adapter = requests_mock.get(
+        "https://api.tiingo.com/tiingo/daily/AAPL/prices",
+        status_code=200,
+        text="<html>gateway hiccup</html>",
+    )
+    provider = TiingoProvider(api_key="k", sleep=lambda _s: None)
+    with pytest.raises(TiingoError, match="non-JSON"):
+        provider.get_prices("AAPL")
+    assert adapter.call_count == 1
+
+
+def test_fallback_does_not_mask_a_quota_stop_with_another_provider(synthetic_prices):
+    from alphalineage.data.provider import QuotaExceededError
+
+    class _Quota:
+        name = "tiingo"
+
+        def get_prices(self, *_a, **_k):
+            raise QuotaExceededError("hourly allowance used", scope="hourly")
+
+    class _Ok:
+        name = "yfinance"
+
+        def get_prices(self, *_a, **_k):
+            return synthetic_prices
+
+    fallback = FallbackProvider([_Quota(), _Ok()])
+    with pytest.raises(QuotaExceededError):
+        fallback.get_prices("AAPL")
+    assert "AAPL" not in fallback.sources

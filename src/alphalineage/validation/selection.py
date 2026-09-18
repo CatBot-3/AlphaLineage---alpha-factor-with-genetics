@@ -543,6 +543,7 @@ def compare_validation_strategies(
     *,
     costs: TransactionCostModel,
     horizon: int = 1,
+    execution: str = "close",
     method: str = "spearman",
     min_names: int = 5,
     validation_folds: int = 3,
@@ -594,6 +595,7 @@ def compare_validation_strategies(
             ic_method=method,
             min_names=min_names,
             horizon=horizon,
+            execution=execution,
         )
         fold_results: list[dict[str, Any]] = []
         for index, fold_dates in enumerate(folds):
@@ -607,6 +609,7 @@ def compare_validation_strategies(
                 ic_method=method,
                 min_names=min_names,
                 horizon=horizon,
+                execution=execution,
             )
             health = dict(report.get("portfolio_health") or {})
             valid_ic_dates = int(len(validation_ic.reindex(fold_dates).dropna()))

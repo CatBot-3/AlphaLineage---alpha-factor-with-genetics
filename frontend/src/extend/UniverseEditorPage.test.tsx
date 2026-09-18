@@ -7,6 +7,7 @@ const getDataCoverage = vi.fn();
 const getDataSync = vi.fn();
 const getMembershipSync = vi.fn();
 const getUniverse = vi.fn();
+const listUniverseFolders = vi.fn();
 const listUniversePresets = vi.fn();
 const listUniverses = vi.fn();
 const listDataSyncs = vi.fn();
@@ -24,6 +25,7 @@ vi.mock("../api/client", () => ({
   getDataSync: (jobId: string) => getDataSync(jobId),
   getMembershipSync: (jobId: string) => getMembershipSync(jobId),
   getUniverse: (name: string) => getUniverse(name),
+  listUniverseFolders: () => listUniverseFolders(),
   listUniversePresets: () => listUniversePresets(),
   listUniverses: () => listUniverses(),
   listDataSyncs: (...args: unknown[]) => listDataSyncs(...args),
@@ -48,7 +50,12 @@ function candidate(symbol: string) {
   };
 }
 
+async function loadFromLibrary(label: string) {
+  fireEvent.click(await screen.findByRole("button", { name: `Load ${label}` }));
+}
+
 function setupMocks() {
+  listUniverseFolders.mockResolvedValue({ folders: [], placements: {} });
   getDataCoverage.mockResolvedValue([]);
   listDataSyncs.mockResolvedValue([]);
   stopDataSync.mockResolvedValue({ stopping: true });
@@ -540,9 +547,7 @@ describe("UniverseEditorPage", () => {
     setupMocks();
     render(<UniverseEditorPage />);
     await screen.findByTestId("universe-presets");
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: "sp500-lite" },
-    });
+    await loadFromLibrary("sp500-lite");
 
     const coverage = await screen.findByTestId("universe-cache-coverage");
     expect(coverage).toHaveTextContent("Price history: needs attention");
@@ -575,13 +580,9 @@ describe("UniverseEditorPage", () => {
     ));
 
     render(<UniverseEditorPage />);
-    await screen.findByRole("option", { name: "slow-universe (custom)" });
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: "slow-universe" },
-    });
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: "fast-universe" },
-    });
+    await screen.findByRole("button", { name: "Load slow-universe" });
+    await loadFromLibrary("slow-universe");
+    await loadFromLibrary("fast-universe");
 
     await waitFor(() => expect(screen.getByLabelText("Universe name")).toHaveValue("fast-universe"));
     expect(screen.getByLabelText("symbol-0")).toHaveValue("NEW");
@@ -629,10 +630,8 @@ describe("UniverseEditorPage", () => {
         }}
       />,
     );
-    await screen.findByRole("option", { name: "selected-universe (custom)" });
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: selectedUniverse.name },
-    });
+    await screen.findByRole("button", { name: "Load selected-universe" });
+    await loadFromLibrary(selectedUniverse.name);
     await waitFor(() => expect(screen.getByLabelText("Universe name"))
       .toHaveValue(selectedUniverse.name));
 
@@ -677,17 +676,13 @@ describe("UniverseEditorPage", () => {
     const onPullProgress = vi.fn();
 
     render(<UniverseEditorPage onPullProgress={onPullProgress} />);
-    await screen.findByRole("option", { name: "first-universe (custom)" });
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: first.name },
-    });
+    await screen.findByRole("button", { name: "Load first-universe" });
+    await loadFromLibrary(first.name);
     await waitFor(() => expect(screen.getByLabelText("symbol-0")).toHaveValue("AAA"));
     fireEvent.click(screen.getByTestId("sync-membership-dates"));
     await waitFor(() => expect(getMembershipSync).toHaveBeenCalledWith("m-1"));
 
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: second.name },
-    });
+    await loadFromLibrary(second.name);
     await waitFor(() => expect(screen.getByLabelText("symbol-0")).toHaveValue("BBB"));
     await act(async () => {
       resolveMembership({
@@ -757,9 +752,7 @@ describe("UniverseEditorPage", () => {
 
     render(<UniverseEditorPage />);
     await screen.findByTestId("universe-presets");
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: "sp500-lite" },
-    });
+    await loadFromLibrary("sp500-lite");
     await waitFor(() => expect(screen.getByLabelText("Sync start date")).toHaveValue("2000-01-01"));
     expect(screen.getByTestId("universe-cache-coverage")).toHaveTextContent(
       "1 exited membership requires prices only through",
@@ -781,9 +774,7 @@ describe("UniverseEditorPage", () => {
     setupMocks();
     render(<UniverseEditorPage />);
     await screen.findByTestId("universe-presets");
-    fireEvent.change(screen.getByLabelText("Load universe"), {
-      target: { value: "sp500-lite" },
-    });
+    await loadFromLibrary("sp500-lite");
     await waitFor(() => expect(getUniverse).toHaveBeenCalledWith("sp500-lite"));
     fireEvent.change(screen.getByLabelText("Universe name"), { target: { value: "edited-name" } });
 

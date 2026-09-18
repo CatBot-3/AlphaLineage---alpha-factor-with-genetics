@@ -86,20 +86,63 @@ def expanded_complexities(tree: Node) -> tuple[int, int]:
     return expanded.size(), expanded.unique_computation_size()
 
 
-def forward_returns(panel: Panel, horizon: int = 1) -> pd.DataFrame:
-    """Cumulative close-to-close return over the next ``horizon`` sessions.
+#: When a signal computed from session ``t`` data (including the ``t`` close) is traded.
+#:
+#: * ``close``      - in the closing auction of ``t`` itself. Optimistic: it assumes the order
+#:   can use the very close that produced the signal. Legacy meaning of every stored session.
+#: * ``next_open``  - at the opening auction of ``t + 1`` (orders sent overnight).
+#: * ``next_close`` - in the closing auction of ``t + 1`` (a full one-session delay).
+EXECUTION_TIMINGS: tuple[str, ...] = ("close", "next_open", "next_close")
+LEGACY_EXECUTION = "close"
 
-    A horizon of one is the next session's realized return.  Longer horizons use
-    ``close[t + horizon] / close[t] - 1`` rather than selecting only the one-day
-    return observed ``horizon`` rows later.
+
+def validate_execution(execution: object) -> str:
+    if not isinstance(execution, str) or execution not in EXECUTION_TIMINGS:
+        raise ValueError(
+            f"execution must be one of {', '.join(EXECUTION_TIMINGS)}, got {execution!r}"
+        )
+    return execution
+
+
+def execution_delay(execution: str) -> int:
+    """Sessions between the signal date and the first bar whose price the trade uses."""
+    return 0 if validate_execution(execution) == "close" else 1
+
+
+def label_span(horizon: int, execution: str = LEGACY_EXECUTION) -> int:
+    """How many sessions past the signal date its forward-return label reaches.
+
+    Embargoes and purges must be at least this long, or a label near a split boundary would
+    read prices from the next segment.
     """
     if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
         raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
-    if horizon == 1:
-        # Preserve the established default scorer bit-for-bit.
-        return panel["returns"].shift(-1)
-    close = panel["close"]
-    return close.shift(-horizon).div(close).sub(1.0)
+    return horizon + execution_delay(execution)
+
+
+def forward_returns(
+    panel: Panel, horizon: int = 1, execution: str = LEGACY_EXECUTION
+) -> pd.DataFrame:
+    """The ``horizon``-session return a signal dated ``t`` can actually earn.
+
+    ``close``: ``close[t + h] / close[t] - 1`` (one session: the next close-to-close return).
+    ``next_open``: ``open[t + 1 + h] / open[t + 1] - 1``.
+    ``next_close``: ``close[t + 1 + h] / close[t + 1] - 1``.
+
+    Longer horizons are cumulative returns, not the one-day return observed ``h`` rows later.
+    """
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
+        raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
+    execution = validate_execution(execution)
+    if execution == "close":
+        if horizon == 1:
+            # Preserve the established default scorer bit-for-bit.
+            return panel["returns"].shift(-1)
+        close = panel["close"]
+        return close.shift(-horizon).div(close).sub(1.0)
+    price = panel["open"] if execution == "next_open" else panel["close"]
+    entry = price.shift(-1)
+    return price.shift(-(1 + horizon)).div(entry).sub(1.0)
 
 
 def _rowwise_corr_values(a: np.ndarray, b: np.ndarray, min_names: int) -> np.ndarray:

@@ -181,6 +181,7 @@ class SavedFactor:
             "start": self.configuration.get("start"),
             "end": self.configuration.get("end"),
             "horizon": self.configuration.get("horizon"),
+            "execution": self.configuration.get("execution"),
             "weighting_scheme": self.configuration.get("weighting_scheme"),
             "quantile": self.configuration.get("quantile"),
             "commission_bps": self.configuration.get("commission_bps"),

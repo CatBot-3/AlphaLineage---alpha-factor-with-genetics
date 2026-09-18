@@ -7,10 +7,14 @@ inputs the adjuster needs. The HTTP session is injectable so tests mock it.
 
 from __future__ import annotations
 
+import json
+import re
+
 import pandas as pd
 import requests
 
 from alphalineage.data import paths, schema
+from alphalineage.data.provider import QuotaExceededError
 from alphalineage.data.retry import RateLimiter, with_retry
 
 _BASE_URL = "https://api.tiingo.com"
@@ -37,6 +41,56 @@ class RateLimitError(TiingoError):
     def __init__(self, retry_after: float | None = None) -> None:
         super().__init__("Tiingo rate limit exceeded (HTTP 429)")
         self.retry_after = retry_after
+
+
+class TiingoQuotaExceeded(TiingoError, QuotaExceededError):
+    """Tiingo's hourly/daily request or monthly unique-symbol allowance is used up."""
+
+    def __init__(self, message: str, *, scope: str) -> None:
+        QuotaExceededError.__init__(self, message, scope=scope, provider="tiingo")
+
+
+#: A 429 whose Retry-After is at most this many seconds is a transient burst limit worth one
+#: short wait. Anything longer (or unspecified) means an allowance window is exhausted.
+MAX_TRANSIENT_RETRY_AFTER_S = 60.0
+
+# Tiingo reports allowance exhaustion in prose, sometimes with HTTP 200 and a text/plain body.
+_QUOTA_PATTERN = re.compile(
+    r"run over|allocation|symbol look ?up|request limit|rate limit|upgrade", re.IGNORECASE
+)
+
+
+def _quota_scope(text: str) -> str:
+    lowered = text.lower()
+    for scope in ("hourly", "daily", "monthly"):
+        if scope in lowered:
+            return scope
+    if "this month" in lowered or "per month" in lowered:
+        return "monthly"
+    if "per hour" in lowered:
+        return "hourly"
+    if "per day" in lowered or "today" in lowered:
+        return "daily"
+    return "unknown"
+
+
+def _response_message(response: requests.Response) -> str:
+    """Server-provided error prose (JSON ``detail`` or plain text), trimmed for display."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text.strip()[:300]
+    if isinstance(payload, dict):
+        return str(payload.get("detail") or payload.get("message") or payload)[:300]
+    return str(payload)[:300]
+
+
+def _quota_error(message: str) -> TiingoQuotaExceeded:
+    scope = _quota_scope(message)
+    return TiingoQuotaExceeded(
+        f"Tiingo {scope if scope != 'unknown' else 'account'} allowance exhausted: {message}",
+        scope=scope,
+    )
 
 
 def _parse_retry_after(response: requests.Response) -> float | None:
@@ -101,10 +155,34 @@ class TiingoProvider:
                 self.rate_limiter.acquire()
             response = self.session.get(url, params=params, headers=headers, timeout=30)
             if response.status_code == 429:
-                raise RateLimitError(retry_after=_parse_retry_after(response))
+                retry_after = _parse_retry_after(response)
+                if retry_after is not None and retry_after <= MAX_TRANSIENT_RETRY_AFTER_S:
+                    raise RateLimitError(retry_after=retry_after)
+                message = _response_message(response) or "HTTP 429"
+                error = _quota_error(message)
+                if error.scope == "unknown":
+                    # A bare 429 on the EOD endpoint is the hourly request allowance.
+                    error.scope = "hourly"
+                raise error
             if response.status_code >= 400:
-                raise TiingoError(f"Tiingo HTTP {response.status_code}: {response.text[:200]}")
-            payload = response.json()
+                message = _response_message(response)
+                if _QUOTA_PATTERN.search(message):
+                    raise _quota_error(message)
+                raise TiingoError(f"Tiingo HTTP {response.status_code}: {message[:200]}")
+            try:
+                payload = json.loads(response.text)
+            except ValueError as exc:
+                message = response.text.strip()
+                if _QUOTA_PATTERN.search(message):
+                    raise _quota_error(message[:300]) from None
+                raise TiingoError(
+                    f"Tiingo returned a non-JSON body for {symbol!r}: {message[:120]!r}"
+                ) from exc
+            if isinstance(payload, dict):
+                message = str(payload.get("detail") or payload.get("message") or payload)
+                if _QUOTA_PATTERN.search(message):
+                    raise _quota_error(message[:300])
+                raise TiingoError(f"Tiingo error for {symbol!r}: {message[:200]}")
             if not isinstance(payload, list):
                 raise TiingoError(f"unexpected Tiingo payload for {symbol!r}")
             return payload

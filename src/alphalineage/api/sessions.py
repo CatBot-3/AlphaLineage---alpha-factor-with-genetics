@@ -104,7 +104,11 @@ def derive_boundaries(
     embargo: int = 5,
     horizon: int = 1,
 ) -> Boundaries:
-    """Freeze boundaries from a session's initial panel (one canonical split)."""
+    """Freeze boundaries from a session's initial panel (one canonical split).
+
+    ``horizon`` here is the label span (``fitness.label_span``): forward horizon plus any
+    execution delay, which the embargo must cover.
+    """
     split = time_split(dates, train=train, valid=valid, embargo=embargo, horizon=horizon)
     return Boundaries(
         train_end=split.train[-1].isoformat(),
@@ -178,6 +182,7 @@ def _report_cache_context(
         "as_of": session["as_of"],
         "boundaries": boundaries.to_dict(),
         "horizon": config.horizon,
+        **({} if config.execution == "close" else {"execution": config.execution}),
         "weighting": {"name": "quantile_ls", "quantile": 0.2},
         "costs": {"commission_bps": 1.0, "slippage_bps": 5.0},
         "panel": panel_fingerprint or _panel_fingerprint(panel),
@@ -697,11 +702,12 @@ def run_strategy_comparison(
     results = compare_validation_strategies(
         from_json(best_factor),
         panel,
-        forward_returns(panel, config.horizon),
+        forward_returns(panel, config.horizon, config.execution),
         split.valid,
         strategies,
         costs=_round_cost_model(round_payload),
         horizon=config.horizon,
+        execution=config.execution,
         method=config.ic_method,
         min_names=config.min_names,
         validation_folds=getattr(config, "validation_folds", 3),
@@ -1239,6 +1245,9 @@ def holdout_fingerprint(
         "test_start": boundaries.test_start,
         "test_dates": [stamp.isoformat() for stamp in test_dates],
         "horizon": int(config.horizon),
+        # Legacy (same-close) sessions keep their existing fingerprint; any other execution
+        # timing is a different holdout measurement.
+        **({} if config.execution == "close" else {"execution": config.execution}),
         "adjustment_version": _adjustment_version(),
         "portfolio_schema_version": PORTFOLIO_SCHEMA_VERSION,
         "validation_selection_version": VALIDATION_SELECTION_VERSION,
@@ -1647,7 +1656,7 @@ def run_segment(
         if progress is not None and hasattr(progress, "set_phase"):
             progress.set_phase("validating")
         validation_started = time.monotonic()
-        fwd = forward_returns(panel, gp.config.horizon)
+        fwd = forward_returns(panel, gp.config.horizon, gp.config.execution)
         searched_candidates = gp.searched_individuals()
         selection_result = select_validation_candidate(
             searched_candidates,
@@ -1975,6 +1984,7 @@ def finalize_round(
             searched_trials=searched_trials,
             min_names=config.min_names,
             horizon=config.horizon,
+            execution=config.execution,
             ic_method=config.ic_method,
             n_user_operators=n_user_operators,
             strategy_specs=strategy_specs,
@@ -1985,7 +1995,7 @@ def finalize_round(
             on_finalizing=on_finalizing,
             summary_cache=report_summaries,
             summary_key=_report_tree_key,
-            fwd=forward_returns(panel, config.horizon),
+            fwd=forward_returns(panel, config.horizon, config.execution),
         )
     finally:
         _save_report_cache(report_cache_path, cache_context, report_summaries)

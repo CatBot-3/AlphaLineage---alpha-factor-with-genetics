@@ -22,6 +22,20 @@ class ProviderError(RuntimeError):
     """Raised when every provider in a :class:`FallbackProvider` fails for a symbol."""
 
 
+class QuotaExceededError(RuntimeError):
+    """A provider refused the request because an account allowance is used up.
+
+    This is a *stop* signal, not a per-symbol failure: every further request in the same batch
+    spends more of the allowance (or is refused outright), so callers end the batch and report
+    what was fetched. ``scope`` is ``"hourly"``, ``"daily"``, ``"monthly"`` or ``"unknown"``.
+    """
+
+    def __init__(self, message: str, *, scope: str = "unknown", provider: str = "") -> None:
+        super().__init__(message)
+        self.scope = scope
+        self.provider = provider
+
+
 class FallbackProvider:
     """Try each provider in order; return the first success.
 
@@ -47,6 +61,10 @@ class FallbackProvider:
         for provider in self.providers:
             try:
                 frame = provider.get_prices(symbol, start, end)
+            except QuotaExceededError:
+                # Never mask an allowance stop by silently switching sources: the next provider
+                # has different adjustment/survivorship semantics and the batch must end anyway.
+                raise
             except Exception as exc:  # noqa: BLE001 - we intentionally fall through
                 errors.append(f"{provider.name}: {exc!r}")
                 continue

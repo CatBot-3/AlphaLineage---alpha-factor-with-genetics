@@ -13,6 +13,7 @@ import type {
 import { ProgressView } from "./ProgressView";
 import { RunConfigForm, type RunRequestForm } from "./RunConfigForm";
 import { useSession, type SessionController } from "./useSession";
+import { executionTimingLabel } from "./defaults";
 import { TrainingResourcePicker } from "./TrainingResourcePicker";
 
 export function TrainPanel({
@@ -200,6 +201,12 @@ export function TrainPanel({
               <div>
                 <dt>explicit holdout reads</dt>
                 <dd>{state.session_holdout_reads ?? state.test_reads}</dd>
+              </div>
+              <div>
+                <dt>execution timing</dt>
+                <dd data-testid="session-execution">
+                  {executionTimingLabel(state.config?.execution)}
+                </dd>
               </div>
             </dl>
           )}

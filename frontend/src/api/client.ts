@@ -19,6 +19,7 @@ import type {
   FormulaValidation,
   FormulaTestJob,
   FormulaTestRequest,
+  FactorOverlapReport,
   FinalizationPlan,
   Lineage,
   MembershipSyncJob,
@@ -26,6 +27,7 @@ import type {
   OperatorSpec,
   RunResult,
   PrimitiveInfo,
+  ProgressSnapshot,
   SavedFactor,
   SessionContinueRequest,
   SessionCreateRequest,
@@ -44,6 +46,8 @@ import type {
   StrategyComparisonDetail,
   StrategyComparisonHandle,
   StrategyComparisonSummary,
+  UniverseFolder,
+  UniverseFolderTree,
   UniverseInfo,
   UniverseCacheCoverage,
   UniversePreset,
@@ -98,6 +102,7 @@ interface RunStatus {
   status: string;
   result: RunResult | null;
   error: string | null;
+  progress?: ProgressSnapshot | null;
 }
 
 export async function submitRun(config: RunConfig = {}): Promise<string> {
@@ -314,6 +319,48 @@ export async function updateUniverse(
 export async function deleteUniverse(name: string): Promise<void> {
   const res = await fetch(`${BASE}/universes/${encodeURIComponent(name)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`delete universe failed: ${res.status}`);
+}
+
+export async function listUniverseFolders(): Promise<UniverseFolderTree> {
+  return jsonOrThrow(await fetch(`${BASE}/universe-folders`), "list universe folders");
+}
+
+export async function createUniverseFolder(
+  name: string,
+  parent: string | null = null,
+): Promise<UniverseFolder> {
+  return jsonOrThrow(await POST("/universe-folders", { name, parent }), "create folder");
+}
+
+/** Rename and/or move a folder; omit a key to keep it, pass `parent: null` for top level. */
+export async function updateUniverseFolder(
+  id: string,
+  changes: { name?: string; parent?: string | null },
+): Promise<UniverseFolder> {
+  const res = await fetch(`${BASE}/universe-folders/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return jsonOrThrow(res, "update folder");
+}
+
+/** Removes the folder only; its universes and subfolders move up one level. */
+export async function deleteUniverseFolder(id: string): Promise<{ removed: string; moved_to: string | null }> {
+  const res = await fetch(`${BASE}/universe-folders/${encodeURIComponent(id)}`, { method: "DELETE" });
+  return jsonOrThrow(res, "delete folder");
+}
+
+export async function moveUniverses(
+  universes: string[],
+  folder: string | null,
+): Promise<{ universes: string[]; folder: string | null }> {
+  const res = await fetch(`${BASE}/universe-folders/placements`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ universes, folder }),
+  });
+  return jsonOrThrow(res, "move universes");
 }
 
 export async function searchSymbols(query: string, limit = 15): Promise<SymbolCandidate[]> {
@@ -780,4 +827,30 @@ export async function deleteSession(sessionId: string): Promise<Record<string, u
 // --- shutdown (single-process launcher Quit) -----------------------------------
 export async function shutdown(): Promise<{ shutting_down: boolean }> {
   return jsonOrThrow(await POST("/shutdown", {}), "shutdown");
+}
+
+export async function startRoundOverlap(
+  sessionId: string,
+  roundIndex: number,
+  body: { include_saved_results?: boolean; top_k?: number } = {},
+): Promise<{ job_id: string; status: string; reused: boolean }> {
+  return jsonOrThrow(
+    await POST(
+      `/sessions/${encodeURIComponent(sessionId)}/rounds/${roundIndex}/overlap`,
+      body,
+    ),
+    "start overlap check",
+  );
+}
+
+/** The last stored overlap check for a round, or null when none has been run. */
+export async function getRoundOverlap(
+  sessionId: string,
+  roundIndex: number,
+): Promise<FactorOverlapReport | null> {
+  const res = await fetch(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/rounds/${roundIndex}/overlap`,
+  );
+  if (res.status === 404) return null;
+  return jsonOrThrow(res, "load overlap check");
 }

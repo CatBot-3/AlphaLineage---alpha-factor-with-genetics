@@ -1103,6 +1103,45 @@ def test_data_sync_keeps_other_symbols_running_after_failure(client, monkeypatch
     assert results["BAD"]["status"] == "failed"
 
 
+def test_data_sync_stops_the_batch_when_the_provider_allowance_is_exhausted(
+    client, monkeypatch, synthetic_prices
+):
+    from alphalineage.data.provider import QuotaExceededError
+
+    prices = api_app.schema.normalize(synthetic_prices)
+    calls: list[str] = []
+
+    class QuotaProvider:
+        name = "quota"
+
+        def get_prices(self, symbol, start=None, end=None):
+            calls.append(symbol)
+            if symbol == "BBB":
+                raise QuotaExceededError("hourly allowance used", scope="hourly")
+            return prices
+
+    monkeypatch.setattr(api_app, "_price_provider", QuotaProvider)
+    started = client.post(
+        "/data/sync",
+        json={
+            "symbols": ["AAA", "BBB", "CCC", "DDD"],
+            "start": "2020-01-01",
+            "end": "2020-02-01",
+            "mode": "refresh",
+        },
+    )
+    final = _poll_data_sync(client, started.json()["job_id"])
+    assert final["status"] == "done", final
+    result = final["result"]
+    # No request is spent after the refusal; the untouched symbols are reported, not failed.
+    assert calls == ["AAA", "BBB"]
+    assert result["termination_reason"] == "quota_exceeded"
+    assert result["quota"]["scope"] == "hourly"
+    statuses = {item["symbol"]: item["status"] for item in result["results"]}
+    assert statuses == {"AAA": "fetched", "BBB": "quota_exceeded"}
+    assert result["not_attempted"] == ["CCC", "DDD"]
+
+
 def test_membership_date_sync_reports_coverage_without_mutating_membership(
     client, monkeypatch
 ):

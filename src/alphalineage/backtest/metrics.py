@@ -44,11 +44,14 @@ def position_magnitude(weights: pd.DataFrame) -> dict[str, float]:
 
 
 def ic_decay(
-    factor: pd.DataFrame, panel: Panel, horizons: tuple[int, ...] = (1, 2, 3, 5, 10)
+    factor: pd.DataFrame,
+    panel: Panel,
+    horizons: tuple[int, ...] = (1, 2, 3, 5, 10),
+    execution: str = "close",
 ) -> dict[int, float]:
     """Mean |rank IC| of ``factor`` against forward returns at growing horizons."""
     out: dict[int, float] = {}
     for h in horizons:
-        ic = daily_ic(factor, forward_returns(panel, h), "spearman")
+        ic = daily_ic(factor, forward_returns(panel, h, execution), "spearman")
         out[h] = float(ic.abs().mean()) if ic.notna().any() else 0.0
     return out

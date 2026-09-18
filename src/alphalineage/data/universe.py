@@ -302,6 +302,78 @@ def _snapshot_asset(asset: str) -> tuple[tuple[str, ...], dict[str, str]]:
     return symbols, aliases
 
 
+@cache
+def _classification_asset(asset: str) -> dict[str, tuple[str, str]]:
+    """Symbol -> ``(sector, sub_industry)`` from a checksummed packaged classification asset."""
+    source = resources.files("alphalineage.data").joinpath(_SNAPSHOT_RESOURCE_DIR, asset)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError(f"invalid classification asset {asset!r}")
+    parent = next(
+        (item for item in _snapshot_manifest() if item["id"] == payload.get("applies_to")), None
+    )
+    if parent is None or "parent" in parent:
+        raise ValueError(f"classification asset {asset!r} names an unknown parent snapshot")
+    symbols, _ = _snapshot_asset(str(parent["asset"]))
+    # Each group is published as ``[sector, sub_industry]``.
+    groups = [(str(sub), str(sector)) for sector, sub in payload["sub_industries"]]
+    codes = [int(code) for code in payload["codes"]]
+    if len(codes) != len(symbols):
+        raise ValueError(f"classification asset {asset!r} does not cover its parent snapshot")
+    triples = [
+        [symbol, groups[code][1], groups[code][0]]
+        for symbol, code in zip(symbols, codes, strict=True)
+    ]
+    checksum = hashlib.sha256(
+        json.dumps(triples, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if checksum != payload.get("checksum"):
+        raise ValueError(f"classification asset {asset!r} failed its checksum")
+    return {symbol: (sector, sub) for symbol, sector, sub in triples}
+
+
+def bundled_classification(name: str) -> dict[str, dict[str, str]]:
+    """GICS sector/sub-industry per member of a bundled universe; empty when unclassified."""
+    canonical = bundled_snapshot_name(name)
+    if canonical is None:
+        return {}
+    item = next(spec for spec in _snapshot_manifest() if spec["id"] == canonical)
+    parent_id = str(item.get("parent") or canonical)
+    asset = next(
+        (
+            str(spec.get("classification_asset"))
+            for spec in _snapshot_manifest()
+            if spec.get("parent") == parent_id and spec.get("classification_asset")
+        ),
+        None,
+    )
+    if asset is None:
+        return {}
+    table = _classification_asset(asset)
+    members = bundled_universe(canonical).all_symbols()
+    return {
+        symbol: {"sector": table[symbol][0], "sub_industry": table[symbol][1]}
+        for symbol in members
+        if symbol in table
+    }
+
+
+def _subset_symbols(item: Mapping[str, Any]) -> tuple[str, ...]:
+    """Members of a classification-filtered snapshot, in the parent's order."""
+    parent_symbols, _ = _snapshot_asset(str(item["asset"]))
+    table = _classification_asset(str(item["classification_asset"]))
+    rule = dict(item.get("filter") or {})
+    sectors = set(rule.get("sectors") or [])
+    sub_industries = set(rule.get("sub_industries") or [])
+    if not sectors and not sub_industries:
+        raise ValueError(f"bundled universe {item['id']!r} has an empty classification filter")
+    return tuple(
+        symbol
+        for symbol in parent_symbols
+        if table[symbol][0] in sectors or table[symbol][1] in sub_industries
+    )
+
+
 def bundled_snapshot_specs() -> list[dict[str, Any]]:
     """Immutable manifest entries for every loadable offline static snapshot."""
     return [dict(item) for item in _snapshot_manifest()]
@@ -324,6 +396,14 @@ def bundled_universe(name: str) -> Universe:
         raise KeyError(f"unknown bundled universe {name!r}")
     item = next(spec for spec in _snapshot_manifest() if spec["id"] == canonical)
     symbols, symbol_aliases = _snapshot_asset(str(item["asset"]))
+    subset = "parent" in item
+    if subset:
+        symbols = _subset_symbols(item)
+        symbol_aliases = {
+            source: provider
+            for source, provider in symbol_aliases.items()
+            if source in symbols or provider in symbols
+        }
     if len(symbols) != int(item["source_symbol_count"]):
         raise ValueError(f"bundled universe {canonical!r} symbol count does not match its manifest")
     checksum_payload = json.dumps(list(symbols), separators=(",", ":"))
@@ -345,6 +425,14 @@ def bundled_universe(name: str) -> Universe:
             ),
             "member_count": len(symbols),
             "benchmark": str(item["benchmark"]),
+            **(
+                {
+                    "parent": str(item["parent"]),
+                    "classification": dict(item["filter"]),
+                }
+                if subset
+                else {}
+            ),
         },
         provenance={
             "provider": str(item["source_name"]),

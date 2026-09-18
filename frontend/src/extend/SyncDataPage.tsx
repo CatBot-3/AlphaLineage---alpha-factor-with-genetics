@@ -180,8 +180,14 @@ export function UniverseDataSync({
   const staleCount = coverage.filter((item) => item.needs_sync).length;
   const currentCount = coverage.length - staleCount;
   const activeJobs = jobs.filter(isActive);
+  const quotaStop = syncJob?.result?.termination_reason === "quota_exceeded"
+    ? syncJob.result.quota ?? { provider: "provider", scope: "unknown", message: "" }
+    : null;
+  const notAttempted = syncJob?.result?.not_attempted ?? [];
   const syncSummary = isActive(syncJob)
     ? "Sync running"
+    : syncJob?.status === "done" && quotaStop
+      ? `Stopped: ${quotaStop.scope === "unknown" ? "provider" : quotaStop.scope} allowance used`
     : syncJob?.status === "done" && latestFailedCount > 0
       ? `Completed with ${latestFailedCount} failure${latestFailedCount === 1 ? "" : "s"}`
     : coverage.length > 0
@@ -552,9 +558,17 @@ export function UniverseDataSync({
       {syncJob?.result && (
         <CompactSection
           title="Latest sync result"
-          summary={`${syncJob.result.results.filter((item) => item.status !== "failed").length} completed · ${syncJob.result.results.filter((item) => item.status === "failed").length} failed`}
-          defaultOpen={syncJob.result.results.some((item) => item.status === "failed")}
+          summary={`${syncJob.result.results.filter((item) => item.status === "fetched" || item.status === "skipped").length} completed · ${syncJob.result.results.filter((item) => item.status === "failed").length} failed${quotaStop ? ` · ${notAttempted.length} not attempted` : ""}`}
+          defaultOpen={Boolean(quotaStop) || syncJob.result.results.some((item) => item.status === "failed")}
         >
+          {quotaStop && (
+            <p className="oos-warning" data-testid="sync-quota-stop">
+              The {quotaStop.provider} {quotaStop.scope === "unknown" ? "account" : quotaStop.scope} allowance
+              is used up, so the sync stopped instead of spending more requests
+              {notAttempted.length > 0 ? ` (${notAttempted.length} symbol${notAttempted.length === 1 ? "" : "s"} not attempted)` : ""}.
+              Run the sync again after the window resets; symbols already cached are skipped.
+            </p>
+          )}
           <ul className="coverage-list universe-data-sync__list" data-testid="sync-results">
             {syncJob.result.results.map((result) => (
               <li key={result.symbol}>

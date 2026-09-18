@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from alphalineage.library import alpha_catalog
+
 CATALOG_ORIGIN = "catalog_formula"
 CATALOG_CATEGORY = "technical_indicators"
 CATALOG_REVISION = 2
@@ -271,7 +273,7 @@ _SLOW = _parameter("slow", "window", "Slow EMA period.", 26, 20, 40)
 _FAST_LT_SLOW = [{"left": "fast", "operator": "lt", "right": "slow"}]
 
 
-INDICATOR_CATALOG: tuple[dict[str, Any], ...] = (
+TECHNICAL_INDICATOR_CATALOG: tuple[dict[str, Any], ...] = (
     # Moving averages ------------------------------------------------------------
     _formula(
         "ta_sma",
@@ -786,6 +788,14 @@ INDICATOR_CATALOG: tuple[dict[str, Any], ...] = (
     ),
 )
 
+# Published alpha factors share the managed-catalog lifecycle (immutable, revisioned, retirable)
+# but live in their own ``classic_alphas`` category so runs opt in to them explicitly.
+assert alpha_catalog.CATALOG_ORIGIN == CATALOG_ORIGIN
+assert alpha_catalog.CATALOG_REVISION == CATALOG_REVISION
+INDICATOR_CATALOG: tuple[dict[str, Any], ...] = (
+    TECHNICAL_INDICATOR_CATALOG + alpha_catalog.ALPHA_CATALOG
+)
+
 CATALOG_NAMES = frozenset(item["name"] for item in INDICATOR_CATALOG)
 ACTIVE_CATALOG_NAMES = frozenset(
     item["name"] for item in INDICATOR_CATALOG if item["status"] == "active"
@@ -793,6 +803,7 @@ ACTIVE_CATALOG_NAMES = frozenset(
 
 __all__ = [
     "CATALOG_CATEGORY",
+    "TECHNICAL_INDICATOR_CATALOG",
     "ACTIVE_CATALOG_NAMES",
     "CATALOG_NAMES",
     "CATALOG_ORIGIN",

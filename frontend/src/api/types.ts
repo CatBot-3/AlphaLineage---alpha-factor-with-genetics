@@ -178,6 +178,12 @@ export interface RunResult {
   parameter_coverage?: Record<string, FormulaParameterCoverage>;
 }
 
+/**
+ * When a signal computed from day t data (including the t close) is traded.
+ * `close` is the legacy same-close assumption; stored sessions without the key mean `close`.
+ */
+export type ExecutionTiming = "close" | "next_open" | "next_close";
+
 export interface RunContext {
   universe?: string;
   universe_revision?: string;
@@ -191,6 +197,7 @@ export interface RunContext {
     embargo?: number;
   };
   horizon?: number;
+  execution?: ExecutionTiming;
   ic_method?: string;
   weighting_scheme?: string;
   quantile?: number | null;
@@ -306,6 +313,8 @@ export interface GpConfig {
   ic_method: string;
   min_names: number;
   horizon: number;
+  /** Frozen when a session is created. Missing on legacy sessions, which mean `close`. */
+  execution?: ExecutionTiming;
   min_depth: number;
   seed: number;
   time_budget_s: number | null;
@@ -648,6 +657,7 @@ export interface FormulaResult extends SavedFactor {
   start?: string | null;
   end?: string | null;
   horizon?: number | null;
+  execution?: ExecutionTiming | null;
   weighting_scheme?: "quantile_ls" | "rank_proportional" | null;
   quantile?: number | null;
   commission_bps?: number | null;
@@ -682,6 +692,7 @@ export interface FormulaTestRequest {
   start?: string | null;
   end?: string | null;
   horizon?: number;
+  execution?: ExecutionTiming;
   strategies?: PortfolioStrategySpec[];
   weighting_scheme?: "quantile_ls" | "rank_proportional";
   quantile?: number;
@@ -1001,6 +1012,23 @@ export interface UniverseInfo extends UniverseSpec {
   aliases?: Record<string, string>;
   integrity?: UniverseIntegrity;
   cache_coverage?: UniverseCacheCoverage;
+  /** Presentation folder (`null` = top level). Folders never change the definition itself. */
+  folder_id?: string | null;
+  /** Folder names from the top level down; lets pickers group without a second request. */
+  folder_path?: string[];
+}
+
+export interface UniverseFolder {
+  id: string;
+  name: string;
+  parent: string | null;
+  builtin: boolean;
+}
+
+export interface UniverseFolderTree {
+  folders: UniverseFolder[];
+  /** Universe name -> folder id (`null` = top level). */
+  placements: Record<string, string | null>;
 }
 
 export interface UniverseIntegrity {
@@ -1120,7 +1148,7 @@ export interface DataSyncRequest {
 
 export interface DataSyncResult {
   symbol: string;
-  status: "queued" | "running" | "done" | "failed" | "fetched" | "skipped";
+  status: "queued" | "running" | "done" | "failed" | "fetched" | "skipped" | "quota_exceeded";
   rows_fetched: number;
   rows_cached: number;
   first_date?: string | null;
@@ -1128,6 +1156,8 @@ export interface DataSyncResult {
   provider?: string | null;
   provider_symbol?: string | null;
   error?: string | null;
+  /** Set when the provider refused the request because an allowance window is used up. */
+  quota_scope?: "hourly" | "daily" | "monthly" | "unknown" | string | null;
 }
 
 export interface SyncProgressSnapshot {
@@ -1164,8 +1194,12 @@ export interface DataSyncJob {
     universe_definition?: DataSyncJob["universe_definition"];
     failed_count?: number;
     succeeded_count?: number;
-    termination_reason?: "completed" | "user_stopped" | string;
+    termination_reason?: "completed" | "user_stopped" | "quota_exceeded" | string;
     results: DataSyncResult[];
+    /** Present when the batch stopped because the provider allowance was exhausted. */
+    quota?: { provider: string; scope: string; message: string } | null;
+    /** Symbols the stopped batch never requested; re-run the sync after the window resets. */
+    not_attempted?: string[];
   } | null;
   error: string | null;
   progress?: SyncProgressSnapshot | null;
@@ -1343,4 +1377,63 @@ export interface AgentJob {
   status: "queued" | "running" | "done" | "failed" | "stopped";
   error: string | null;
   result: Record<string, unknown> | null;
+}
+
+// --- overlap with known factors ------------------------------------------------------------
+export type OverlapVerdict =
+  | "novel"
+  | "related"
+  | "mostly_explained"
+  | "near_duplicate"
+  | "unmeasured";
+
+export interface OverlapReference {
+  key: string;
+  name: string;
+  display_name: string;
+  /** catalog = starter formulas, your_formulas = user formulas, saved_results = Formula Results. */
+  group: "catalog" | "your_formulas" | "saved_results" | string;
+  family: string;
+  status: "ok" | "unavailable" | "no_overlap";
+  error?: string;
+  /** Mean over training dates of the cross-sectional Spearman correlation (signed). */
+  mean_rank_corr?: number | null;
+  abs_mean_rank_corr?: number | null;
+  share_dates_abs_corr_above_half?: number | null;
+  dates?: number;
+  reference_ic?: number | null;
+  reference_ic_t?: number | null;
+  /** Set when this factor was not removed because it nearly copies one that was. */
+  redundant_with?: string;
+}
+
+export interface FactorOverlapReport {
+  overlap_version: number;
+  session_id: string;
+  round_index: number;
+  window: { start: string | null; end: string | null; dates: number; label: string };
+  thresholds: { related: number; near_duplicate: number; top_k: number };
+  candidate: { ic: number | null; ic_t: number | null };
+  residual: {
+    /** Unique IC: the additive part of the IC the known factors cannot account for. */
+    ic: number | null;
+    ic_t: number | null;
+    explained_ic: number | null;
+    decomposed_ic: number | null;
+    unique_share: number | null;
+    mean_r_squared: number | null;
+    explained_by: string[];
+  };
+  max_abs_rank_corr: number | null;
+  verdict: OverlapVerdict;
+  references: OverlapReference[];
+  reference_count: number;
+  measured_count: number;
+  horizon: number;
+  execution: ExecutionTiming;
+  include_saved_results: boolean;
+  computed_at: string;
+  disclaimer?: string;
+  stale?: boolean;
+  stale_reasons?: string[];
 }

@@ -280,6 +280,11 @@ PROTECTED_KEYS: dict[str, str] = {
         "changes what is being predicted, so metrics stop being comparable across segments "
         "and the embargo sized for the old horizon no longer covers the label window"
     ),
+    "execution": (
+        "changes which return is being predicted (same close, next open or next close), so "
+        "every stored IC, backtest and holdout fingerprint would stop meaning the same thing; "
+        "it is frozen when the session is created"
+    ),
     "ic_method": "changes the definition of fitness itself, not how the search explores",
     "min_names": (
         "is a feasibility floor, not a tuning knob: lowering it lets a spuriously perfect IC "

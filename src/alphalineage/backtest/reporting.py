@@ -38,6 +38,7 @@ def backtest_report(
     ic_method: str = "spearman",
     min_names: int = 5,
     horizon: int = 1,
+    execution: str = "close",
 ) -> dict[str, Any]:
     """Compute the canonical metric/time-series payload over ``dates``.
 
@@ -53,6 +54,7 @@ def backtest_report(
         costs,
         dates=report_dates,
         horizon=horizon,
+        execution=execution,
     )
     ic = daily_ic(factor, forward, ic_method, min_names=min_names).reindex(report_dates)
     clean_ic = ic.dropna()

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from alphalineage.api.app import app, get_panel
 from alphalineage.core import extensions
 from alphalineage.core.primitives import OPERATORS, REGISTRY
-from alphalineage.library.indicator_catalog import CATALOG_NAMES
+from alphalineage.library.indicator_catalog import ACTIVE_CATALOG_NAMES, CATALOG_NAMES
 
 
 @pytest.fixture(autouse=True)
@@ -333,7 +333,14 @@ def test_packaged_indicator_catalog_is_managed_searchable_and_idempotent(client)
     assert CATALOG_NAMES <= formulas.keys()
     assert all(formulas[name]["origin"] == "catalog_formula" for name in CATALOG_NAMES)
     assert all(formulas[name]["editable"] is False for name in CATALOG_NAMES)
-    assert all(formulas[name]["category"] == "technical_indicators" for name in CATALOG_NAMES)
+    from alphalineage.library.alpha_catalog import ALPHA_CATALOG
+
+    alpha_names = {item["name"] for item in ALPHA_CATALOG}
+    assert all(
+        formulas[name]["category"]
+        == ("classic_alphas" if name in alpha_names else "technical_indicators")
+        for name in CATALOG_NAMES
+    )
     assert all(formulas[name]["family"] for name in CATALOG_NAMES)
     assert all(formulas[name]["aliases"] for name in CATALOG_NAMES)
     assert all(formulas[name]["catalog_revision"] == 2 for name in CATALOG_NAMES)
@@ -599,7 +606,7 @@ def test_catalog_upgrade_retires_orphan_managed_family_without_rewriting_old_run
     assert sum(
         item["origin"] == "catalog_formula" and item["status"] == "active"
         for item in formulas
-    ) == 36
+    ) == len(ACTIVE_CATALOG_NAMES)
     detail = client.get("/formulas/ta_rsi").json()
     assert [item["runtime_name"] for item in detail["revisions"]] == [
         "ta_rsi",

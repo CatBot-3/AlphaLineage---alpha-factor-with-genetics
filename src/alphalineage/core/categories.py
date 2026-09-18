@@ -18,6 +18,7 @@ CROSS_SECTIONAL = "cross_sectional"
 CONSTANT = "constant"
 CONDITION = "condition"
 TECHNICAL_INDICATORS = "technical_indicators"
+CLASSIC_ALPHAS = "classic_alphas"
 CUSTOM = "custom"
 UNCATEGORIZED = "uncategorized"
 
@@ -32,6 +33,7 @@ DEFAULT_CATEGORY_ORDER: list[str] = [
     CONDITION,
     CONSTANT,
     TECHNICAL_INDICATORS,
+    CLASSIC_ALPHAS,
     CUSTOM,
 ]
 

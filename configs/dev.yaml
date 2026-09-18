@@ -31,6 +31,9 @@ gp:
   ic_method: spearman
   min_names: 5
   horizon: 1
+  # When a signal is traded: close (same close that produced it; optimistic), next_open, or
+  # next_close. Frozen per session.
+  execution: next_open
   min_depth: 2
   seed: 0
   time_budget_s: null

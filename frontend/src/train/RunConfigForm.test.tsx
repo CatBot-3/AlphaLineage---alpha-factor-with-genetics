@@ -243,3 +243,44 @@ describe("RunConfigForm function space", () => {
   });
 });
 
+
+describe("RunConfigForm execution timing", () => {
+  it("defaults new sessions to the next open and explains the choice", async () => {
+    const onStart = vi.fn();
+    render(<RunConfigForm onStart={onStart} />);
+    await screen.findByTestId("function-cat-condition");
+
+    const select = screen.getByLabelText("Execution timing") as HTMLSelectElement;
+    expect(select.value).toBe("next_open");
+    expect(screen.getByTestId("execution-timing-hint")).toHaveTextContent("tomorrow's opening auction");
+
+    fireEvent.change(select, { target: { value: "close" } });
+    expect(screen.getByTestId("execution-timing-hint")).toHaveClass("oos-warning");
+    expect(screen.getByTestId("execution-timing-hint")).toHaveTextContent("overstates fast signals");
+
+    fireEvent.change(select, { target: { value: "next_close" } });
+    fireEvent.submit(screen.getByTestId("run-config-form"));
+    const req = onStart.mock.calls[0][0] as RunRequestForm;
+    expect(req.config.execution).toBe("next_close");
+  });
+
+  it("keeps the same-close timing when copying a session created before the setting", async () => {
+    const onStart = vi.fn();
+    const legacy = {
+      id: "legacy",
+      name: "Old",
+      universe: "sp500-lite",
+      as_of: "2026-07-15",
+      config: { population_size: 16, generations: 2, horizon: 1 },
+      segments: [],
+    } as unknown as NonNullable<Parameters<typeof RunConfigForm>[0]["initialSession"]>;
+    render(<RunConfigForm onStart={onStart} initialSession={legacy} />);
+    await screen.findByTestId("function-cat-condition");
+
+    await waitFor(() =>
+      expect((screen.getByLabelText("Execution timing") as HTMLSelectElement).value).toBe("close"),
+    );
+    fireEvent.submit(screen.getByTestId("run-config-form"));
+    expect((onStart.mock.calls[0][0] as RunRequestForm).config.execution).toBe("close");
+  });
+});

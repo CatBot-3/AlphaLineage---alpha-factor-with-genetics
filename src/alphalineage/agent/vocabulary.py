@@ -24,6 +24,9 @@ def operator_listing(config: dict[str, Any] | None = None) -> list[dict[str, Any
     from alphalineage.core.categories import builtin_category
     from alphalineage.core.primitive_docs import primitive_doc
     from alphalineage.core.primitives import REGISTRY
+    from alphalineage.library.indicator_catalog import INDICATOR_CATALOG
+
+    catalog_categories = {str(item["name"]): str(item["category"]) for item in INDICATOR_CATALOG}
 
     settings = config or {}
     enabled_categories = set(settings.get("enabled_categories") or [])
@@ -35,7 +38,7 @@ def operator_listing(config: dict[str, Any] | None = None) -> list[dict[str, Any
         if is_macro:
             if enabled_formulas and base_name(name) not in enabled_formulas:
                 continue
-            category = "technical_indicators"
+            category = catalog_categories.get(base_name(name), "technical_indicators")
         else:
             category = builtin_category(name)
             if enabled_categories and category not in enabled_categories:

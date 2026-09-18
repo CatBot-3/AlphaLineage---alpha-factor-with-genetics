@@ -31,6 +31,7 @@ from alphalineage.api.service import build_report  # noqa: E402
 from alphalineage.backtest.costs import TransactionCostModel  # noqa: E402
 from alphalineage.backtest.portfolio import QuantileLongShort  # noqa: E402
 from alphalineage.core import cpp  # noqa: E402
+from alphalineage.core.fitness import label_span  # noqa: E402
 from alphalineage.core.gp import GP, GPConfig  # noqa: E402
 from alphalineage.core.panel import Panel  # noqa: E402
 from alphalineage.data.universe import sample_universe  # noqa: E402
@@ -111,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         train=float(cfg.get("train", 0.6)),
         valid=float(cfg.get("valid", 0.2)),
         embargo=int(cfg.get("embargo", 5)),
-        horizon=gp_config.horizon,
+        horizon=label_span(gp_config.horizon, gp_config.execution),
     )
     print(f"universe={universe} symbols={list(panel.symbols)}")
     print(
@@ -168,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         panel,
         searched_trials=gp.trial_count,
         horizon=gp_config.horizon,
+        execution=gp_config.execution,
         ic_method=gp_config.ic_method,
         min_names=gp_config.min_names,
         scheme=scheme,

@@ -19,7 +19,13 @@ import type {
   UniverseCacheCoverage,
   UniverseInfo,
 } from "../api/types";
-import { ADVANCED_FIELDS, CORE_FIELDS, DEFAULT_CONFIG } from "./defaults";
+import { UniversePicker } from "../extend/UniverseTree";
+import {
+  ADVANCED_FIELDS,
+  CORE_FIELDS,
+  DEFAULT_CONFIG,
+  EXECUTION_TIMING_OPTIONS,
+} from "./defaults";
 import { TrainingResourcePicker } from "./TrainingResourcePicker";
 
 export interface RunRequestForm {
@@ -127,7 +133,7 @@ export function RunConfigForm({
   // Operator categories the GP may draw from this run. `condition` (boolean ops) is off by
   // default so the classic numeric search space is unchanged unless the user opts it in.
   const [disabledCats, setDisabledCats] = useState<Set<string>>(
-    new Set(["condition", "technical_indicators"]),
+    new Set(["condition", "technical_indicators", "classic_alphas"]),
   );
   const [previousEnabledCategories, setPreviousEnabledCategories] =
     useState<string[] | null | undefined>(undefined);
@@ -171,7 +177,13 @@ export function RunConfigForm({
     if (initialSession.universe) setUniverse(initialSession.universe);
     if (initialSession.as_of) setAsOf(initialSession.as_of);
     const storedConfig = initialSession.config ?? {};
-    const previousConfig = { ...DEFAULT_CONFIG, ...storedConfig } as GpConfig;
+    const previousConfig = {
+      ...DEFAULT_CONFIG,
+      ...storedConfig,
+      // A stored config without the key predates the setting and meant the same-close timing;
+      // "same setup" must reproduce that rather than silently switching to the new default.
+      execution: storedConfig.execution ?? "close",
+    } as GpConfig;
     setConfig(previousConfig);
     setResources(initialSession.resources ?? { profile: "auto", cpu_budget_percent: null });
     setSeedIds(initialSession.seed_factor_ids ?? []);
@@ -329,20 +341,10 @@ export function RunConfigForm({
             <span className="field-label">Session name</span>
             <input value={name} aria-label="Session name" onChange={(e) => setName(e.target.value)} />
           </label>
-          <label className="field run-universe-field">
+          <div className="field run-universe-field">
             <span className="field-label">Universe</span>
             <span className="universe-field-row">
-              <select value={universe} aria-label="Universe" onChange={(e) => setUniverse(e.target.value)}>
-                {universes.length === 0 && <option value="sp500-lite">sp500-lite</option>}
-                {universes.length > 0 && !selectedUniverse && (
-                  <option value={universe}>{universe} (unavailable)</option>
-                )}
-                {universes.map((u) => (
-                  <option key={u.name} value={u.name}>
-                    {u.display_name ?? u.name} ({u.symbol_count ?? u.definition?.member_count ?? u.symbols.length})
-                  </option>
-                ))}
-              </select>
+              <UniversePicker universes={universes} value={universe} onChange={setUniverse} />
               {onEditUniverse && (
                 <button
                   type="button"
@@ -354,7 +356,7 @@ export function RunConfigForm({
                 </button>
               )}
             </span>
-          </label>
+          </div>
           <label className="field run-date-field">
             <span className="field-label">As of date</span>
             <input
@@ -366,6 +368,31 @@ export function RunConfigForm({
               onChange={(event) => setAsOf(event.target.value)}
             />
             <small className="hint">Membership and available data are evaluated on this date.</small>
+          </label>
+          <label className="field run-execution-field">
+            <span className="field-label">Execution timing</span>
+            <select
+              aria-label="Execution timing"
+              data-testid="execution-timing"
+              value={config.execution ?? "close"}
+              onChange={(event) =>
+                setConfig((previous) => ({
+                  ...previous,
+                  execution: event.target.value as GpConfig["execution"],
+                }))
+              }
+            >
+              {EXECUTION_TIMING_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <small
+              className={config.execution === "close" ? "hint oos-warning" : "hint"}
+              data-testid="execution-timing-hint"
+            >
+              {EXECUTION_TIMING_OPTIONS.find((option) => option.value === (config.execution ?? "close"))?.description}{" "}
+              Fixed for the whole session: fitness, validation, backtests and the holdout all use it.
+            </small>
           </label>
         </div>
         {missingDependencies && (

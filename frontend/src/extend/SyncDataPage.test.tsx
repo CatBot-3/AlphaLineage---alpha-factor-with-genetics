@@ -218,6 +218,43 @@ describe("UniverseDataSync", () => {
     expect(screen.getByText("Completed with 1 failure")).toBeInTheDocument();
   });
 
+  it("explains a provider allowance stop and how many symbols were never requested", async () => {
+    startDataSync.mockResolvedValue({ job_id: "sync-quota", status: "queued", reused: false });
+    getDataSync.mockResolvedValue({
+      job_id: "sync-quota",
+      status: "done",
+      result: {
+        mode: "incremental",
+        start: "2020-01-01",
+        failed_count: 0,
+        succeeded_count: 1,
+        termination_reason: "quota_exceeded",
+        quota: { provider: "tiingo", scope: "hourly", message: "hourly allocation" },
+        not_attempted: ["MSFT", "NVDA"],
+        results: [
+          { symbol: "AAPL", status: "fetched", rows_fetched: 10, rows_cached: 10 },
+          {
+            symbol: "AMZN",
+            status: "quota_exceeded",
+            rows_fetched: 0,
+            rows_cached: 0,
+            error: "Tiingo hourly allowance exhausted",
+            quota_scope: "hourly",
+          },
+        ],
+      },
+      error: null,
+    });
+
+    render(<UniverseDataSync rows={ROWS} />);
+    fireEvent.click(screen.getByTestId("sync-universe"));
+    expect(await screen.findByText("Stopped: hourly allowance used")).toBeInTheDocument();
+    expect(screen.getByTestId("sync-quota-stop")).toHaveTextContent(
+      "The tiingo hourly allowance is used up, so the sync stopped instead of spending more requests (2 symbols not attempted).",
+    );
+    expect(screen.getByText("1 completed · 0 failed · 2 not attempted")).toBeInTheDocument();
+  });
+
   it("continues polling beyond the former 60-second cap", async () => {
     vi.useFakeTimers();
     try {

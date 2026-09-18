@@ -65,6 +65,8 @@ class AgentContext:
     #: Metrics already recorded for the target, labelled by split. Read-only context.
     target_metrics: dict[str, Any] = field(default_factory=dict)
     horizon: int = 1
+    #: Session execution timing (``fitness.EXECUTION_TIMINGS``); frozen, never agent-editable.
+    execution: str = "close"
     ic_method: str = "spearman"
     commission_bps: float = 1.0
     slippage_bps: float = 5.0
@@ -93,6 +95,7 @@ class AgentContext:
             "session_name": self.session_name,
             "universe": self.universe,
             "horizon": self.horizon,
+            "execution": self.execution,
             "ic_method": self.ic_method,
             "train_dates": len(self.panel.dates),
             "symbols": len(self.panel.symbols),
@@ -140,6 +143,7 @@ def context_from_session(
         target_label=target_label,
         target_metrics=dict(target_metrics or {}),
         horizon=int(config.get("horizon", 1) or 1),
+        execution=str(config.get("execution") or "close"),
         ic_method=str(config.get("ic_method", "spearman") or "spearman"),
         commission_bps=commission_bps,
         slippage_bps=slippage_bps,

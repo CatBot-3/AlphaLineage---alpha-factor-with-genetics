@@ -110,7 +110,8 @@ def session_header(context: AgentContext) -> str:
     reach = context.guard.describe()
     lines = [
         f"Session: {context.session_name} (universe {context.universe}, "
-        f"horizon {context.horizon}, IC method {context.ic_method}).",
+        f"horizon {context.horizon}, execution {context.execution}, "
+        f"IC method {context.ic_method}).",
         f"You may read training data through {reach['readable_through']}. The validation window "
         f"opens {reach['validation_starts']} and the locked holdout opens {reach['test_starts']}; "
         "neither is reachable from any tool you have.",

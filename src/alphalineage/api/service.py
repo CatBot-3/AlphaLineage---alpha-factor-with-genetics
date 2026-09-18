@@ -21,7 +21,7 @@ from alphalineage.backtest.portfolio import (
 )
 from alphalineage.backtest.reporting import backtest_report
 from alphalineage.core.extensions import operator_counts
-from alphalineage.core.fitness import forward_returns
+from alphalineage.core.fitness import forward_returns, label_span
 from alphalineage.core.gp import GP, GPConfig
 from alphalineage.core.panel import Panel
 from alphalineage.core.primitives import OPERATORS
@@ -62,6 +62,7 @@ def report_context(split: Split, config: GPConfig, *, embargo: int) -> dict[str,
             "embargo": embargo,
         },
         "horizon": config.horizon,
+        "execution": config.execution,
         "ic_method": config.ic_method,
         "weighting_scheme": "quantile_ls",
         "quantile": 0.2,
@@ -88,6 +89,7 @@ def build_report(
     searched_trials: int,
     min_names: int = 5,
     horizon: int = 1,
+    execution: str = "close",
     ic_method: str = "spearman",
     n_user_operators: int = 0,
     scheme: WeightingScheme | None = None,
@@ -124,7 +126,7 @@ def build_report(
         n_operators=builtin + n_user_operators,
         baseline=builtin,
     )
-    resolved_fwd = forward_returns(panel, horizon) if fwd is None else fwd
+    resolved_fwd = forward_returns(panel, horizon, execution) if fwd is None else fwd
     if strategy_specs is not None and scheme is not None:
         raise ValueError("pass either scheme or strategy_specs, not both")
     if strategy_specs is None:
@@ -165,6 +167,7 @@ def build_report(
                     resolved_scheme,
                     cost_model,
                     horizon=horizon,
+                    execution=execution,
                 ),
                 lambda factor, current_scheme=resolved_scheme: net_returns_for_factor(
                     factor,
@@ -173,6 +176,7 @@ def build_report(
                     cost_model,
                     panel=panel,
                     horizon=horizon,
+                    execution=execution,
                 ),
             )
         )
@@ -193,6 +197,7 @@ def build_report(
                 ic_method=ic_method,
                 min_names=min_names,
                 horizon=horizon,
+                execution=execution,
             )
             strategy_results.append(
                 {
@@ -273,7 +278,11 @@ def run_search(
 ) -> dict[str, Any]:
     """Run a GP search and return the best factor, its OOS/deflated verdict, and the lineage."""
     split = time_split(
-        panel.dates, train=train, valid=valid, embargo=embargo, horizon=config.horizon
+        panel.dates,
+        train=train,
+        valid=valid,
+        embargo=embargo,
+        horizon=label_span(config.horizon, config.execution),
     )
     train_panel = Panel({f: df.loc[df.index.isin(split.train)] for f, df in panel.fields.items()})
 
@@ -311,7 +320,7 @@ def run_search(
         if progress is not None and hasattr(progress, "set_phase"):
             progress.set_phase("validating")
         report_started = time.monotonic()
-        fwd = forward_returns(panel, config.horizon)
+        fwd = forward_returns(panel, config.horizon, config.execution)
         searched = gp.searched_individuals()
         selection = select_validation_candidate(
             searched,
@@ -349,6 +358,7 @@ def run_search(
             searched_trials=gp.trial_count,
             min_names=config.min_names,
             horizon=config.horizon,
+            execution=config.execution,
             ic_method=config.ic_method,
             n_user_operators=user_operator_count(allowed_operators),
             progress=report_progress,

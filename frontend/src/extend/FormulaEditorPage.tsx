@@ -242,6 +242,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   condition: "Conditions",
   constant: "Constants",
   technical_indicators: "Technical Indicators",
+  classic_alphas: "Classic Alpha Factors",
   custom: "Custom",
   uncategorized: "Other",
 };
@@ -257,6 +258,9 @@ const STARTER_FAMILY_ORDER = [
   "donchian",
   "directional_movement",
   "volume",
+  "worldquant_101",
+  "qlib_alpha158",
+  "academic_anomalies",
   // Backward-compatible family keys used by catalog revision 1.
   "volatility",
   "other_indicators",
@@ -273,6 +277,9 @@ const STARTER_FAMILY_LABELS: Record<string, string> = {
   donchian: "Donchian Channels",
   directional_movement: "Directional Movement",
   volume: "Volume",
+  worldquant_101: "WorldQuant 101 Alphas",
+  qlib_alpha158: "Qlib Alpha158 Features",
+  academic_anomalies: "Academic Anomalies",
   volatility: "Volatility",
   other_indicators: "Other indicators",
 };
