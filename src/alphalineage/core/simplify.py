@@ -24,7 +24,7 @@ def _is_window(node: Node, value: int) -> bool:
     return node.name == "window" and node.value is not None and int(node.value) == value
 
 
-def _rewrite(node: Node) -> Node:
+def _rewrite(node: Node, *, preserve_missing: bool = False) -> Node:
     """Apply one layer of rewrites to a node whose children are already simplified."""
     name = node.name
     ch = node.children
@@ -34,13 +34,13 @@ def _rewrite(node: Node) -> Node:
         return ch[0]
     if name == "mul_scalar" and _is_const(ch[1], 1.0):
         return ch[0]
-    if name == "signed_power" and _is_const(ch[1], 1.0):
+    if not preserve_missing and name == "signed_power" and _is_const(ch[1], 1.0):
         return ch[0]
 
     # window identities
     if name == "delay" and _is_window(ch[1], 0):
         return ch[0]
-    if name in _TS_WINDOW1_IDENTITY and _is_window(ch[1], 1):
+    if not preserve_missing and name in _TS_WINDOW1_IDENTITY and _is_window(ch[1], 1):
         return ch[0]
 
     # idempotent / inverse unaries
@@ -54,11 +54,11 @@ def _rewrite(node: Node) -> Node:
     return node
 
 
-def simplify(node: Node) -> Node:
+def simplify(node: Node, *, preserve_missing: bool = False) -> Node:
     """Return a semantically-equivalent, reduced copy of ``node``."""
     if node.children:
-        node = Node(node.name, tuple(simplify(c) for c in node.children), node.value)
-    rewritten = _rewrite(node)
+        node = Node(node.name, tuple(simplify(c, preserve_missing=preserve_missing) for c in node.children), node.value)
+    rewritten = _rewrite(node, preserve_missing=preserve_missing)
     if rewritten != node:
-        return simplify(rewritten)
+        return simplify(rewritten, preserve_missing=preserve_missing)
     return node

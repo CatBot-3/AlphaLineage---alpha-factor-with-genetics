@@ -75,10 +75,11 @@ describe("FactorOverlapPanel", () => {
     render(<FactorOverlapPanel sessionId="s1" roundIndex={0} />);
 
     const verdict = await screen.findByTestId("overlap-verdict");
-    expect(verdict).toHaveTextContent("Near-duplicate");
+    expect(verdict).toHaveTextContent("Strong overlap");
     expect(verdict).toHaveTextContent("Closest: ANOM_MOMENTUM_12_1 (rank correlation 0.84)");
     expect(screen.getByTestId("overlap-unique-share")).toHaveTextContent("19%");
     expect(screen.getByTestId("overlap-unique-ic")).toHaveTextContent("0.004");
+    expect(screen.getByTestId("overlap-unique-share")).not.toHaveTextContent("-0");
     expect(screen.getByText(/Removed before measuring unique IC: ANOM_MOMENTUM_12_1/)).toBeInTheDocument();
 
     const rows = within(screen.getByTestId("overlap-references")).getAllByRole("row");
@@ -114,6 +115,15 @@ describe("FactorOverlapPanel", () => {
     );
     expect(await screen.findByRole("button", { name: "Comparing… 50%" })).toBeDisabled();
     expect(await screen.findByText("Novel", {}, { timeout: 3000 })).toBeInTheDocument();
+  });
+
+  it("reports a unique IC that rounds to zero without a phantom minus sign", async () => {
+    getRoundOverlap.mockResolvedValue(
+      report({ residual: { ...report().residual, ic: -0.0004, unique_share: -0.02 } }),
+    );
+    render(<FactorOverlapPanel sessionId="s1" roundIndex={0} />);
+    expect(await screen.findByTestId("overlap-unique-ic")).toHaveTextContent("0.000");
+    expect(screen.getByTestId("overlap-unique-ic")).not.toHaveTextContent("-0.000");
   });
 
   it("warns when the stored check is stale and surfaces job failures", async () => {

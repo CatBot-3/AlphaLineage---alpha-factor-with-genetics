@@ -90,7 +90,7 @@ describe("restoring a workspace from an older build", () => {
     const { App } = await import("./App");
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Genealogy", level: 1 })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Results · Lineage", level: 1 })).toBeInTheDocument();
   });
 
   it("survives a saved tab that is not a string at all", async () => {

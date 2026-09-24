@@ -3,6 +3,7 @@ import type { ExecutionTiming, GpConfig } from "../api/types";
 // A light, interactive preset (the full dev.yaml defaults are 200x25; that is too slow for a
 // click-and-watch first run). Every field is editable in the form, so users can scale up.
 export const DEFAULT_CONFIG: GpConfig = {
+  novelty_mode: "balanced",
   population_size: 80,
   generations: 12,
   tournament_size: 3,
@@ -31,12 +32,13 @@ export const DEFAULT_CONFIG: GpConfig = {
 export const CORE_FIELDS: Array<{ key: keyof GpConfig; label: string }> = [
   { key: "population_size", label: "Population" },
   { key: "generations", label: "Generations" },
-  { key: "max_depth", label: "Max depth" },
-  { key: "max_nodes", label: "Max nodes" },
-  { key: "seed", label: "Seed" },
+
 ];
 
 export const ADVANCED_FIELDS: Array<{ key: keyof GpConfig; label: string }> = [
+  { key: "max_depth", label: "Max depth" },
+  { key: "max_nodes", label: "Max nodes" },
+  { key: "seed", label: "Seed" },
   { key: "tournament_size", label: "Tournament size" },
   { key: "crossover_rate", label: "Crossover rate" },
   { key: "subtree_mutation_rate", label: "Subtree mutation" },

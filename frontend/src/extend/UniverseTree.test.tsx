@@ -114,7 +114,15 @@ describe("UniverseTree", () => {
     fireEvent.change(moveThemes, { target: { value: "sectors" } });
     await waitFor(() => expect(updateUniverseFolder).toHaveBeenCalledWith("themes", { parent: "sectors" }));
 
-    fireEvent.change(screen.getByLabelText("Move Popular US stocks sample to folder"), { target: { value: "tech" } });
+    // A universe row keeps its name and count in view; moving it lives behind the same
+    // overflow menu a folder row uses, not in a select competing with the row's label.
+    const sample = screen.getByRole("button", { name: "Load Popular US stocks sample" }).closest("li")!;
+    const sampleMenu = within(sample).getByLabelText("Actions for Popular US stocks sample");
+    expect(sampleMenu.closest("details")).not.toHaveAttribute("open");
+    fireEvent.click(sampleMenu);
+    fireEvent.change(within(sample).getByLabelText("Move Popular US stocks sample to folder"), {
+      target: { value: "tech" },
+    });
     await waitFor(() => expect(moveUniverses).toHaveBeenCalledWith(["sp500-lite"], "tech"));
 
     fireEvent.click(screen.getByRole("button", { name: "Expand folder S&P 500 themes" }));

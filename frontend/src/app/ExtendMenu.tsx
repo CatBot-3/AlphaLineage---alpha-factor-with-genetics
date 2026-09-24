@@ -51,7 +51,7 @@ export function ExtendMenu({
         }
         onClick={() => setOpen((v) => !v)}
       >
-        Extend
+        Build &amp; Data
       </button>
       {open && (
         <div className="nav-dropdown__menu" role="menu" data-testid="extend-menu">

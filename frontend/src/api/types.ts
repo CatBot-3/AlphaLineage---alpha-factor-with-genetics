@@ -55,6 +55,10 @@ export interface HistoryPoint {
 }
 
 export interface CandidateScoreMetrics {
+  novelty_multiplier?: number;
+  novelty_penalty?: number;
+  novelty_correlation?: number;
+  novelty_measured?: number;
   ic?: number;
   signed_ic?: number;
   oriented_ic?: number;
@@ -287,6 +291,7 @@ export interface BenchmarkSeries extends BenchmarkDefinition {
 
 // --- iterative sessions (A4/A5) ------------------------------------------------
 export interface GpConfig {
+  novelty_mode?: "off" | "balanced";
   population_size: number;
   generations: number;
   tournament_size: number;
@@ -360,13 +365,30 @@ export interface TrainingCapabilities {
   fallback_reason: string | null;
 }
 
+/** What the worker tuner measured on this machine. Never feeds a metric or a fingerprint. */
+export interface WorkerTuning {
+  state: "calibrating" | "settled" | string;
+  /** Worker count in use, chosen by measurement rather than by a percentage. */
+  workers: number;
+  max_workers: number;
+  ladder: number[];
+  samples: number;
+  /** Measured cost ratio of one worker to the chosen count, once both are sampled. */
+  speedup: number | null;
+  /** Median cost per unit of work at each sampled worker count. */
+  cost_by_workers: Record<string, number>;
+}
+
 export interface ProgressSnapshot {
+  novelty?: {mode: string; structural_skips: number; predictive_trials: number; family_count: number; references: number};
+  checkpoint?: boolean;
   phase: string;
   generation: number;
   target_generations: number;
   history: Array<{ generation: number; best_fitness: number; mean_fitness: number }>;
   best: { tree: string; fitness: number } | null;
   resources?: ResolvedTrainingResources | null;
+  tuning?: WorkerTuning | null;
   candidate_done?: number;
   candidate_total?: number;
   report_done?: number;
@@ -614,6 +636,12 @@ export interface SessionContinueRequest {
 
 // --- saved factors (A3) --------------------------------------------------------
 export interface FactorProvenance {
+  evidence?: string;
+  validation_passed?: boolean | null;
+  round_index?: number;
+  evaluation_id?: string | null;
+  execution?: ExecutionTiming;
+  polarity?: number | null;
   session_id?: string;
   generation?: number;
   universe?: string;
@@ -651,7 +679,7 @@ export interface FormulaResult extends SavedFactor {
   source_formula?: string | null;
   dependency_fingerprint?: string | null;
   bindings?: Record<string, FormulaTestBinding>;
-  source?: FormulaTestSource | null;
+  source?: (FormulaTestSource | {kind?: "research"; identity: {id: string; evaluation_id?: string | null}}) | null;
   expression_fingerprint?: string | null;
   universe?: string | null;
   start?: string | null;
@@ -784,6 +812,8 @@ export interface Settings {
   tiingo_stored_key_set?: boolean;
   evaluator: "auto" | "python" | "cpp";
   cpp_available: boolean;
+  /** How eagerly price gaps are filled without being asked. Optional for older backends. */
+  auto_sync?: AutoSyncMode;
   /** The agent's model. Optional for the same rolling-upgrade reason. */
   llm_provider?: string;
   llm_model?: string;
@@ -797,6 +827,7 @@ export interface SettingsUpdate {
   factors_dir?: string;
   tiingo_api_key?: string;
   evaluator?: "auto" | "python" | "cpp";
+  auto_sync?: AutoSyncMode;
   llm_provider?: string;
   llm_model?: string;
   llm_base_url?: string;
@@ -1123,6 +1154,32 @@ export interface SymbolValidation {
   cached?: boolean;
 }
 
+/**
+ * `top_up` refreshes symbols already cached, which costs requests from an allowance that
+ * refills by itself. `full` also pulls never-cached symbols, which spends the provider's
+ * monthly unique-symbol allowance.
+ */
+export type AutoSyncMode = "off" | "top_up" | "full";
+
+export interface UniverseFillPlan {
+  name: string;
+  as_of: string;
+  mode: AutoSyncMode;
+  scope: "top_up" | "full";
+  /** Symbols this scope would fetch. */
+  symbols: string[];
+  /** Gaps this scope deliberately leaves alone. */
+  deferred_symbols: string[];
+  cached_gap_count: number;
+  first_time_count: number;
+}
+
+export interface UniverseFillJob extends UniverseFillPlan {
+  job_id: string | null;
+  status: string;
+  reused?: boolean;
+}
+
 export interface DataCoverage {
   symbol: string;
   cached: boolean;
@@ -1263,7 +1320,16 @@ export interface OperatorComposerDraft {
 }
 
 export interface WorkspaceUiState {
-  selectedTab?: "train" | "dashboard" | "factor" | "genealogy" | "extend" | "library" | "agent";
+  signals?: SignalsWorkspaceState;
+  selectedTab?:
+    | "train"
+    | "dashboard"
+    | "factor"
+    | "genealogy"
+    | "signals"
+    | "extend"
+    | "library"
+    | "agent";
   selectedFactorNode?: { name: string; value?: number } | null;
   selectedLineage?: number | null;
   sessionId?: string | null;
@@ -1384,6 +1450,7 @@ export type OverlapVerdict =
   | "novel"
   | "related"
   | "mostly_explained"
+  | "strong_overlap"
   | "near_duplicate"
   | "unmeasured";
 
@@ -1408,6 +1475,7 @@ export interface OverlapReference {
 }
 
 export interface FactorOverlapReport {
+  own_saved_copies?: {key: string; name: string}[];
   overlap_version: number;
   session_id: string;
   round_index: number;
@@ -1436,4 +1504,129 @@ export interface FactorOverlapReport {
   disclaimer?: string;
   stale?: boolean;
   stale_reasons?: string[];
+}
+
+// --- signals: using a discovered factor -----------------------------------------------------
+export interface SignalSource {
+  revision?: number;
+  inputs?: FormulaInputSpec[];
+  validation_passed?: boolean | null;
+  missing_context?: string[];
+  expression_fingerprint?: string;
+  id: string;
+  kind: "saved_result" | "round" | string;
+  name: string;
+  universe?: string | null;
+  execution?: ExecutionTiming;
+  horizon?: number | null;
+  /** How far this formula has been tested: a round is only "holdout" once finalized. */
+  evidence: "holdout" | "validation" | "saved" | string;
+  created_at?: string | null;
+  detail?: string;
+}
+
+export interface SignalRow {
+  symbol: string;
+  rank: number;
+  percentile: number;
+  value: number;
+  previous_rank: number | null;
+  /** Positive means the symbol climbed since the previous snapshot date. */
+  rank_change: number | null;
+  close: number | null;
+  day_change: number | null;
+  last_price_date: string | null;
+}
+
+export interface SignalExclusion {
+  symbol: string;
+  reason: "stale_prices" | "warming_up" | "no_prices" | string;
+  detail: string;
+  last_price_date: string | null;
+  stale_bars: number | null;
+}
+
+export interface SignalSnapshot {
+  snapshot_id?: string;
+  sources?: SignalSource[];
+  data_revision?: string;
+  expected_session?: string;
+  current_expected_session?: string;
+  stale?: boolean;
+  actual_signal_date?: string | null;
+  fetched_at?: string | null;
+  actionable?: boolean;
+  coverage?: number;
+  active_count?: number;
+  status?: string;
+  missing_context?: string[];
+  price_basis?: string;
+  history_start?: string;
+  validation_passed?: boolean | null;
+  primary_strategy?: PortfolioStrategySpec;
+  diagnostic_rows?: SignalRow[];
+  signals_version: number;
+  as_of: string;
+  previous_as_of: string | null;
+  panel_end: string;
+  /** Bars between the snapshot date and the newest cached bar; 0 means fully current. */
+  bars_behind_panel: number;
+  execution: ExecutionTiming;
+  execution_delay: number;
+  ranked_count: number;
+  excluded_count: number;
+  min_names: number;
+  /** The formula has an unbounded window, so a trimmed history only approximates its value. */
+  approximate: boolean;
+  rows: SignalRow[];
+  excluded: SignalExclusion[];
+  source: string;
+  source_name: string;
+  evidence: string;
+  universe: string;
+  universe_fingerprint?: string;
+  history_bars: number;
+  effective_lookback_bars: number;
+  computed_at: string;
+  disclaimer?: string;
+  sync?: {
+    termination_reason?: string;
+    failed_count?: number;
+    succeeded_count?: number;
+    quota?: { provider: string; scope: string; message: string };
+  };
+}
+
+export interface SignalsWorkspaceState {
+  source?: string;
+  universe?: string;
+  symbol?: string;
+  comparisons?: string[];
+  bindings?: Record<string, Record<string, FormulaTestBinding>>;
+  range?: "1M" | "3M" | "6M" | "1Y" | "All";
+  view?: "chart" | "portfolio";
+  percentile?: boolean;
+  snapshotId?: string;
+  jobId?: string;
+  execution?: ExecutionTiming;
+  direction?: "higher" | "lower";
+  strategy?: "quantile_ls" | "rank_proportional";
+  notional?: number;
+}
+export interface SignalSeries {
+  snapshot_id: string;
+  symbol: string;
+  data_revision: string;
+  bars: { time: string; open: number | null; high: number | null; low: number | null; close: number | null; volume: number | null }[];
+  signals: { source: string; name: string; evidence: string; points: { time: string; value: number | null; percentile: number | null; rank?: number | null; coverage: number | null }[] }[];
+}
+export interface PortfolioPreview {
+  snapshot_id: string;
+  strategy: PortfolioStrategySpec;
+  rows: {symbol: string; side: string; weight: number; amount: number | null}[];
+  gross_exposure: number;
+  net_exposure: number;
+  largest_weight: number;
+  coverage: number;
+  excluded_count: number;
 }

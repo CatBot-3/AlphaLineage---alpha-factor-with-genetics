@@ -58,6 +58,7 @@ from alphalineage.core.gp import (
 )
 from alphalineage.core.panel import Panel
 from alphalineage.core.tree import Node, from_json, to_json
+from alphalineage.core.tuning import WorkerTuner
 from alphalineage.data import paths
 from alphalineage.data.identifiers import atomic_write_text, child_path
 from alphalineage.library.store import LineageStore
@@ -1612,8 +1613,14 @@ def run_segment(
     ]:
         workers = int(lease.max_workers) if lease is not None else 1
         memory_budget = int(lease.memory_budget_bytes) if lease is not None else None
+        # The lease reserves the ceiling; the tuner decides how much of it each batch is worth.
+        # Timings carry across segments in the checkpoint because they describe the machine,
+        # not the search - and worker count cannot change what a search finds.
+        tuner = WorkerTuner(workers)
+        if progress is not None and hasattr(progress, "set_tuning"):
+            progress.set_tuning(tuner.snapshot().to_dict())
         if progress is not None and hasattr(progress, "set_phase"):
-            progress.set_phase("initializing")
+            progress.set_phase("preparing_references" if config.novelty_mode == "balanced" else "initializing")
         training_started = time.monotonic()
         if warm:
             store.continue_from(_last_generation(store))
@@ -1624,6 +1631,7 @@ def run_segment(
                 allowed_operators=allowed_operators,
                 workers=workers,
                 memory_budget_bytes=memory_budget,
+                tuner=tuner,
             )
             gp.config = config  # apply any continue-time overrides
             if rescore:
@@ -1643,6 +1651,8 @@ def run_segment(
                 allowed_operators=allowed_operators,
                 workers=workers,
                 memory_budget_bytes=memory_budget,
+                tuner=tuner,
+                novelty_state=session.get("novelty"),
             )
             gen_start = 0
             target = generations
@@ -1650,6 +1660,8 @@ def run_segment(
                 progress.set_target(target)
             gp.run(generations=target, seeds=list(seeds), stop=stop)
         training_seconds = time.monotonic() - training_started
+        if progress is not None and hasattr(progress, "set_tuning"):
+            progress.set_tuning(tuner.snapshot().to_dict())
 
         gp.save_checkpoint(checkpoint)
         store.save(lineage_path)
@@ -1659,7 +1671,7 @@ def run_segment(
         fwd = forward_returns(panel, gp.config.horizon, gp.config.execution)
         searched_candidates = gp.searched_individuals()
         selection_result = select_validation_candidate(
-            searched_candidates,
+            gp.validation_candidates(),
             panel,
             fwd,
             split.valid,

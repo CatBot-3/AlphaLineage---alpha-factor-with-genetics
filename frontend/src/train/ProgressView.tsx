@@ -18,6 +18,7 @@ export function ProgressView({
   const best = progress?.best?.fitness;
   const activePhase = progress?.phase ?? phase;
   const resources = progress?.resources;
+  const tuning = progress?.tuning;
   const reportTotal = progress?.report_total ?? 0;
   const reportDone = progress?.report_done ?? 0;
   const showingReport = ["validating", "reporting", "finalizing"].includes(activePhase);
@@ -38,7 +39,7 @@ export function ProgressView({
             ? `validation ${reportDone} / ${reportTotal}`
             : `generation ${generation} / ${target}`}
         </span>
-        <span className="progress-phase">{activePhase}</span>
+        <span className="progress-phase">{activePhase.replace(/_/g, " ")}</span>
         {canStop && (
           <button type="button" className="ghost" onClick={onStop} data-testid="stop-run">
             Stop
@@ -48,16 +49,32 @@ export function ProgressView({
       <div className="progress-bar" role="progressbar" aria-valuenow={pct}>
         <span className="progress-bar__fill" style={{ width: `${pct}%` }} />
       </div>
+      {progress?.novelty && <p>{progress.novelty.structural_skips} duplicate evaluations skipped · {progress.novelty.family_count} behavioral families · {progress.novelty.predictive_trials} scored trials</p>}
+      {progress?.checkpoint && <p>Checkpoint saved</p>}
       {resources && (
         <p className="progress-resources" data-testid="progress-resources">
           {resources.profile === "custom" ? `${resources.percent}% custom` : resources.profile}
-          {" · "}{resources.workers} worker{resources.workers === 1 ? "" : "s"}
+          {" · "}
+          {tuning ? `${tuning.workers} of ${tuning.max_workers}` : `${resources.workers}`} worker
+          {(tuning ? tuning.workers : resources.workers) === 1 ? "" : "s"}
           {resources.accelerated ? " · accelerated" : " · Python fallback"}
+        </p>
+      )}
+      {tuning && (
+        // Why the machine is not pegged: most of a search parallelises, the rest does not, and
+        // the tuner stops adding workers once they stop earning their place.
+        <p className="progress-detail" data-testid="progress-tuning">
+          {tuning.state === "calibrating"
+            ? `timing worker counts ${tuning.ladder.join(", ")} on this machine…`
+            : tuning.speedup
+              ? `measured ${tuning.speedup.toFixed(1)}× faster than one worker; more than ` +
+                `${tuning.workers} stopped helping`
+              : `settled on ${tuning.workers} of ${tuning.max_workers} workers`}
         </p>
       )}
       {(progress?.candidate_total ?? 0) > 0 && (
         <p className="progress-detail" data-testid="candidate-progress">
-          scoring candidates {progress?.candidate_done ?? 0} / {progress?.candidate_total}
+          {activePhase === "preparing_references" ? "preparing references" : "scoring candidates"} {progress?.candidate_done ?? 0} / {progress?.candidate_total}
           {progress?.factors_per_second
             ? ` · ${progress.factors_per_second.toFixed(1)} factors/s`
             : ""}

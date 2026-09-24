@@ -325,11 +325,12 @@
   position: absolute;
   top: 2px;
   right: 0;
-  font-size: 8px;
+  /* 8px accent-on-parchment was below the smallest type token and barely legible. */
+  font-size: var(--type-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--color-accent);
+  color: color-mix(in srgb, var(--color-accent) 65%, var(--color-ink));
 }
 
 .beta-badge {

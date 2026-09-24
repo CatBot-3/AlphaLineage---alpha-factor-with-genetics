@@ -10,6 +10,7 @@ evaluator. There is no ``eval``/``exec``/``compile`` anywhere on this path.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 from typing import Any
 
 from alphalineage.core.primitives import OPERATORS, REGISTRY, Kind, Primitive
@@ -21,6 +22,24 @@ ARG = "$arg"
 
 #: User-registered operators (name -> Primitive). Process-global (single-user local app).
 USER_OPERATORS: dict[str, Primitive] = {}
+
+#: Bumped whenever a user operator is registered or removed. A macro expansion is a pure
+#: function of a tree *and* the registry that defines its macros, so anything that caches an
+#: expansion keys on this and is invalidated the moment a formula is added, replaced or retired.
+_REGISTRY_REVISION = 0
+
+
+def registry_revision() -> int:
+    """Monotonic counter identifying the current user-operator registry."""
+    return _REGISTRY_REVISION
+
+
+def _bump_revision() -> None:
+    global _REGISTRY_REVISION
+    _REGISTRY_REVISION += 1
+    # Keying on the revision already makes stale entries unreachable; dropping them keeps a
+    # long-lived process from holding expansions of formulas the user has since retired.
+    _expand_all_memo.cache_clear()
 
 # User formulas are data, but a malformed or manually edited formula store can still describe
 # a recursive or exponentially expanding macro graph.  Keep every expansion entry point bounded
@@ -117,6 +136,7 @@ def register_operator(
     OPERATORS[name] = prim
     REGISTRY[name] = prim
     USER_OPERATORS[name] = prim
+    _bump_revision()
     return prim
 
 
@@ -163,6 +183,7 @@ def unregister_operator(name: str) -> None:
         prim = table.get(name)
         if prim is not None and prim.macro_body is not None:
             del table[name]
+    _bump_revision()
 
 
 def clear_user_operators() -> None:
@@ -262,3 +283,41 @@ def expand_all(
             f"expanded expression size exceeds the limit of {max_nodes} distinct nodes"
         )
     return expanded
+
+
+#: An expansion is a pure function of (tree, limits, registry revision), and the GP asks for the
+#: same one over and over: a profile of a real search found 96% of calls repeating an input
+#: already expanded, because identity, feasibility and diversity checks each re-derive it.
+_EXPANSION_CACHE_SIZE = 8192
+
+
+@lru_cache(maxsize=_EXPANSION_CACHE_SIZE)
+def _expand_all_memo(
+    node: Node, max_depth: int, max_nodes: int, revision: int
+) -> Node:
+    return expand_all(node, max_depth=max_depth, max_nodes=max_nodes)
+
+
+def expand_all_cached(
+    node: Node,
+    *,
+    max_depth: int = MAX_EXPANDED_DEPTH,
+    max_nodes: int = MAX_EXPANDED_NODES,
+) -> Node:
+    """:func:`expand_all`, memoized across calls and invalidated by registry changes.
+
+    Callers that expand the *same* tree repeatedly should use this; callers expanding a tree
+    once should not, because filling the cache costs a hash of the tree either way. Failures are
+    not cached: an ``InvalidOperator`` is cheap to re-raise and caching it would pin a tree that
+    a later registration could make valid.
+    """
+    return _expand_all_memo(node, max_depth, max_nodes, registry_revision())
+
+
+def expansion_cache_info() -> Any:
+    """Hit/miss counts for the expansion memo, for tests and profiling."""
+    return _expand_all_memo.cache_info()
+
+
+def clear_expansion_cache() -> None:
+    _expand_all_memo.cache_clear()

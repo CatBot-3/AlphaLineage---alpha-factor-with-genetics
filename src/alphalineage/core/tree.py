@@ -30,6 +30,22 @@ class Node:
     children: tuple[Node, ...] = ()
     value: float | int | None = None  # ephemeral leaves only (const -> float, window -> int)
 
+    def __hash__(self) -> int:
+        """Structural hash, computed once per node.
+
+        The dataclass-generated hash walks the whole subtree on *every* call, so hashing a tree
+        of N nodes costs O(N) and the set comprehensions below cost O(N^2). A profile of a real
+        search counted 767,000 hash calls for 218 scored trees. A node is frozen, so the value
+        can only be computed once; ``_hash`` is written through ``object.__setattr__`` because
+        frozen dataclasses refuse ordinary assignment, and it is deliberately not a field so
+        equality, ordering and ``asdict`` are unaffected.
+        """
+        cached = self.__dict__.get("_hash")
+        if cached is None:
+            cached = hash((self.name, self.children, self.value))
+            object.__setattr__(self, "_hash", cached)
+        return cached
+
     @property
     def primitive(self) -> Primitive:
         return REGISTRY[self.name]

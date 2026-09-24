@@ -453,7 +453,8 @@ def select_validation_candidate(
             value=penalty_value,
             max_nodes=max_nodes,
         )
-        objective = float(metrics["median_oriented_ic"] - deduction)
+        metrics["novelty_multiplier"] = candidate.metrics.get("novelty_multiplier", 1.0)
+        objective = float(metrics["median_oriented_ic"] * metrics["novelty_multiplier"] - deduction)
         positive = sum(bool(item["positive"]) for item in fold_metrics)
         adequate = all(bool(item["adequate_coverage"]) for item in fold_metrics)
         ranked.append(

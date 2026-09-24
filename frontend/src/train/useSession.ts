@@ -69,7 +69,9 @@ export function useSession(
             onCompleteRef.current?.(next.result);
           }
         } else if (status === "failed") {
-          setError("the run failed; see the backend logs");
+          // The job carries why it failed and the finalization branch below already shows it.
+          // Dropping it here sent users to a log they have no way to open from the app.
+          setError(next.job?.error ?? "the run failed; see the backend logs");
           return;
         }
         if (finalizationStatus === "failed") {

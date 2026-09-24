@@ -23,7 +23,12 @@ from typing import Any
 import pandas as pd
 
 from alphalineage.core.categories import CUSTOM, builtin_category
-from alphalineage.core.extensions import InvalidOperator, expand_all
+from alphalineage.core.extensions import (
+    MAX_EXPANDED_NODES,
+    InvalidOperator,
+    expand_all,
+    expand_all_cached,
+)
 from alphalineage.core.fitness import (
     COMPLEXITY_PENALTY_MODES,
     DEFAULT_NORMALIZED_COMPLEXITY_PENALTY,
@@ -36,6 +41,7 @@ from alphalineage.core.panel import Panel
 from alphalineage.core.primitives import OPERANDS, OPERATORS, Kind
 from alphalineage.core.simplify import simplify
 from alphalineage.core.tree import Node, from_dict, from_json, to_dict, to_json, validate
+from alphalineage.core.tuning import WorkerTuner
 from alphalineage.core.types import DType, is_subtype
 
 Path_ = str | Path
@@ -47,6 +53,15 @@ MAX_POPULATION_SIZE = 5_000
 MAX_GENERATIONS = 1_000
 MAX_SEARCH_EVALUATIONS = 1_000_000
 MAX_TREE_DEPTH = 32
+#: Scoring is handed to the backend in chunks so a stop request lands and progress moves. The
+#: floor stops a many-worker run from spending its waves on pool spin-up and load imbalance.
+MIN_SCORING_CHUNK = 16
+MAX_SCORING_CHUNK = 256
+MAX_SCORING_WAVES = 8
+#: Trees per worker below which a shared program has almost nothing left to share. Batch CSE
+#: shares *within* a worker's group, so a chunk split across many workers leaves each program
+#: holding a handful of trees; at one tree per group the sharing is gone entirely.
+MIN_TREES_PER_GROUP = 8
 MAX_TREE_NODES = 2_000
 MAX_MIN_NAMES = 10_000
 MAX_HORIZON = 252
@@ -149,6 +164,7 @@ class GPConfig:
     validation_folds: int = 3
     # Missing/None is the compatibility path for checkpoints and direct library callers.
     exploration_profile: str | None = None
+    novelty_mode: str = "off"
     elitism: int = 1
     ic_method: str = "spearman"
     min_names: int = 5
@@ -165,6 +181,8 @@ class GPConfig:
     enabled_formula_names: list[str] | None = None
 
     def __post_init__(self) -> None:
+        if self.novelty_mode not in {"off", "balanced"}:
+            raise ValueError("novelty_mode must be off or balanced")
         positive_ints = (
             "population_size",
             "generations",
@@ -433,6 +451,72 @@ def _expansion_depth_limit(tree: Node, configured: int) -> int:
     return MAX_TREE_DEPTH if managed else configured
 
 
+@dataclass(frozen=True)
+class OversizedFormula:
+    """An enabled managed formula whose published default cannot fit the node budget."""
+
+    name: str
+    #: Smallest ``max_nodes`` that admits it, or ``None`` when no budget does.
+    needs_nodes: int | None
+
+
+def _expands_within(call: Node, max_nodes: int) -> bool:
+    try:
+        expand_all(call, max_depth=MAX_TREE_DEPTH, max_nodes=max_nodes)
+    except (InvalidOperator, ValueError):
+        return False
+    return True
+
+
+def _minimum_nodes_for(call: Node) -> int | None:
+    """Smallest node budget that admits this call, found by bisection on the same check."""
+    if not _expands_within(call, MAX_EXPANDED_NODES):
+        return None
+    low, high = 1, MAX_EXPANDED_NODES
+    while low < high:
+        middle = (low + high) // 2
+        if _expands_within(call, middle):
+            high = middle
+        else:
+            low = middle + 1
+    return low
+
+
+def oversized_enabled_formulas(config: GPConfig) -> list[OversizedFormula]:
+    """Enabled managed formulas a run would refuse, with the node budget each one needs.
+
+    The GP raises while building its seed population, which reaches the user as a failed job
+    rather than as something they can act on. Callers run this *before* starting a run, so the
+    answer arrives as "raise max nodes to N" next to the control that sets it.
+    """
+    selected = config.enabled_formula_names
+    if selected is None:
+        return []
+    logical_names = set(selected)
+    oversized: dict[str, OversizedFormula] = {}
+    for primitive in OPERATORS.values():
+        logical = next(
+            (
+                name
+                for name in logical_names
+                if primitive.name == name or primitive.name.startswith(f"{name}__r")
+            ),
+            None,
+        )
+        if logical is None or logical in oversized:
+            continue
+        call = GP._managed_default_call(primitive.name)
+        if call is None or call.depth() > config.max_depth:
+            continue
+        if _expands_within(call, config.max_nodes):
+            continue
+        oversized[logical] = OversizedFormula(logical, _minimum_nodes_for(call))
+    return sorted(
+        oversized.values(),
+        key=lambda item: (-(item.needs_nodes or MAX_EXPANDED_NODES), item.name),
+    )
+
+
 class GP:
     """A genetic-programming run over a panel."""
 
@@ -447,6 +531,8 @@ class GP:
         allowed_operators: set[str] | None = None,
         workers: int = 1,
         memory_budget_bytes: int | None = None,
+        tuner: WorkerTuner | None = None,
+        novelty_state: dict[str, Any] | None = None,
     ) -> None:
         if (
             isinstance(workers, bool)
@@ -460,6 +546,13 @@ class GP:
             or memory_budget_bytes <= 0
         ):
             raise ValueError("memory_budget_bytes must be a positive integer or None")
+        from .novelty import NoveltyContext
+        self.novelty = (NoveltyContext(panel, (novelty_state or {}).get("references", []),
+            min_names=int((novelty_state or {}).get("min_names", config.min_names)), memory_budget_bytes=memory_budget_bytes,
+            families=(novelty_state or {}).get("families", []),
+            progress=getattr(recorder, "on_reference_preparation", None))
+            if config.novelty_mode == "balanced" else None)
+        self.structural_skips = int((novelty_state or {}).get("structural_skips", 0))
         self.config = config
         self.panel = panel
         self.fwd = (
@@ -473,6 +566,10 @@ class GP:
         # Operator name allow-set (None => default pool, condition category excluded).
         self.allowed_operators = allowed_operators
         self.workers = workers
+        # When present, the tuner owns the per-batch worker count and `workers` is only its
+        # ceiling. Worker count cannot change what a search finds, so this is free of any
+        # consequence for reproducibility - only for how long the run takes.
+        self.tuner = tuner
         self.memory_budget_bytes = memory_budget_bytes
         self.scorer_backend = active_scorer_backend(config.ic_method)
         self.rng = random.Random(config.seed)
@@ -487,6 +584,7 @@ class GP:
         self.generation = 0
         self.history: list[dict[str, Any]] = []
         self._cache: dict[str, tuple[float, dict[str, float]]] = {}
+        self._cache_trees: dict[str, Node] = {}
         # Trials counted before this object's cache existed (resumes, invalidated caches).
         # Monotone by construction: it only ever grows, so deflation never softens.
         self._prior_trials = 0
@@ -520,9 +618,43 @@ class GP:
     def searched_individuals(self) -> list[Individual]:
         """All distinct scored trees in deterministic first-seen order."""
         return [
-            Individual(from_json(key), fitness, dict(metrics), 0)
+            Individual(self._cache_trees.get(key) or from_json(key), fitness, dict(metrics), 0)
             for key, (fitness, metrics) in self._cache.items()
         ]
+
+    @staticmethod
+    def _family_indices(individuals):
+        families = {}
+        for index, candidate in enumerate(individuals):
+            family = candidate.metrics.get("novelty_family", f"unmeasured:{index}")
+            previous = families.get(family)
+            if previous is None or (candidate.fitness, -candidate.metrics.get("expanded_complexity", candidate.tree.size()), -index) > (individuals[previous].fitness, -individuals[previous].metrics.get("expanded_complexity", individuals[previous].tree.size()), -previous):
+                families[family] = index
+        return sorted(families.values())
+
+    def _limit_families(self, population, entries=None):
+        if not self.novelty:
+            return population, entries
+        keep = set(self._family_indices(population))
+        extra = set()
+        if entries:
+            for index, entry in enumerate(entries):
+                family = population[index].metrics.get("novelty_family")
+                if entry[2] == "stepping_stone" and index not in keep and family not in extra:
+                    keep.add(index)
+                    extra.add(family)
+        indices = sorted(keep)
+        return [population[i] for i in indices], [entries[i] for i in indices] if entries else entries
+
+    def validation_candidates(self):
+        candidates = self.searched_individuals()
+        return [candidates[i] for i in self._family_indices(candidates)] if self.novelty else candidates
+
+    def novelty_diagnostics(self):
+        return {"mode": self.config.novelty_mode, "structural_skips": self.structural_skips,
+                "predictive_trials": self.trial_count, "family_count": len(self.validation_candidates()),
+                "reference_fingerprint": self.novelty.fingerprint if self.novelty else None,
+                "references": len(self.novelty.references) if self.novelty else 0}
 
     def _base_exploration_settings(self) -> ExplorationSettings:
         return resolve_exploration_settings(self.config.exploration_profile)
@@ -532,13 +664,13 @@ class GP:
             self._generations_since_improvement
         )
 
-    @staticmethod
-    def _cache_key(tree: Node) -> str:
-        return to_json(simplify(tree))
+    def _cache_key(self, tree: Node) -> str:
+        from .novelty import identity
+        return identity(tree) if self.novelty is not None else to_json(simplify(tree))
 
     def _prepare_tree(self, tree: Node) -> Node:
         """Normalize a candidate before identity, feasibility, scoring, or persistence."""
-        prepared = simplify(tree)
+        prepared = simplify(tree, preserve_missing=self.novelty is not None)
         if prepared != tree:
             self._pre_cache_simplifications += 1
         return prepared
@@ -607,7 +739,7 @@ class GP:
                 "best_validation_score": self._formula_validation_best.get(name),
                 "default_evaluated": int(
                     any(
-                        call.name == name and to_json(call) in self._cache
+                        call.name == name and self._cache_key(call) in self._cache
                         for call in self._managed_formula_defaults
                     )
                 ),
@@ -692,12 +824,31 @@ class GP:
         }
 
     # --- scoring -----------------------------------------------------------------
+    def _with_complexity(self, tree: Node, scored):
+        """Structural equivalents reuse predictions, but retain their own expansion cost."""
+        if self.novelty is None:
+            return scored
+        from .fitness import complexity_deduction
+        fitness, metrics = scored
+        metrics = dict(metrics)
+        expanded = expand_all(tree)
+        penalty = complexity_deduction(expanded.size(), parsimony=self.config.parsimony,
+            complexity_penalty_mode=self.config.complexity_penalty_mode,
+            complexity_penalty_value=self.config.complexity_penalty_value, max_nodes=self.config.max_nodes)
+        metrics.update(expanded_complexity=float(expanded.size()),
+                       expanded_unique_nodes=float(expanded.unique_computation_size()), complexity_penalty=penalty)
+        raw = metrics.get("raw_objective", metrics.get("ic", 0.))
+        return raw * metrics.get("novelty_multiplier", 1.) - penalty, metrics
+
     def _score(self, tree: Node) -> tuple[float, dict[str, float]]:
         tree = self._prepare_tree(tree)
-        key = to_json(tree)
+        key = self._cache_key(tree)
         cached = self._cache.get(key)
         if cached is not None:
-            return cached
+            adjusted = self._with_complexity(tree, cached)
+            if adjusted[0] > cached[0]:
+                self._cache[key], self._cache_trees[key] = adjusted, tree
+            return adjusted
         self._ensure_scorer_backend()
         result = score_trees(
             [tree],
@@ -711,8 +862,10 @@ class GP:
             min_names=self.config.min_names,
             workers=1,
             memory_budget_bytes=self.memory_budget_bytes,
+            **({"observer": self.novelty.apply} if self.novelty else {}),
         )[0]
         self._cache[key] = result
+        self._cache_trees[key] = tree
         return result
 
     def _individual(self, tree: Node, *, birth_generation: int | None = None) -> Individual:
@@ -737,7 +890,24 @@ class GP:
                 factors_per_second=done / elapsed,
             )
 
-    def _individuals(
+    def _notify_tuning(self) -> None:
+        """Forward what the tuner has learned, so a live run can explain its own core count."""
+        callback = getattr(self.recorder, "set_tuning", None)
+        if callback is not None and self.tuner is not None:
+            callback(self.tuner.snapshot().to_dict())
+
+    def _individuals(self, trees, **kwargs):
+        mark = self.novelty.mark() if self.novelty else None
+        skips = self.structural_skips
+        try:
+            return self._individuals_transaction(trees, **kwargs)
+        except BaseException:
+            if self.novelty:
+                self.novelty.rollback(mark)
+            self.structural_skips = skips
+            raise
+
+    def _individuals_transaction(
         self,
         trees: Sequence[Node],
         *,
@@ -752,28 +922,37 @@ class GP:
         Thus cancellation cannot leave a half-generation counted as searched.
         """
         prepared_trees = [self._prepare_tree(tree) for tree in trees]
-        keys = [to_json(tree) for tree in prepared_trees]
+        keys = [self._cache_key(tree) for tree in prepared_trees]
         missing: dict[str, Node] = {}
         for key, tree in zip(keys, prepared_trees, strict=True):
             if key not in self._cache and key not in missing:
                 missing[key] = tree
 
         pending = list(missing.items())
+        self.structural_skips += len(keys) - len(pending)
         if pending:
             self._ensure_scorer_backend()
         staged: dict[str, tuple[float, dict[str, float]]] = {}
         started = time.monotonic()
         total = len(pending)
         self._notify_scoring(phase, 0, total, started)
-        # More than two waves gives cancellation/progress useful granularity while keeping native
-        # call overhead negligible on the small default population.
-        chunk_size = max(1, min(64, self.workers * 2))
+        chunk_size = self._scoring_chunk_size(total)
+        if self.novelty:
+            output_bytes = max(1, len(self.panel.dates) * len(self.panel.symbols) * 8)
+            chunk_size = min(chunk_size, max(1, (self.memory_budget_bytes or 256*1024*1024) // 4 // output_bytes))
         for offset in range(0, total, chunk_size):
             if stop is not None and stop():
                 raise TrainingCancelled("training cancelled before scoring completed")
             chunk = pending[offset : offset + chunk_size]
+            chunk_trees = [tree for _, tree in chunk]
+            workers = (
+                self.tuner.choose(len(chunk_trees))
+                if self.tuner is not None
+                else min(self.workers, len(chunk_trees))
+            )
+            chunk_started = time.perf_counter()
             scored = score_trees(
-                [tree for _, tree in chunk],
+                chunk_trees,
                 self.panel,
                 self.fwd,
                 method=self.config.ic_method,
@@ -782,9 +961,20 @@ class GP:
                 complexity_penalty_value=self.config.complexity_penalty_value,
                 max_nodes=self.config.max_nodes,
                 min_names=self.config.min_names,
-                workers=min(self.workers, len(chunk)),
+                workers=workers,
                 memory_budget_bytes=self.memory_budget_bytes,
+                **({"observer": self.novelty.apply} if self.novelty else {}),
             )
+            if self.tuner is not None:
+                # Work volume, not tree count: trees differ in size by an order of magnitude,
+                # so seconds-per-batch cannot rank two worker counts but seconds-per-node can.
+                self.tuner.observe(
+                    workers,
+                    len(chunk_trees),
+                    sum(tree.size() for tree in chunk_trees),
+                    time.perf_counter() - chunk_started,
+                )
+                self._notify_tuning()
             for (key, _), result in zip(chunk, scored, strict=True):
                 staged[key] = result
             self._notify_scoring(phase, min(offset + len(chunk), total), total, started)
@@ -792,11 +982,41 @@ class GP:
                 raise TrainingCancelled("training cancelled before scoring completed")
 
         self._cache.update(staged)
+        self._cache_trees.update(missing)
         born = self.generation if birth_generation is None else birth_generation
-        return [
-            Individual(tree, *self._cache[key], born)
+        individuals = [
+            Individual(tree, *self._with_complexity(tree, self._cache[key]), born)
             for tree, key in zip(prepared_trees, keys, strict=True)
         ]
+        if self.novelty:
+            for individual, key in zip(individuals, keys, strict=True):
+                if individual.fitness > self._cache[key][0]:
+                    self._cache[key] = individual.fitness, individual.metrics
+                    self._cache_trees[key] = individual.tree
+        return individuals
+
+    def _scoring_chunk_size(self, total: int) -> int:
+        """How many trees to hand the scorer at once.
+
+        Chunks exist so a stop request is noticed, progress moves, and the worker tuner gets
+        more than one timing per generation. They are not free, and the way they are not free
+        turned out to be worse than load imbalance: batch CSE shares subexpressions *inside* one
+        worker's program, so a chunk is divided by the worker count before any sharing happens.
+        The old ``workers * 2`` ceiling meant a sixteen-core machine scored sixteen trees in
+        sixteen programs of one tree each, which shares nothing at all - the machine with the
+        most cores got the least benefit from the work done to remove duplicate computation.
+
+        So size the chunk by what a *group* needs rather than by what a worker can hold, and
+        keep only the two waves that the progress bar, cancellation, and the tuner actually
+        require. ``MAX_SCORING_WAVES`` still applies as an upper bound on how finely a very
+        large batch is cut.
+        """
+        ceiling = self.tuner.max_workers if self.tuner is not None else self.workers
+        for_sharing = max(MIN_SCORING_CHUNK, ceiling * MIN_TREES_PER_GROUP)
+        # Two waves for a batch big enough to have them, never fewer.
+        for_waves = max(MIN_SCORING_CHUNK, (total + 1) // 2)
+        by_waves = max(1, (total + MAX_SCORING_WAVES - 1) // MAX_SCORING_WAVES)
+        return max(1, min(MAX_SCORING_CHUNK, for_sharing, max(for_waves, by_waves)))
 
     def _ensure_scorer_backend(self) -> None:
         """Refuse a mid-run evaluator switch instead of mixing numerical kernels."""
@@ -816,6 +1036,9 @@ class GP:
         pool: Sequence[int] = range(n) if eligible_indices is None else eligible_indices
         if not pool:
             pool = range(n)
+        if self.novelty:
+            representatives = self._family_indices(self.population)
+            pool = [index for index in pool if index in representatives] or representatives
         idxs = [self.rng.choice(pool) for _ in range(self.config.tournament_size)]
         best = max(idxs, key=lambda i: self.population[i].fitness)
         return self.population[best], best
@@ -827,7 +1050,7 @@ class GP:
             if tree.depth() > self.config.max_depth or tree.size() > self.config.max_nodes:
                 self._complexity_rejections += 1
                 return False
-            expand_all(
+            expand_all_cached(
                 tree,
                 max_depth=_expansion_depth_limit(tree, self.config.max_depth),
                 max_nodes=self.config.max_nodes,
@@ -840,7 +1063,7 @@ class GP:
     @staticmethod
     def _canonical_key(tree: Node) -> str:
         """Expanded-expression identity used for population diversity limits."""
-        return to_json(expand_all(simplify(tree)))
+        return to_json(expand_all_cached(simplify(tree)))
 
     def _accept_under_copy_limit(self, tree: Node, counts: Counter[str]) -> bool:
         key = self._canonical_key(tree)
@@ -1513,7 +1736,7 @@ class GP:
             if root.macro_body is not None
             else builtin_category(root.name)
         )
-        expanded_size = expand_all(simplify(tree)).size()
+        expanded_size = expand_all_cached(simplify(tree)).size()
         return formula, root_category, self._complexity_band(expanded_size)
 
     @staticmethod
@@ -1641,6 +1864,11 @@ class GP:
             best.stepping_stone_ancestors
         )
         self._last_exploration_diagnostics = exploration
+        if self.novelty:
+            exploration["novelty"] = self.novelty_diagnostics()
+            callback = getattr(self.recorder, "set_novelty", None)
+            if callback:
+                callback(exploration["novelty"])
         self.history.append(
             {
                 "generation": self.generation,
@@ -1763,7 +1991,7 @@ class GP:
         except TrainingCancelled:
             self.rng.setstate(rng_state)
             raise
-        self.population = population
+        self.population, _ = self._limit_families(population)
         self._pending_formula_defaults = [
             tree
             for tree in self._managed_formula_defaults
@@ -1810,7 +2038,7 @@ class GP:
                 self._canonical_key(tree) for tree in formula_seed_trees
             )
             ops = []
-            for tree in trees:
+            for tree in (individual.tree for individual in self.population):
                 key = self._canonical_key(tree)
                 if seed_keys[key] > 0:
                     ops.append("seed")
@@ -2089,7 +2317,7 @@ class GP:
             )
             next_pop.append(child)
             entries.append((child.tree, parents, op, child.fitness))
-        self.population = next_pop
+        self.population, entries = self._limit_families(next_pop, entries)
         self._last_novel_offspring = novel_offspring
         self._last_parameter_neighbors = parameter_neighbors
         self._last_formula_default_injections = formula_injections
@@ -2309,6 +2537,7 @@ class GP:
         for individual in self.population:
             collect_policy(individual.tree)
         state = {
+            "novelty": {**self.novelty.state(), "structural_skips": self.structural_skips} if self.novelty else None,
             "scorer_version": SCORER_VERSION,
             "evolution_version": EVOLUTION_VERSION,
             "scorer_backend": self.scorer_backend,
@@ -2323,7 +2552,7 @@ class GP:
             # so checkpoint/resume retains deterministic first-seen tie-breaking.
             "score_cache": [
                 {
-                    "tree": to_dict(from_json(key)),
+                    "tree": to_dict(self._cache_trees.get(key) or from_json(key)),
                     "fitness": fitness,
                     "metrics": metrics,
                 }
@@ -2354,6 +2583,11 @@ class GP:
                     for name, counts in self._formula_move_counts.items()
                 },
             },
+            # Machine timings, not search state: a continued run reuses them instead of
+            # recalibrating, and a checkpoint moved to another machine simply ignores them.
+            "worker_tuning": (
+                self.tuner.snapshot().to_dict() if self.tuner is not None else None
+            ),
             "exploration_state": {
                 "parameter_beam_cursor": self._parameter_beam_cursor,
                 "parameter_frontier_cursor": self._parameter_frontier_cursor,
@@ -2390,6 +2624,7 @@ class GP:
         allowed_operators: set[str] | None = None,
         workers: int = 1,
         memory_budget_bytes: int | None = None,
+        tuner: WorkerTuner | None = None,
     ) -> GP:
         state = json.loads(Path(path).read_text(encoding="utf-8"))
         gp = cls(
@@ -2400,7 +2635,11 @@ class GP:
             allowed_operators=allowed_operators,
             workers=workers,
             memory_budget_bytes=memory_budget_bytes,
+            tuner=tuner,
+            novelty_state=state.get("novelty"),
         )
+        if tuner is not None:
+            tuner.restore(state.get("worker_tuning"))
         version, internal, gauss = state["rng_state"]
         gp.rng.setstate((version, tuple(internal), gauss))
         gp.generation = int(state["generation"])
@@ -2527,6 +2766,7 @@ class GP:
             # New checkpoints restore all searched formulas; legacy checkpoints at least retain
             # free current-population hits.
             for individual in saved_cache or gp.population:
+                gp._cache_trees.setdefault(gp._cache_key(individual.tree), individual.tree)
                 gp._cache.setdefault(
                     gp._cache_key(individual.tree),
                     (individual.fitness, individual.metrics),

@@ -27,10 +27,12 @@ def test_device_relative_profiles_are_visible_and_bounded():
     maximum = resolve_resources(ResourcePolicy("maximum"), cpus=20, available_memory=16 << 30)
     custom = resolve_resources(ResourcePolicy("custom", 70), cpus=20, available_memory=16 << 30)
     assert (light.percent, light.workers) == (25, 5)
-    assert (auto.percent, auto.workers) == (50, 10)
+    # Auto opens the whole capacity as a ceiling; the worker tuner measures how much of it is
+    # worth using, which a fixed percentage could only ever guess at.
+    assert (auto.percent, auto.workers) == (100, 19)
     assert (maximum.percent, maximum.workers) == (100, 19)
     assert (custom.percent, custom.workers) == (70, 14)
-    assert (auto.requested_workers, auto.effective_workers, auto.workers) == (10, 10, 10)
+    assert (auto.requested_workers, auto.effective_workers, auto.workers) == (19, 19, 19)
     assert auto.memory_budget_bytes == 4 << 30
     assert auto.run_memory_budget_bytes == auto.memory_per_worker_bytes * auto.workers
 

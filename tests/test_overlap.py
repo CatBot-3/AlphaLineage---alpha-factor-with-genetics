@@ -206,7 +206,7 @@ def test_round_overlap_reads_only_training_rows_and_persists(client, monkeypatch
     groups = {row["group"] for row in result["references"]}
     assert "catalog" in groups
     assert result["measured_count"] > 30
-    assert result["verdict"] in {"novel", "related", "mostly_explained", "near_duplicate"}
+    assert result["verdict"] in {"novel", "related", "mostly_explained", "near_duplicate", "strong_overlap"}
     ranked = [row["abs_mean_rank_corr"] for row in result["references"] if row["status"] == "ok"]
     assert ranked == sorted(ranked, reverse=True)
 

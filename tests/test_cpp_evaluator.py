@@ -80,6 +80,16 @@ def test_backend_selection(monkeypatch):
     assert cpp.backend_enabled() == cpp.available()
 
 
+def test_older_native_ema_uses_python_for_pandas_two(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(cpp, "_EXT", SimpleNamespace(ABI_VERSION=9))
+    monkeypatch.setattr(cpp, "_EMA_DECAYED_NEW_WEIGHT", False)
+    tree = Node("ts_ema", (Node("close"), Node("window", value=3)))
+    assert not cpp._plan_supported_by_loaded_abi(cpp._compile(tree))
+    assert cpp._plan_supported_by_loaded_abi(cpp._compile(Node("close")))
+
+
 def _expanded_operator_trees() -> list[Node]:
     window = Node("window", value=5)
     close, open_, high, low = (Node(name) for name in ("close", "open", "high", "low"))

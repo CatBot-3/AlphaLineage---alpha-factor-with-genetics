@@ -126,9 +126,17 @@ class ResourcePolicy:
 
     @property
     def percent(self) -> int:
+        """Share of worker capacity this profile permits, as a *ceiling*.
+
+        ``auto`` opens the whole capacity because the worker tuner now decides how much of it
+        is worth using, measured on the actual machine. Before the tuner existed this had to
+        guess, and guessing half meant half the cores idled while the rest delivered a fraction
+        of the speedup their number implied. The lower profiles remain a deliberate cap for
+        someone who wants the computer left usable.
+        """
         return {
             "light": 25,
-            "auto": 50,
+            "auto": 100,
             "maximum": 100,
             "custom": int(self.custom_percent or 50),
         }[self.profile]

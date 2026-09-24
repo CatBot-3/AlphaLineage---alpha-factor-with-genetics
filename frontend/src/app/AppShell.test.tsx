@@ -41,12 +41,11 @@ describe("AppShell", () => {
     expect(appLabels).toEqual(demoLabels);
     expect(demoLabels).toEqual([
       "Train",
-      "Metrics",
-      "Best Formula Result",
-      "Genealogy",
+      "Results",
       "Library",
+      "Signals",
       "AgentBeta", // the Beta mark is a child span, so it joins the tab's text content
-      "Extend",
+      "Build & Data",
     ]);
   });
 
@@ -59,7 +58,7 @@ describe("AppShell", () => {
 
   it("opens the Extend dropdown and selects a sub-page instead of a plain tab switch", () => {
     const { onSelectExtendPage } = renderShell("app");
-    const extend = screen.getByRole("button", { name: "Extend" });
+    const extend = screen.getByRole("button", { name: "Build & Data" });
 
     fireEvent.click(extend); // opens the dropdown rather than navigating
     expect(screen.getByTestId("extend-menu")).toBeInTheDocument();
@@ -70,7 +69,7 @@ describe("AppShell", () => {
 
   it("keeps the local Extend workspace accessible in static demo mode", () => {
     const { onSelectExtendPage } = renderShell("demo");
-    const extend = screen.getByRole("button", { name: "Extend" });
+    const extend = screen.getByRole("button", { name: "Build & Data" });
 
     expect(extend).not.toHaveAttribute("aria-disabled");
     fireEvent.click(extend);

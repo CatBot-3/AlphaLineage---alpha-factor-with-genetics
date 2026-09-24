@@ -10,7 +10,7 @@ describe("ExtendMenu", () => {
     render(<ExtendMenu current={false} onSelect={onSelect} />);
 
     expect(screen.queryByTestId("extend-menu")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Extend" }));
+    fireEvent.click(screen.getByRole("button", { name: "Build & Data" }));
     expect(screen.getByTestId("extend-menu")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("menuitem", { name: "Universe Editor" }));
@@ -21,7 +21,7 @@ describe("ExtendMenu", () => {
 
   it("closes on Escape", () => {
     render(<ExtendMenu current={false} onSelect={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Extend" }));
+    fireEvent.click(screen.getByRole("button", { name: "Build & Data" }));
     expect(screen.getByTestId("extend-menu")).toBeInTheDocument();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByTestId("extend-menu")).not.toBeInTheDocument();
@@ -30,7 +30,7 @@ describe("ExtendMenu", () => {
   it("offers one unified formula workflow", () => {
     const onSelect = vi.fn();
     render(<ExtendMenu current={false} onSelect={onSelect} />);
-    fireEvent.click(screen.getByRole("button", { name: "Extend" }));
+    fireEvent.click(screen.getByRole("button", { name: "Build & Data" }));
     expect(screen.queryByRole("menuitem", { name: "Factor Builder" })).not.toBeInTheDocument();
     expect(
       screen.queryByRole("menuitem", { name: "Reusable Formula Builder" }),

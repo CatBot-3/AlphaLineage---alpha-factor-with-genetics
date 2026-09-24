@@ -9,6 +9,8 @@ relationship continually flips, which is not a tradeable signal.
 
 from __future__ import annotations
 
+from typing import Any
+
 from collections.abc import Sequence
 
 import numpy as np
@@ -354,6 +356,7 @@ def score_tree(
     complexity_penalty_value: float | None = None,
     max_nodes: int | None = None,
     min_names: int = 5,
+    observer: Any = None,
 ) -> tuple[float, dict[str, float]]:
     """Return ``(fitness, metrics)``: ``abs(mean(IC))`` minus node penalty.
 
@@ -361,10 +364,11 @@ def score_tree(
     against factors that earn a spuriously perfect IC on a near-empty cross-section.
     """
     expanded = expand_all(tree)
-    return _score_factor(
+    factor = evaluate(expanded, panel)
+    result = _score_factor(
         expanded.size(),
         expanded.unique_computation_size(),
-        evaluate(expanded, panel),
+        factor,
         fwd,
         method=method,
         absolute=absolute,
@@ -374,6 +378,8 @@ def score_tree(
         max_nodes=max_nodes,
         min_names=min_names,
     )
+    return observer(tree, factor.to_numpy(), result) if observer is not None and isinstance(factor, pd.DataFrame) else result
+
 
 
 def score_trees(
@@ -390,6 +396,7 @@ def score_trees(
     min_names: int = 5,
     workers: int = 1,
     memory_budget_bytes: int | None = None,
+    observer: Any = None,
 ) -> list[tuple[float, dict[str, float]]]:
     """Score trees in input order, using fused native scoring when it is available.
 
@@ -406,6 +413,7 @@ def score_trees(
     # Import lazily so the optional extension does not become a requirement of fitness.py.
     from alphalineage.core import cpp as cpp_backend
 
+    observations: dict[int, np.ndarray] = {}
     native_results: list[tuple[float, dict[str, float]] | None] | None = None
     score_many = getattr(cpp_backend, "score_many", None)
     supports_scoring = getattr(cpp_backend, "supports_native_scoring", None)
@@ -431,6 +439,8 @@ def score_trees(
                     "max_nodes": max_nodes,
                 }
             )
+        if observer is not None:
+            native_kwargs["observations"] = observations
         native_results = score_many(ordered, panel, fwd, **native_kwargs)
 
     if native_results is None or len(native_results) != len(ordered):
@@ -439,7 +449,9 @@ def score_trees(
     # Unsupported/custom expressions and non-parity-safe methods are intentionally scored by the
     # ordinary evaluator on the coordinator thread, preserving deterministic fallback ordering.
     results: list[tuple[float, dict[str, float]]] = []
-    for tree, native_result in zip(ordered, native_results, strict=True):
+    for index, (tree, native_result) in enumerate(zip(ordered, native_results, strict=True)):
+        if native_result is not None and observer is not None:
+            native_result = observer(tree, observations[index], native_result)
         results.append(
             native_result
             if native_result is not None
@@ -454,6 +466,7 @@ def score_trees(
                 complexity_penalty_value=complexity_penalty_value,
                 max_nodes=max_nodes,
                 min_names=min_names,
+                observer=observer,
             )
         )
     return results

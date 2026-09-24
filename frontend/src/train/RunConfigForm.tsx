@@ -1,13 +1,16 @@
 // The run launcher: pick a universe, set GP hyperparameters, optionally seed from kept
 // formula results, and start a session. Replaces the old hardcoded run config in the client.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  getDataSync,
   getPrimitives,
   getUniverseCoverage,
+  getUniverseFillPlan,
   listFormulas,
   listFormulaResults,
   listUniverses,
+  startUniverseFill,
 } from "../api/client";
 import type {
   FormulaSpec,
@@ -17,6 +20,7 @@ import type {
   SessionState,
   TrainingResourcesRequest,
   UniverseCacheCoverage,
+  UniverseFillPlan,
   UniverseInfo,
 } from "../api/types";
 import { UniversePicker } from "../extend/UniverseTree";
@@ -124,6 +128,11 @@ export function RunConfigForm({
   const [seedIds, setSeedIds] = useState<string[]>(initialSeedIds);
   const [universes, setUniverses] = useState<UniverseInfo[]>([]);
   const [coverage, setCoverage] = useState<UniverseCacheCoverage | null>(null);
+  const [fillPlan, setFillPlan] = useState<UniverseFillPlan | null>(null);
+  const [filling, setFilling] = useState(false);
+  const [fillNotice, setFillNotice] = useState<string | null>(null);
+  const preparationKey = useRef("");
+  preparationKey.current = JSON.stringify({name, universe, asOf, config, seedIds});
   const [coverageLoading, setCoverageLoading] = useState(true);
   const [coverageError, setCoverageError] = useState<string | null>(null);
   const [factors, setFactors] = useState<SavedFactor[]>([]);
@@ -147,6 +156,54 @@ export function RunConfigForm({
     listFormulas().then(setFormulas).catch(() => setFormulas(null));
   }, []);
 
+  const loadCoverage = useCallback(() => {
+    setCoverageLoading(true);
+    setCoverageError(null);
+    return getUniverseCoverage(universe, asOf)
+      .then((next) => {
+        setCoverage(next);
+        return next;
+      })
+      .finally(() => setCoverageLoading(false));
+  }, [asOf, universe]);
+
+  /** Fill this universe's gaps, then re-read coverage so the banner reflects the result. */
+  const fillGaps = useCallback(
+    async (scope: "top_up" | "full") => {
+      setFilling(true);
+      setFillNotice(null);
+      try {
+        const job = await startUniverseFill(universe, { as_of: asOf, scope });
+        if (job.job_id) {
+          // The global data-pull bar already shows per-symbol progress; this only waits.
+          for (let attempt = 0; attempt < 600; attempt += 1) {
+            const status = await getDataSync(job.job_id);
+            if (status.status !== "queued" && status.status !== "running") {
+              if (status.status === "failed" || status.status === "stopped") throw new Error(status.error ?? "Data preparation did not finish.");
+              const quota = status.result?.quota;
+              if (quota) {
+                setFillNotice(
+                  `The pull stopped early: ${quota.provider} reported the ${quota.scope} ` +
+                    "allowance used. What was already fetched has been kept.",
+                );
+              }
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
+          }
+        }
+        const checked = await getUniverseCoverage(universe, asOf);
+        setCoverage(checked);
+        return checked.complete;
+      } catch (error) {
+        setFillNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        setFilling(false);
+      }
+    },
+    [asOf, loadCoverage, universe],
+  );
+
   useEffect(() => {
     let cancelled = false;
     setCoverageLoading(true);
@@ -169,6 +226,28 @@ export function RunConfigForm({
     };
   }, [universe, asOf]);
 
+  // Readiness checks plan the required repair without downloading prices. The user's
+  // Prepare data & start action owns the fill and continues only after coverage is rechecked.
+  useEffect(() => {
+    if (coverageLoading || coverage === null || coverage.complete) {
+      setFillPlan(null);
+      return;
+    }
+    let cancelled = false;
+    getUniverseFillPlan(universe, asOf, "full")
+      .then((plan) => {
+        if (cancelled) return;
+        setFillPlan(plan);
+
+      })
+      .catch(() => {
+        if (!cancelled) setFillPlan(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [asOf, coverage, coverageLoading, disabled, fillGaps, universe]);
+
   useEffect(() => setSeedIds(initialSeedIds), [initialSeedIds]);
 
   useEffect(() => {
@@ -183,6 +262,7 @@ export function RunConfigForm({
       // A stored config without the key predates the setting and meant the same-close timing;
       // "same setup" must reproduce that rather than silently switching to the new default.
       execution: storedConfig.execution ?? "close",
+      novelty_mode: storedConfig.novelty_mode ?? "off",
     } as GpConfig;
     setConfig(previousConfig);
     setResources(initialSession.resources ?? { profile: "auto", cpu_budget_percent: null });
@@ -308,9 +388,11 @@ export function RunConfigForm({
     <form
       className="run-form"
       data-testid="run-config-form"
-      onSubmit={(e) => {
+      onSubmit={async (e) => {
         e.preventDefault();
-        if (disabled || coverageLoading || !trainingReady || missingDependencies) return;
+        if (disabled || filling || coverageLoading || missingDependencies) return;
+        const setup = preparationKey.current;
+        if (!trainingReady && (!(await fillGaps("full")) || preparationKey.current !== setup)) return;
         const enabled = [...functionsByCategory.keys()].filter((c) => !disabledCats.has(c));
         const enabledFormulaNames = formulas === null
           ? null
@@ -337,6 +419,7 @@ export function RunConfigForm({
           <span>Choose the research context before tuning the search.</span>
         </div>
         <div className="run-setup-grid">
+          <label className="field"><span className="field-label">Novelty control</span><select aria-label="Novelty control" value={config.novelty_mode ?? "off"} onChange={e => setConfig(prev => ({...prev, novelty_mode: e.target.value as "balanced" | "off"}))}><option value="balanced">Balanced · reward different ideas</option><option value="off">Off · classic scoring</option></select><small>Known formulas remain useful building blocks. References stay frozen for this session.</small></label>
           <label className="field">
             <span className="field-label">Session name</span>
             <input value={name} aria-label="Session name" onChange={(e) => setName(e.target.value)} />
@@ -423,12 +506,49 @@ export function RunConfigForm({
                   : coverageError ?? `${coverage?.incomplete_symbols?.length ?? 0} symbols are missing or incomplete through ${asOf}.`}
             </span>
           </div>
-          {!coverageLoading && !trainingReady && onOpenDataSync && (
-            <button type="button" className="ghost" onClick={() => onOpenDataSync(universe)}>
-              Data Sync
-            </button>
+          {!coverageLoading && !trainingReady && (
+            <div className="run-readiness__actions">
+              {fillPlan && fillPlan.symbols.length > 0 && !disabled && (
+                <button
+                  type="button"
+                  className="primary-action"
+                  data-testid="fill-price-gaps"
+                  disabled={filling}
+                  onClick={() => void fillGaps("full")}
+                >
+                  {filling
+                    ? "Pulling prices…"
+                    : fillPlan.first_time_count > 0
+                      ? `Pull ${fillPlan.symbols.length} symbols (${fillPlan.first_time_count} new)`
+                      : `Pull ${fillPlan.symbols.length} symbols`}
+                </button>
+              )}
+              {onOpenDataSync && (
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => onOpenDataSync(universe)}
+                >
+                  Universe Editor
+                </button>
+              )}
+            </div>
           )}
         </div>
+        {fillPlan && fillPlan.first_time_count > 0 && (
+          <p className="hint" data-testid="fill-plan-note">
+            {fillPlan.cached_gap_count > 0
+              ? `${fillPlan.cached_gap_count} cached symbol(s) are being refreshed automatically. `
+              : ""}
+            {fillPlan.first_time_count} symbol(s) have never been downloaded, which spends your
+            provider's monthly unique-symbol allowance, so they wait for the button above.
+          </p>
+        )}
+        {fillNotice && (
+          <p className="oos-warning" data-testid="fill-notice" role="status">
+            {fillNotice}
+          </p>
+        )}
       </section>
 
       <section className="run-form-section" aria-labelledby="search-budget-heading">
@@ -498,7 +618,7 @@ export function RunConfigForm({
           </label>
         </div>
         <div className="field-grid">
-          {ADVANCED_FIELDS.map((f) =>
+          {ADVANCED_FIELDS.map((f) => f.key === "seed" ? seedField(config.seed, set("seed")) :
             numberField(f.key, config[f.key] as number, set(f.key), f.label),
           )}
         </div>
@@ -626,9 +746,9 @@ export function RunConfigForm({
       <button
         type="submit"
         className="primary-action"
-        disabled={disabled || coverageLoading || !trainingReady || missingDependencies}
+        disabled={disabled || filling || coverageLoading || (!trainingReady && (!fillPlan || fillPlan.mode === "off")) || missingDependencies}
       >
-        Start training
+        {filling ? "Preparing data…" : trainingReady ? "Start training" : "Prepare data & start"}
       </button>
     </form>
   );

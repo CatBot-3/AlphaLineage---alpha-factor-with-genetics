@@ -215,3 +215,43 @@ def test_classic_alphas_are_opt_in_for_new_runs() -> None:
 
     assert CLASSIC_ALPHAS in DEFAULT_CATEGORY_ORDER
     assert CLASSIC_ALPHAS not in DEFAULT_ENABLED_CATEGORIES
+
+
+def test_node_budget_too_small_for_enabled_formulas_is_refused_before_the_run(client) -> None:
+    """A budget no enabled formula can fit must fail the request, not the job.
+
+    Deep starter formulas (ADX, MFI, Wilder RSI) expand into far more nodes than they show at
+    the call site. Before this check the GP hit that while seeding its population, so lowering
+    "max nodes" produced a failed run whose only explanation was in the backend log.
+    """
+    from alphalineage.core.gp import GPConfig, oversized_enabled_formulas
+
+    enabled = ["ta_adx", "ta_dx", "ta_mfi", "ta_sma"]
+    tight = GPConfig(max_depth=6, max_nodes=30, enabled_formula_names=enabled)
+    oversized = oversized_enabled_formulas(tight)
+    assert {item.name for item in oversized} == {"ta_adx", "ta_dx", "ta_mfi"}
+    assert all(item.needs_nodes and item.needs_nodes > 30 for item in oversized)
+    # ta_sma fits comfortably, so it is not reported and not blamed. Raising the budget to
+    # the largest reported requirement clears every one of them.
+    needed = max(item.needs_nodes or 0 for item in oversized)
+    roomy = GPConfig(max_depth=6, max_nodes=needed, enabled_formula_names=enabled)
+    assert oversized_enabled_formulas(roomy) == []
+
+    refused = client.post(
+        "/sessions",
+        json={
+            "name": "tight",
+            "universe": "sp500-lite",
+            "config": {
+                "population_size": 16,
+                "generations": 1,
+                "max_depth": 6,
+                "max_nodes": 30,
+                "enabled_formula_names": enabled,
+            },
+        },
+    )
+    assert refused.status_code == 400, refused.text
+    detail = refused.json()["detail"]
+    assert "max nodes (30)" in detail and "ta_adx" in detail
+    assert "raise max nodes to" in detail

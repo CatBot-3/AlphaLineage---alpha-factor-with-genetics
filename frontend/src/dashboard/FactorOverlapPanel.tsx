@@ -8,8 +8,9 @@ import type { FactorOverlapReport, OverlapReference, OverlapVerdict } from "../a
 const VISIBLE_REFERENCES = 8;
 
 const VERDICTS: Record<OverlapVerdict, { label: string; tone: string; summary: string }> = {
+  strong_overlap: { label: "Strong overlap", tone: "is-warning", summary: "This formula shares substantial behavior with a known reference." },
   near_duplicate: {
-    label: "Near-duplicate",
+    label: "Near-identical",
     tone: "is-danger",
     summary:
       "Ranks stocks almost the same way as a known factor. Its IC is real, but it adds little " +
@@ -47,7 +48,11 @@ const GROUP_LABELS: Record<string, string> = {
 };
 
 function decimal(value: number | null | undefined, digits = 3): string {
-  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  const text = value.toFixed(digits);
+  // A unique IC of -0.0004 rounds to the string "-0.000", which reads as a sign that is not
+  // there. Anything that rounds to zero is reported as zero.
+  return Number(text) === 0 ? (0).toFixed(digits) : text;
 }
 
 function percent(value: number | null | undefined): string {
@@ -163,7 +168,7 @@ export function FactorOverlapPanel({
   }
 
   const running = jobId !== null;
-  const verdict = report ? VERDICTS[report.verdict] ?? VERDICTS.unmeasured : null;
+  const verdict = report ? VERDICTS[report.overlap_version < 2 && report.verdict === "near_duplicate" && (report.max_abs_rank_corr ?? 0) < .98 ? "strong_overlap" : report.verdict] ?? VERDICTS.unmeasured : null;
   const measured = report?.references.filter((item) => item.status === "ok") ?? [];
   const unavailable = report?.references.filter((item) => item.status !== "ok") ?? [];
   const explainedBy = new Set(report?.residual.explained_by ?? []);
@@ -191,6 +196,7 @@ export function FactorOverlapPanel({
         )}
       </header>
 
+      {report?.own_saved_copies?.length ? <p>{report.own_saved_copies.length} saved copies of this result are excluded from independent reference matches.</p> : null}
       <div className="factor-overlap__actions">
         <label className="seed-option">
           <input

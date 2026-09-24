@@ -76,13 +76,14 @@ from alphalineage.core.extensions import (
     register_operator,
     unregister_operator,
 )
-from alphalineage.core.fitness import forward_returns, label_span
+from alphalineage.core.fitness import LEGACY_EXECUTION, forward_returns, label_span
 from alphalineage.core.gp import (
     MAX_GENERATIONS,
     MAX_HORIZON,
     MAX_SEARCH_EVALUATIONS,
     GPConfig,
     TrainingCancelled,
+    oversized_enabled_formulas,
     validate_seed,
 )
 from alphalineage.core.panel import Panel
@@ -147,6 +148,21 @@ if _DOTENV_PATH and os.environ.get("ALPHALINEAGE_SKIP_DOTENV") != "1":
     load_dotenv(_DOTENV_PATH, override=False)
 
 app = FastAPI(title="AlphaLineage", version="0.1.0")
+
+from alphalineage.api.errors import ActionError, error_payload
+from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import http_exception_handler
+
+@app.exception_handler(ActionError)
+async def action_error_handler(request, exc):
+    return JSONResponse(status_code=400, content={"detail": error_payload(exc)})
+
+@app.exception_handler(HTTPException)
+async def source_http_error_handler(request, exc):
+    if request.url.path.startswith(("/signals", "/formula-results")):
+        return JSONResponse(status_code=exc.status_code, content={"detail": error_payload(exc)})
+    return await http_exception_handler(request, exc)
+
 # Allow the browser `app` build (Vite dev server) to call the local backend.
 app.add_middleware(
     CORSMiddleware,
@@ -165,6 +181,19 @@ _formula_test_jobs = JobStore()
 _formula_lifecycle_lock = threading.RLock()
 
 _DEFAULT_UNIVERSE = "sp500-lite"
+
+#: How eagerly the app fills price gaps on its own.
+#:
+#: ``top_up`` is the default because the two kinds of gap cost very different things. Refreshing
+#: a symbol already in the cache is one more request against an hourly allowance that refills by
+#: itself. Pulling a symbol for the first time spends the provider's *monthly unique-symbol*
+#: allowance, which does not, and there is no local ledger that can predict how much is left -
+#: the app only discovers the allowance is gone when the provider refuses. So the cheap half
+#: happens silently and the expensive half stays one deliberate click away.
+AUTO_SYNC_MODES = ("off", "top_up", "full")
+DEFAULT_AUTO_SYNC = "top_up"
+#: Furthest back an automatic fill reaches when a universe declares no required start.
+AUTO_SYNC_FALLBACK_YEARS = 3
 _DEFAULT_AS_OF = datetime.now(UTC).date().isoformat()
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _FORMULA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
@@ -406,6 +435,8 @@ class SettingsUpdate(BaseModel):
     factors_dir: str | None = None
     tiingo_api_key: str | None = None
     evaluator: str | None = None
+    #: How eagerly price gaps are filled without being asked. See ``AUTO_SYNC_MODES``.
+    auto_sync: str | None = None
     # P9 explanation layer. The key follows the Tiingo contract exactly: an empty string clears
     # it, and it is never echoed back by GET /settings.
     llm_provider: str | None = None
@@ -690,7 +721,9 @@ def _primitive_info(
     is_user = prim.macro_body is not None
     cats = formula_categories if formula_categories is not None else _formula_categories()
     formula = _formula_for_runtime(prim.name) if is_user else None
-    doc = (
+    # Explicitly typed: the two branches are a literal and `primitive_doc`'s return, and the
+    # join of those loses that "inputs" holds dicts rather than an opaque collection.
+    doc: dict[str, Any] = (
         {
             "display_name": formula.display_name or formula.name.replace("_", " ").title(),
             "description": formula.description or "User-defined typed formula.",
@@ -710,8 +743,9 @@ def _primitive_info(
     )
     inputs = []
     for index, arg_type in enumerate(prim.arg_types):
-        meta = doc["inputs"][index] if index < len(doc["inputs"]) else {}
-        item = {
+        entries = list(doc["inputs"])
+        meta: dict[str, Any] = entries[index] if index < len(entries) else {}
+        item: dict[str, Any] = {
             "name": str(meta.get("name") or f"input_{index + 1}"),
             "type": arg_type.value,
             "description": str(meta.get("description") or "Function input."),
@@ -1052,7 +1086,9 @@ def _merge_indicator_catalog(store: dict[str, Any]) -> bool:
     """Idempotently add/update the packaged catalog while preserving every published revision."""
     changed = False
     pinned: dict[str, str] = {}
-    families = {str(item.get("name")): item for item in store["families"]}
+    families: dict[str, dict[str, Any]] = {
+        str(item.get("name")): item for item in store["families"]
+    }
     for definition in INDICATOR_CATALOG:
         name = str(definition["name"])
         dependencies = _tree_names(definition["body"]) & CATALOG_NAMES
@@ -1086,15 +1122,17 @@ def _merge_indicator_catalog(store: dict[str, Any]) -> bool:
             created_at=created_at,
         )
         if latest is None:
-            family = {
+            created = {
                 "name": name,
                 "latest_revision": 1,
                 "revisions": [_model_dump(candidate)],
             }
-            store["families"].append(family)
-            families[name] = family
+            store["families"].append(created)
+            families[name] = created
             changed = True
         elif _catalog_signature(candidate) != _catalog_signature(latest):
+            # `latest` was read from this family, so the entry is present by construction.
+            family = families[name]
             calculation_changed = (
                 candidate.body != latest.body
                 or candidate.arg_types != latest.arg_types
@@ -2414,11 +2452,20 @@ def _universe_api_payload(
         ),
         None,
     )
-    display_name = (
-        str(preset["display_name"])
-        if preset is not None and source in {"sample", "bundled"}
-        else universe.name
-    )
+    display_name = universe.name
+    if source in {"sample", "bundled"}:
+        if preset is not None:
+            display_name = str(preset["display_name"])
+        else:
+            # Sector and theme subsets live only in the snapshot manifest, not the preset
+            # catalog. Without this they surfaced their slug as their name, so the folder
+            # tree read "builtin-sp500-sector-energy" while the cards above it read "S&P 500".
+            spec = next(
+                (item for item in bundled_snapshot_specs() if item["id"] == universe.name),
+                None,
+            )
+            if spec is not None and spec.get("display_name"):
+                display_name = str(spec["display_name"])
     integrity = universe_integrity(universe.name, source=source)
     provenance = universe.provenance or {
         "provider": "User-supplied",
@@ -2700,6 +2747,36 @@ def _gp_config_from_request(data: dict[str, Any]) -> GPConfig:
         raise HTTPException(status_code=400, detail=f"invalid GP config: {exc}") from exc
 
 
+def _validate_formula_budget(config: GPConfig) -> None:
+    """Refuse a config whose enabled formulas cannot fit its node budget, before any job starts.
+
+    The GP raises the same objection while seeding its population, but by then the user only
+    sees a failed run. Catching it here turns it into the sentence that names the fix - which
+    matters now that the starter catalog includes deep formulas (ADX, MFI, Wilder RSI) whose
+    expansions need a larger budget than a hand-lowered "max nodes" may allow.
+    """
+    oversized = oversized_enabled_formulas(config)
+    if not oversized:
+        return
+    impossible = [item.name for item in oversized if item.needs_nodes is None]
+    needed = max((item.needs_nodes or 0) for item in oversized)
+    shown = ", ".join(item.name for item in oversized[:4])
+    more = f" and {len(oversized) - 4} more" if len(oversized) > 4 else ""
+    remedy = (
+        f"raise max nodes to {needed} or turn those formulas off"
+        if not impossible
+        else f"turn off {', '.join(impossible)}"
+    )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"max nodes ({config.max_nodes}) is too small for {len(oversized)} enabled "
+            f"formula(s): {shown}{more}. Expanding them needs more nodes than the budget "
+            f"allows, so the search could never use them - {remedy}."
+        ),
+    )
+
+
 def _validate_panel_config(config: GPConfig, panel: Panel) -> None:
     if config.min_names > len(panel.symbols):
         raise HTTPException(
@@ -2709,6 +2786,7 @@ def _validate_panel_config(config: GPConfig, panel: Panel) -> None:
                 f"({len(panel.symbols)})"
             ),
         )
+    _validate_formula_budget(config)
 
 
 def _preflight_split(
@@ -2804,8 +2882,11 @@ def _validate_formula_expansion(spec: FormulaSpec) -> None:
         raise HTTPException(status_code=400, detail=f"invalid formula expansion: {exc}") from exc
 
 
-def _formula_dependency_revisions(tree: Node) -> list[dict[str, Any]]:
-    by_runtime = {spec.runtime_name: spec for spec in _all_formula_specs()}
+def _formula_dependency_revisions(
+    tree: Node, by_runtime: dict[str, FormulaSpec] | None = None,
+) -> list[dict[str, Any]]:
+    if by_runtime is None:
+        by_runtime = {spec.runtime_name: spec for spec in _all_formula_specs()}
     seen: set[str] = set()
     active: list[str] = []
     ordered: list[dict[str, Any]] = []
@@ -3235,6 +3316,7 @@ def _formula_test_job_payload(job: Any) -> dict[str, Any]:
         "progress": job.progress.snapshot() if job.progress is not None else None,
         "result": job.result,
         "error": job.error,
+        "error_info": job.error_info,
         "termination_reason": job.termination_reason,
     }
 
@@ -3803,6 +3885,114 @@ def get_universe_coverage(name: str, as_of: str = _DEFAULT_AS_OF) -> dict[str, A
     return {"name": name, **_cache_coverage(universe, as_of)}
 
 
+def _auto_sync_mode(settings: dict[str, Any] | None = None) -> str:
+    """The configured automatic-fill policy, defaulted and validated on read."""
+    stored = paths.read_settings() if settings is None else settings
+    mode = str(stored.get("auto_sync") or DEFAULT_AUTO_SYNC).lower()
+    return mode if mode in AUTO_SYNC_MODES else DEFAULT_AUTO_SYNC
+
+
+def plan_coverage_fill(coverage: dict[str, Any], scope: str) -> dict[str, Any]:
+    """Split a universe's gaps into the cheap half and the half that spends the monthly quota.
+
+    ``top_up`` returns only symbols already in the cache: their history is short or stale, and
+    fetching more of it costs requests, not new unique symbols. ``full`` adds the never-cached
+    ones. The split is reported either way so a caller can say what it is *not* doing.
+    """
+    incomplete = [str(symbol) for symbol in coverage.get("incomplete_symbols") or []]
+    missing = {str(symbol) for symbol in coverage.get("missing_symbols") or []}
+    cached_gaps = [symbol for symbol in incomplete if symbol not in missing]
+    first_time = [symbol for symbol in incomplete if symbol in missing]
+    if scope == "full":
+        symbols, deferred = incomplete, []
+    else:
+        symbols, deferred = cached_gaps, first_time
+    return {
+        "scope": scope,
+        "symbols": symbols,
+        "deferred_symbols": deferred,
+        "cached_gap_count": len(cached_gaps),
+        "first_time_count": len(first_time),
+    }
+
+
+class CoverageFillRequest(BaseModel):
+    as_of: str | None = None
+    #: ``top_up`` refreshes cached symbols only; ``full`` also pulls never-cached ones.
+    scope: Literal["top_up", "full"] = "top_up"
+
+
+@app.get("/universes/{name}/fill-plan")
+def get_universe_fill_plan(
+    name: str, as_of: str = _DEFAULT_AS_OF, scope: str = "top_up"
+) -> dict[str, Any]:
+    """What an automatic fill would fetch for this universe, without fetching anything."""
+    if scope not in {"top_up", "full"}:
+        raise HTTPException(status_code=400, detail="scope must be 'top_up' or 'full'")
+    universe = _resolve_universe(name, status_code=404)
+    coverage = _cache_coverage(universe, as_of)
+    return {"name": name, "as_of": coverage["as_of"], "mode": _auto_sync_mode(), **
+            plan_coverage_fill(coverage, scope)}
+
+
+@app.post("/universes/{name}/fill")
+def start_universe_fill(name: str, req: CoverageFillRequest | None = None) -> dict[str, Any]:
+    """Fill this universe's price gaps as a quota-aware job, from wherever the user is.
+
+    Before this existed the only way to fix coverage was to leave the Train tab, open the
+    Universe Editor, set two dates and press Sync. The gap is already measured on the screen
+    that blocks training; this closes it there.
+    """
+    request = req or CoverageFillRequest()
+    universe = _resolve_universe(name, status_code=404)
+    as_of = request.as_of or _today_iso()
+    coverage = _cache_coverage(universe, as_of)
+    plan = plan_coverage_fill(coverage, request.scope)
+    if not plan["symbols"]:
+        return {"job_id": None, "status": "nothing_to_do", **plan}
+    for job in _jobs.list():
+        if (
+            job.metadata.get("kind") == "universe_fill"
+            and job.metadata.get("universe") == name
+            and job.status in {"queued", "running"}
+        ):
+            return {"job_id": job.id, "status": job.status, "reused": True, **plan}
+
+    required_start = coverage.get("required_start") or _date_iso(
+        _as_of_timestamp(as_of) - pd.DateOffset(years=AUTO_SYNC_FALLBACK_YEARS)
+    )
+    aliases = {symbol: universe.aliases.get(symbol, symbol) for symbol in plan["symbols"]}
+    progress = SyncProgress(total=len(plan["symbols"]))
+    cancel = threading.Event()
+    job_id = uuid.uuid4().hex
+
+    def _task() -> dict[str, Any]:
+        return {
+            **_run_data_sync(
+                DataSyncRequest(
+                    symbols=list(plan["symbols"]),
+                    universe=name,
+                    start=str(required_start),
+                    end=as_of,
+                    mode="incremental",
+                    aliases=aliases,
+                ),
+                progress,
+                cancel.is_set,
+            ),
+            "plan": plan,
+        }
+
+    _jobs.submit(
+        _task,
+        job_id=job_id,
+        progress=progress,
+        metadata={"kind": "universe_fill", "universe": name, "scope": request.scope},
+        cancel=cancel,
+    )
+    return {"job_id": job_id, "status": "queued", "reused": False, **plan}
+
+
 @app.put("/universes/{name}")
 def update_universe(name: str, spec: UniverseSpec) -> dict[str, Any]:
     if name == _DEFAULT_UNIVERSE:
@@ -3978,6 +4168,7 @@ def get_run(job_id: str) -> dict[str, Any]:
         "status": job.status,
         "result": job.result,
         "error": job.error,
+        "error_info": job.error_info,
         "termination_reason": job.termination_reason,
         "progress": job.progress.snapshot() if job.progress is not None else None,
     }
@@ -4209,6 +4400,7 @@ def get_settings() -> dict[str, Any]:
         "tiingo_stored_key_set": stored_key_set,
         "evaluator": stored.get("evaluator", "auto"),
         "cpp_available": cpp.available(),
+        "auto_sync": _auto_sync_mode(stored),
         # The LLM key is reported the same way: presence and source only, never the value.
         **explain_credentials.load_config(settings=stored).public_dict(),
     }
@@ -4238,6 +4430,13 @@ def update_settings(update: SettingsUpdate) -> dict[str, Any]:
             )
         settings["evaluator"] = evaluator
         cpp.set_backend(evaluator)
+    if update.auto_sync is not None:
+        mode = update.auto_sync.lower()
+        if mode not in AUTO_SYNC_MODES:
+            raise HTTPException(
+                status_code=400, detail=f"auto_sync must be one of {list(AUTO_SYNC_MODES)}"
+            )
+        settings["auto_sync"] = mode
     if any(
         value is not None
         for value in (
@@ -4476,6 +4675,7 @@ def _data_sync_job_payload(job: Any) -> dict[str, Any]:
         "status": job.status,
         "result": job.result,
         "error": job.error,
+        "error_info": job.error_info,
         "termination_reason": job.termination_reason,
         "stopping": job.cancel.is_set() and job.status in {"queued", "running"},
         "request": job.metadata.get("request"),
@@ -4488,8 +4688,8 @@ def _data_sync_job_payload(job: Any) -> dict[str, Any]:
 def list_data_sync_jobs(active_only: bool = False) -> list[dict[str, Any]]:
     jobs = [
         job
-        for job in _data_jobs.list()
-        if job.metadata.get("kind") == "data_sync"
+        for job in [*_data_jobs.list(), *_jobs.list()]
+        if job.metadata.get("kind") in {"data_sync", "universe_fill"}
         and (not active_only or job.status in {"queued", "running"})
     ]
     return [_data_sync_job_payload(job) for job in reversed(jobs)]
@@ -4497,18 +4697,19 @@ def list_data_sync_jobs(active_only: bool = False) -> list[dict[str, Any]]:
 
 @app.get("/data/sync/{job_id}")
 def data_sync_status(job_id: str) -> dict[str, Any]:
-    job = _data_jobs.get(job_id)
-    if job is None or job.metadata.get("kind") != "data_sync":
+    job = _data_jobs.get(job_id) or _jobs.get(job_id)
+    if job is None or job.metadata.get("kind") not in {"data_sync", "universe_fill"}:
         raise HTTPException(status_code=404, detail="unknown sync job")
     return _data_sync_job_payload(job)
 
 
 @app.post("/data/sync/{job_id}/stop")
 def stop_data_sync(job_id: str) -> dict[str, bool]:
-    job = _data_jobs.get(job_id)
-    if job is None or job.metadata.get("kind") != "data_sync":
+    job = _data_jobs.get(job_id) or _jobs.get(job_id)
+    if job is None or job.metadata.get("kind") not in {"data_sync", "universe_fill"}:
         raise HTTPException(status_code=404, detail="unknown sync job")
-    return {"stopping": _data_jobs.cancel(job_id)}
+    store = _jobs if job.metadata.get("kind") == "universe_fill" else _data_jobs
+    return {"stopping": store.cancel(job_id)}
 
 
 @app.post("/universes/sync-dates")
@@ -4536,6 +4737,7 @@ def universes_sync_dates_status(job_id: str) -> dict[str, Any]:
         "status": job.status,
         "result": job.result,
         "error": job.error,
+        "error_info": job.error_info,
         "progress": job.progress.snapshot() if job.progress else None,
     }
 
@@ -4589,7 +4791,14 @@ def _session_job_view(session: dict[str, Any]) -> dict[str, Any] | None:
         }
     persisted = session.get("last_job")
     if isinstance(persisted, dict):
-        return {**persisted, "progress": None}
+        segments = session.get("segments") or []
+        segment = segments[-1] if segments else {}
+        generation = next((item.get("generation_end") or item.get("gen_end")
+                           for item in reversed(segments)
+                           if item.get("generation_end") is not None or item.get("gen_end") is not None), 0)
+        return {**persisted, "progress": {"phase": persisted.get("status", "done"),
+            "generation": generation, "target_generations": segment.get("target_generation") or generation,
+            "history": [], "checkpoint": (sessions.session_dir(session["id"]) / "checkpoint.json").exists()}}
     return None
 
 
@@ -4694,6 +4903,10 @@ def create_session(
         created_at=_now_iso(),
         resources=requested_resources.to_dict(),
     )
+    from alphalineage.api.formula_sources import freeze_references
+    session["history_start"] = str(panel.dates.min().date())
+    session["novelty"] = freeze_references() if config.novelty_mode == "balanced" else None
+    sessions.save_session(session)
     session_id = session["id"]
     progress = RunProgress(
         target_generations=config.generations,
@@ -4731,7 +4944,7 @@ def create_session(
             sessions.finish_job(session_id, job_id, "stopped")
             raise
         except Exception as exc:
-            sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+            sessions.finish_job(session_id, job_id, "failed", error=str(getattr(exc, "detail", None) or exc))
             raise
         sessions.finish_job(
             session_id,
@@ -4749,7 +4962,7 @@ def create_session(
             cancel=cancel,
         )
     except Exception as exc:
-        sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+        sessions.finish_job(session_id, job_id, "failed", error=str(getattr(exc, "detail", None) or exc))
         raise
     return {"session_id": session_id, "job_id": job_id}
 
@@ -4811,6 +5024,8 @@ def continue_session(
             ),
         )
     boundaries = sessions.Boundaries.from_dict(session["boundaries"])
+    if config.novelty_mode != stored_config.novelty_mode:
+        raise HTTPException(400, "Novelty mode is frozen for this session. Start a new session to change it.")
     if config.execution != stored_config.execution:
         # Execution timing defines what every stored IC, backtest and holdout fingerprint in this
         # session measures. Changing it mid-session would silently mix incomparable evidence.
@@ -4946,7 +5161,7 @@ def continue_session(
             sessions.finish_job(session_id, job_id, "stopped")
             raise
         except Exception as exc:
-            sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+            sessions.finish_job(session_id, job_id, "failed", error=str(getattr(exc, "detail", None) or exc))
             raise
         sessions.finish_job(
             session_id,
@@ -4964,7 +5179,7 @@ def continue_session(
             cancel=cancel,
         )
     except Exception as exc:
-        sessions.finish_job(session_id, job_id, "failed", error=repr(exc))
+        sessions.finish_job(session_id, job_id, "failed", error=str(getattr(exc, "detail", None) or exc))
         raise
     return {"session_id": session_id, "job_id": job_id}
 
@@ -5015,6 +5230,10 @@ def list_sessions() -> list[dict[str, Any]]:
                 or session.get("config", {}).get("generations"),
                 "cumulative_trials": session.get("cumulative_trials", 0),
                 "test_reads": session.get("test_reads", 0),
+                # A session's frozen label definition. Callers that offer its rounds for use
+                # need it to say when a signal is tradable; a missing key means legacy `close`.
+                "execution": session.get("config", {}).get("execution", LEGACY_EXECUTION),
+                "horizon": session.get("config", {}).get("horizon"),
             }
         )
     return sorted(
@@ -5148,7 +5367,7 @@ def compare_session_round_strategies(
                 comparison_id,
                 job_id,
                 "failed",
-                error=repr(exc),
+                error=str(getattr(exc, "detail", None) or exc),
             )
             raise
 
@@ -5171,7 +5390,7 @@ def compare_session_round_strategies(
             comparison_id,
             job_id,
             "failed",
-            error=repr(exc),
+            error=str(getattr(exc, "detail", None) or exc),
         )
         raise
     return {
@@ -5310,8 +5529,14 @@ def _run_round_overlap(
     if not isinstance(candidate, pd.DataFrame):
         raise ValueError("the selected formula did not evaluate to a panel")
     references = _overlap_references(request.include_saved_results)
+    own_keys = {f"result:{factor.id}" for factor in _factor_store().list()
+                if (factor.source.get("identity") or {}).get("id") == f"round:{session_id}:{round_index}"
+                or (factor.provenance.get("session_id") == session_id
+                    and factor.provenance.get("round_index") == round_index)}
+    own_copies = [{"key": item.key, "name": item.display_name} for item in references if item.key in own_keys]
+    independent = [item for item in references if item.key not in own_keys]
     evaluated: list[tuple[ReferenceFactor, pd.DataFrame | None, str | None]] = []
-    for done, reference in enumerate(references, start=1):
+    for done, reference in enumerate(independent, start=1):
         if stop():
             raise TrainingCancelled("overlap check stopped")
         try:
@@ -5345,6 +5570,7 @@ def _run_round_overlap(
         "best_factor": round_payload["best_factor"],
         "horizon": config.horizon,
         "execution": config.execution,
+        "own_saved_copies": own_copies,
         "include_saved_results": request.include_saved_results,
         "reference_signature": _reference_signature(references),
         "computed_at": _now_iso(),
@@ -5589,7 +5815,7 @@ def finalize_session_round(
                 session_id,
                 job_id,
                 "failed",
-                error=repr(exc),
+                error=str(getattr(exc, "detail", None) or exc),
             )
             raise
         return result
@@ -5623,7 +5849,7 @@ def finalize_session_round(
             session_id,
             job_id,
             "failed",
-            error=repr(exc),
+            error=str(getattr(exc, "detail", None) or exc),
         )
         raise
     return {
@@ -5730,6 +5956,162 @@ def stop_session(session_id: str) -> dict[str, bool]:
     if comparison_id and _jobs.cancel(comparison_id):
         return {"stopping": True}
     return {"stopping": False}
+
+
+# --- signals: using a discovered factor -------------------------------------------------------
+# Everything above measures a formula; this is where one is used. A snapshot ranks a universe on
+# the latest cached bar and says which bar it came from, which bar it could be traded at, and
+# which symbols were left out for want of fresh prices. It reads no session split and writes no
+# session state, so looking at today's ranking never spends a holdout read (invariant 1).
+
+
+class SignalComparisonRequest(BaseModel):
+    source: str
+    bindings: dict[str, Any] = Field(default_factory=dict)
+
+
+class SignalSnapshotRequest(BaseModel):
+    source: str
+    universe: str | None = None
+    as_of: str | None = None
+    data_mode: Literal["refresh", "cached"] = "refresh"
+    refresh_prices: bool = False
+    refresh_start: str | None = None
+    bindings: dict[str, Any] = Field(default_factory=dict)
+    comparisons: list[SignalComparisonRequest] = Field(default_factory=list, max_length=3)
+    minimum_coverage: float = Field(default=.90, ge=.9, le=1)
+    execution: Literal["close", "next_open", "next_close"] | None = None
+    direction: Literal["higher", "lower"] | None = None
+
+
+def _round_evidence(summary: dict[str, Any]) -> str:
+    return "holdout" if summary.get("latest_finalization_id") else "validation"
+
+
+def _signal_sources() -> list[dict[str, Any]]:
+    from alphalineage.api.formula_sources import resolve
+    items = []
+    for factor in _factor_store().list():
+        item = resolve(f"result:{factor.id}")
+        items.append({key: value for key, value in item.items() if key != "tree"} |
+                     {"kind": "saved_result", "created_at": factor.saved_at})
+    for session in list_sessions():
+        for row in sessions.list_rounds(session["id"]):
+            if not row.get("index", 0) >= 0:
+                continue
+            item = resolve(f"round:{session['id']}:{row['index']}")
+            items.append({key: value for key, value in item.items() if key != "tree"} |
+                         {"kind": "round", "created_at": session.get("created_at")})
+            if row.get("latest_finalization_id"):
+                evaluated = resolve(f"evaluation:{session['id']}:{row['latest_finalization_id']}")
+                items.append({key: value for key, value in evaluated.items() if key != "tree"} |
+                             {"kind": "evaluation", "created_at": session.get("created_at"), "name": evaluated["name"] + " · holdout evaluation"})
+    items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    for spec in _load_persisted_formulas():
+        if spec.get("status", "active") != "active" or spec.get("error") or spec.get("out_type") not in {"series", "signal"}:
+            continue
+        items.append({"id": f"formula:{spec['runtime_name']}", "kind": "formula",
+                      "name": spec.get("display_name") or spec["name"],
+                      "evidence": "unvalidated", "inputs": spec.get("inputs", []),
+                      "revision": spec.get("revision"), "missing_context": ["execution", "direction"]})
+    return items
+
+
+def _resolve_signal_source(source: str) -> dict[str, Any]:
+    from alphalineage.api.formula_sources import resolve
+    return resolve(source)
+
+
+@app.get("/signals/sources")
+def list_signal_sources() -> list[dict[str, Any]]:
+    return _signal_sources()
+
+
+@app.post("/signals/prepare")
+def signal_preparation(req: SignalSnapshotRequest, panel: Panel | None = Depends(get_panel)) -> dict[str, Any]:
+    from alphalineage.api.formula_sources import resolve
+    from alphalineage.api.signal_workspace import preparation
+    sources = [resolve(req.source, req.bindings)] + [resolve(item.source, item.bindings) for item in req.comparisons]
+    return preparation(req, sources, panel)
+
+
+@app.post("/signals/snapshot")
+@app.post("/signals/history")
+def start_signal_snapshot(req: SignalSnapshotRequest, panel: Panel | None = Depends(get_panel)) -> dict[str, Any]:
+    from alphalineage.api.signal_workspace import submit
+    return submit(req, panel)
+
+
+@app.get("/signals/snapshots/{snapshot_id}")
+def get_signal_snapshot(snapshot_id: str) -> dict[str, Any]:
+    from alphalineage.api.signal_workspace import completed_session, load
+    snapshot = load(snapshot_id)["snapshot"]
+    expected = completed_session()
+    return {**snapshot, "current_expected_session": expected,
+            "stale": snapshot["as_of"] < expected}
+
+
+@app.post("/signals/jobs/{job_id}/stop")
+def stop_signal_job(job_id: str) -> dict[str, bool]:
+    job = _jobs.get(job_id)
+    if job is None or job.metadata.get("kind") != "signal_snapshot":
+        raise HTTPException(404, "This Signals job is no longer available.")
+    return {"stopping": _jobs.cancel(job_id)}
+
+
+@app.get("/signals/snapshots/{snapshot_id}/series/{symbol}")
+def get_signal_series(snapshot_id: str, symbol: str) -> dict[str, Any]:
+    from alphalineage.api.signal_workspace import series
+    return series(snapshot_id, symbol)
+
+
+class PortfolioPreviewRequest(BaseModel):
+    strategy: dict[str, Any] | None = None
+    notional: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+
+@app.post("/signals/snapshots/{snapshot_id}/portfolio")
+def preview_signal_portfolio(snapshot_id: str, req: PortfolioPreviewRequest) -> dict[str, Any]:
+    from alphalineage.api.signal_workspace import portfolio
+    try:
+        return portfolio(snapshot_id, req.strategy, req.notional)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/signals/snapshots/{snapshot_id}/export")
+def export_signal_snapshot(snapshot_id: str, kind: Literal["ranking", "portfolio", "excluded"] = "ranking",
+                           scheme: Literal["quantile_ls", "rank_proportional"] | None = None,
+                           quantile: float = .2):
+    from fastapi.responses import Response
+    from alphalineage.api.signal_workspace import export
+    strategy = {"id": "preview", "scheme": scheme} if scheme is not None else None
+    if scheme == "quantile_ls":
+        strategy["quantile"] = quantile
+    try:
+        text = export(snapshot_id, kind, strategy)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return Response(text, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="signals-{snapshot_id}-{kind}.csv"'})
+
+
+class SourceSaveRequest(BaseModel):
+    source: str
+    name: str | None = None
+    evaluation_id: str | None = None
+    bindings: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/formula-results")
+def save_source_result(req: SourceSaveRequest) -> dict[str, Any]:
+    from alphalineage.api.formula_sources import save
+    return save(req.source, req.name, req.evaluation_id, req.bindings)
+
+
+@app.post("/signals/resolve")
+def resolve_signal_source(req: SignalComparisonRequest) -> dict[str, Any]:
+    from alphalineage.api.formula_sources import public, resolve
+    return public(resolve(req.source, req.bindings))
 
 
 # --- P11: the agent ---------------------------------------------------------------
@@ -5865,7 +6247,8 @@ def get_agent_job(job_id: str) -> dict[str, Any]:
     job = _agent_jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="unknown agent job")
-    return {"job_id": job.id, "status": job.status, "error": job.error, "result": job.result}
+    return {"job_id": job.id, "status": job.status, "error": job.error,
+        "error_info": job.error_info, "result": job.result}
 
 
 @app.post("/agent/jobs/{job_id}/stop")

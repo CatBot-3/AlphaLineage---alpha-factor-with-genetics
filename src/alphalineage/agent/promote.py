@@ -141,7 +141,9 @@ def promote_factor(
     session["agent_trials"] = agent_spend
 
     index = _next_round_index(session)
-    result = {
+    # Annotated because the literal mixes strings, numbers and nested dicts; without it the
+    # inferred value type collapses to `object` and reading a nested key back out fails.
+    result: dict[str, Any] = {
         "round_index": index,
         "segment": index,
         "best_factor": tree_to_json(selection.oriented_tree),

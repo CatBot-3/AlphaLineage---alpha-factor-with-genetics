@@ -419,9 +419,12 @@ def test_tournament_selects_best(signal_panel):
     panel, _ = signal_panel
     gp = GP(GPConfig(population_size=20, tournament_size=20, seed=0), panel)
     gp.initialize()
-    # a full-population tournament must return the single best individual (and its index)
+    # Tournaments draw with replacement; a full-size draw need not include every member.
+    rng_state = gp.rng.getstate()
+    sampled = [gp.rng.choice(range(len(gp.population))) for _ in range(gp.config.tournament_size)]
+    gp.rng.setstate(rng_state)
     best, idx = gp._tournament()
-    assert best.fitness == max(i.fitness for i in gp.population)
+    assert best.fitness == max(gp.population[i].fitness for i in sampled)
     assert gp.population[idx] is best
 
 

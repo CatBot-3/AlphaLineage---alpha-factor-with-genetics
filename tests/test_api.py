@@ -217,7 +217,7 @@ def test_training_capabilities_are_device_relative_and_python_fallback_is_visibl
     payload = response.json()
     assert payload["default_profile"] == "auto"
     assert payload["worker_capacity"] <= 32
-    assert payload["profiles"]["auto"]["percent"] == 50
+    assert payload["profiles"]["auto"]["percent"] == 100
     auto = payload["profiles"]["auto"]
     assert auto["requested_workers"] >= auto["effective_workers"]
     assert auto["effective_workers"] == auto["workers"] == 1
@@ -1455,7 +1455,8 @@ def test_jobstore_runs_and_captures_failure():
     assert store.get(ok).status == "done"
     assert store.get(ok).result == 42
     assert store.get(bad).status == "failed"
-    assert "ZeroDivisionError" in (store.get(bad).error or "")
+    assert store.get(bad).error == "division by zero"
+    assert store.get(bad).error_info["details"] == "ZeroDivisionError"
 
 
 def test_jobstore_treats_training_cancellation_as_stopped_not_failed():

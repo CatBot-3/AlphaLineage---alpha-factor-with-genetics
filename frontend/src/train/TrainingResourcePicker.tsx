@@ -11,8 +11,10 @@ const PROFILE_COPY: Record<
   { label: string; description: string }
 > = {
   light: { label: "Light", description: "keeps the computer responsive" },
-  auto: { label: "Auto", description: "recommended" },
-  maximum: { label: "Maximum", description: "fastest, high system load" },
+  // Auto no longer means "half the cores": it opens the ceiling and lets the run measure how
+  // many workers actually help, which is a question only the machine can answer.
+  auto: { label: "Auto", description: "measures what helps · recommended" },
+  maximum: { label: "Maximum", description: "same ceiling, no measuring" },
   custom: { label: "Custom", description: "Choose 10–100%" },
 };
 
@@ -28,7 +30,8 @@ function profileWorkers(
 ): { percent: number; workers: number; memory: number } | null {
   if (!capabilities) return null;
   if (profile !== "custom") {
-    const resolved = capabilities.profiles[profile];
+    const resolved = capabilities.profiles?.[profile];
+    if (!resolved) return null;
     return {
       percent: resolved.percent,
       workers: resolved.workers,
@@ -95,7 +98,7 @@ export function TrainingResourcePicker({
         >
           {(Object.keys(PROFILE_COPY) as TrainingResourceProfile[]).map((profile) => {
             const resolvedProfile = capabilities && profile !== "custom"
-              ? capabilities.profiles[profile]
+              ? capabilities.profiles?.[profile]
               : null;
             const deviceRelative = resolvedProfile
               ? ` — ${resolvedProfile.percent}%, ${resolvedProfile.workers} of ${capabilities?.detected_cpus} CPUs · `

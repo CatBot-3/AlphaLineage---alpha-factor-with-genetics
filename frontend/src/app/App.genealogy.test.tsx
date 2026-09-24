@@ -126,15 +126,16 @@ describe("Genealogy after a session run (F2 - no blank page)", () => {
 
     // completion triggers a lineage fetch and navigates to the dashboard
     await waitFor(() => expect(getSessionLineage).toHaveBeenCalledWith("s1"));
+    fireEvent.click(screen.getAllByRole("button", {name: "Review result"})[0]);
     await screen.findByTestId("primary-metric");
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole("heading", { level: 1, name: "Metrics" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Results" })).toBeInTheDocument();
 
     // the Genealogy tab now renders the grouped list (previously a blank page)
-    fireEvent.click(screen.getByRole("button", { name: "Genealogy" }));
+    fireEvent.click(screen.getByRole("button", { name: "Lineage" }));
     expect(await screen.findByTestId("generation-list")).toBeInTheDocument();
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole("heading", { level: 1, name: "Genealogy" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Results · Lineage" })).toBeInTheDocument();
     expect(screen.queryByTestId("error-boundary")).not.toBeInTheDocument();
   });
 
@@ -171,6 +172,9 @@ describe("Genealogy after a session run (F2 - no blank page)", () => {
       result: RESULT,
     });
 
+    await waitFor(() => expect(getSessionLineage).toHaveBeenCalledWith("s1"));
+    expect(screen.getByTestId("library-panel")).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", {name: "Review result"})[0]);
     expect(await screen.findByTestId("primary-metric")).toBeInTheDocument();
     expect(getSessionLineage).toHaveBeenCalledWith("s1");
   });
@@ -347,6 +351,8 @@ describe("Genealogy after a session run (F2 - no blank page)", () => {
 
     render(<App />);
     fireEvent.submit(await screen.findByTestId("run-config-form"));
+    await waitFor(() => expect(getSessionLineage).toHaveBeenCalled());
+    fireEvent.click(screen.getAllByRole("button", {name: "Review result"})[0]);
     expect(await screen.findByTestId("strategy-comparison")).toBeInTheDocument();
     expect(screen.queryByTestId("holdout-performance")).not.toBeInTheDocument();
 

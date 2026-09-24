@@ -233,7 +233,12 @@ def effective_lookback(node: Node) -> tuple[int, bool, bool]:
     return total, unbounded, recursive
 
 
-def _window_profile(expanded: Node) -> WindowProfile:
+def window_profile(expanded: Node) -> WindowProfile:
+    """Window sizes and effective lookback of an expanded tree.
+
+    Public because callers outside the explanation path need it too: a signal snapshot
+    trims history to this lookback so a refresh reads a few hundred bars, not twenty years.
+    """
     values = _window_values(expanded)
     lookback, unbounded, recursive = effective_lookback(expanded)
     if not values:
@@ -560,7 +565,7 @@ def measure(
     """Measure a factor. ``expanded`` defaults to ``tree`` when macros are already inlined."""
     surface = tree
     inlined = expanded if expanded is not None else tree
-    windows = _window_profile(inlined)
+    windows = window_profile(inlined)
     structure = _structure_profile(surface, inlined)
     units = _unit_profile(inlined)
     diagnostics = _diagnostics(

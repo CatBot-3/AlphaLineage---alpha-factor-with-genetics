@@ -15,6 +15,10 @@ function progress(phase: string): ProgressSnapshot {
   };
 }
 
+function snapshot(extra: Partial<ProgressSnapshot> = {}): ProgressSnapshot {
+  return { ...progress("training"), report_done: 0, report_total: 0, ...extra };
+}
+
 describe("ProgressView stop policy", () => {
   it.each(["validating", "reporting"])("allows stopping while %s", (activePhase) => {
     const onStop = vi.fn();
@@ -67,4 +71,57 @@ describe("ProgressView stop policy", () => {
       expect(screen.queryByTestId("stop-run")).not.toBeInTheDocument();
     },
   );
+
+  it("explains the worker count it measured rather than the percentage it was given", () => {
+    render(
+      <ProgressView
+        progress={snapshot({
+          resources: {
+            profile: "auto",
+            percent: 50,
+            workers: 15,
+            accelerated: true,
+          } as never,
+          tuning: {
+            state: "settled",
+            workers: 8,
+            max_workers: 15,
+            ladder: [1, 2, 4, 8, 15],
+            samples: 15,
+            speedup: 3.4,
+            cost_by_workers: { "1": 1.0, "8": 0.29 },
+          },
+        })}
+        phase="running"
+        onStop={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("progress-resources")).toHaveTextContent("8 of 15 workers");
+    expect(screen.getByTestId("progress-tuning")).toHaveTextContent(
+      "measured 3.4× faster than one worker; more than 8 stopped helping",
+    );
+  });
+
+  it("says it is still timing the machine while calibrating", () => {
+    render(
+      <ProgressView
+        progress={snapshot({
+          tuning: {
+            state: "calibrating",
+            workers: 4,
+            max_workers: 4,
+            ladder: [1, 2, 4],
+            samples: 2,
+            speedup: null,
+            cost_by_workers: {},
+          },
+        })}
+        phase="running"
+        onStop={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("progress-tuning")).toHaveTextContent(
+      "timing worker counts 1, 2, 4 on this machine",
+    );
+  });
 });

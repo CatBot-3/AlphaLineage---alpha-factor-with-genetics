@@ -3,7 +3,7 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import { clearData, getDataUsage, getSettings, putSettings } from "../api/client";
-import type { AppMode, DataUsageRow, Settings } from "../api/types";
+import type { AppMode, AutoSyncMode, DataUsageRow, Settings } from "../api/types";
 import { CompactSection } from "./CompactSection";
 
 // Kept in step with `alphalineage.explain.providers.PROVIDERS`. Labels only — the backend is
@@ -143,6 +143,10 @@ export function SettingsMenu({
 
   async function saveEvaluator(evaluator: Settings["evaluator"]) {
     await updateSettings("evaluator", { evaluator });
+  }
+
+  async function saveAutoSync(auto_sync: AutoSyncMode) {
+    await updateSettings("auto-sync", { auto_sync });
   }
 
   async function saveTiingo() {
@@ -404,6 +408,26 @@ export function SettingsMenu({
                     </>
                   )}
                 </div>
+
+                <label className="settings-control">
+                  <span className="settings-control__label">Automatic price sync</span>
+                  <select
+                    aria-label="Automatic price sync"
+                    value={settings.auto_sync ?? "top_up"}
+                    disabled={saving === "auto-sync"}
+                    onChange={(e) => void saveAutoSync(e.target.value as AutoSyncMode)}
+                  >
+                    <option value="top_up">Top up cached symbols</option>
+                    <option value="full">Pull anything missing</option>
+                    <option value="off">Never pull on its own</option>
+                  </select>
+                  <small className="hint">
+                    Refreshing a symbol already downloaded costs requests from an allowance that
+                    refills on its own. A symbol you have never downloaded spends your provider's
+                    monthly unique-symbol allowance, so on the default those still wait for you
+                    to press the button.
+                  </small>
+                </label>
 
                 <label className="settings-control">
                   <span className="settings-control__label">Evaluator backend</span>

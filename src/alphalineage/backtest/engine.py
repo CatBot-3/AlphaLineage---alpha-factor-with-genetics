@@ -188,10 +188,14 @@ def _staggered_portfolio_path(
     weights_by_signal = realized_weights.shift(-lag)
     traded_by_signal = traded_realized.shift(-lag)
     costs_by_signal = costs_realized.shift(-lag)
+    # Carry the index's own datetime resolution rather than pinning nanoseconds: pandas 3
+    # builds a business-day index at microsecond resolution, and a realization series in a
+    # different unit from the panel it indexes stops aligning on joins and .loc lookups.
+    signal_index = pd.DatetimeIndex(signal_weights.index)
     realization_dates = pd.Series(
-        pd.DatetimeIndex(signal_weights.index),
+        signal_index,
         index=signal_weights.index,
-        dtype="datetime64[ns]",
+        dtype=signal_index.dtype,
     ).shift(-lag)
     return (
         gross_by_signal,

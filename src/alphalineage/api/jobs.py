@@ -15,6 +15,7 @@ from typing import Any
 
 from alphalineage.api.resources import TrainingLeaseCancelled
 from alphalineage.core.gp import TrainingCancelled
+from alphalineage.api.errors import error_payload
 
 
 @dataclass
@@ -23,6 +24,7 @@ class Job:
     status: str = "queued"  # queued | running | done | stopped | failed
     result: Any = None
     error: str | None = None
+    error_info: dict[str, Any] | None = None
     termination_reason: str | None = None
     # Live snapshot object (e.g. RunProgress) read by GET /runs/{id} while the job runs.
     progress: Any = None
@@ -73,7 +75,8 @@ class JobStore:
                     progress.finish("user_stopped")
             except Exception as exc:  # noqa: BLE001 - record any failure for the caller
                 with self._lock:
-                    job.error = repr(exc)
+                    job.error_info = error_payload(exc)
+                    job.error = job.error_info["message"]
                     job.status = "failed"
             else:
                 termination_reason = (

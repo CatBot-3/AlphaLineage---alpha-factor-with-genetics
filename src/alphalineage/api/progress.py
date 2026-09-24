@@ -41,6 +41,8 @@ class RunProgress:
         self._report_total = 0
         self._factors_per_second: float | None = None
         self._termination_reason: str | None = None
+        self._tuning: dict[str, Any] | None = None
+        self._novelty: dict[str, Any] | None = None
 
     def attach(self, inner: Any) -> None:
         """Set the inner recorder (the persisting LineageStore) calls are forwarded to."""
@@ -69,6 +71,22 @@ class RunProgress:
             self._factors_per_second = (
                 max(0.0, float(factors_per_second)) if factors_per_second is not None else None
             )
+
+    def set_novelty(self, novelty):
+        with self._lock:
+            self._novelty = dict(novelty)
+
+    def on_reference_preparation(self, done: int, total: int) -> None:
+        with self._lock:
+            self._phase = "preparing_references"
+            self._candidate_done = done
+            self._candidate_total = total
+            self._factors_per_second = None
+
+    def set_tuning(self, tuning: dict[str, Any] | None) -> None:
+        """Publish what the worker tuner has measured, so the UI can explain the core count."""
+        with self._lock:
+            self._tuning = dict(tuning) if tuning is not None else None
 
     def set_report_progress(self, done: int, total: int) -> None:
         """Update final trial-report progress, which follows the generation loop."""
@@ -158,6 +176,8 @@ class RunProgress:
                 "history": list(self._history),
                 "best": best,
                 "resources": dict(self._resources) if self._resources is not None else None,
+                "novelty": self._novelty,
+                "tuning": dict(self._tuning) if self._tuning is not None else None,
                 "candidate_done": self._candidate_done,
                 "candidate_total": self._candidate_total,
                 "report_done": self._report_done,

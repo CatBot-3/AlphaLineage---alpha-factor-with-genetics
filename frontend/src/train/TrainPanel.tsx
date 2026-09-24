@@ -101,7 +101,7 @@ export function TrainPanel({
   const lastSegment = state?.segments[state.segments.length - 1];
   const latestRound = state?.rounds?.[state.rounds.length - 1];
   const restartRequired = latestRound?.restart_required === true;
-  const reportCancelled = Boolean(lastSegment?.report_cancelled);
+  const reportCancelled = phase === "stopped" && Boolean(lastSegment?.report_cancelled);
 
   useEffect(() => {
     if (!lastSegment) return;
@@ -263,7 +263,7 @@ export function TrainPanel({
               <div className="train-actions">
                 <button
                   type="button"
-                  className="primary-action"
+                  className="ghost"
                   data-testid="continue-run"
                   onClick={() =>
                     void cont({
@@ -275,8 +275,8 @@ export function TrainPanel({
                   Continue
                 </button>
                 {hasCompletedRound && (
-                  <button type="button" className="ghost" onClick={onOpenDashboard}>
-                    Compare validation rounds
+                  <button type="button" className="primary-action" onClick={onOpenDashboard}>
+                    Review result
                   </button>
                 )}
               </div>

@@ -19,6 +19,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -28,7 +29,7 @@ namespace py = pybind11;
 
 using Vec = std::vector<double>;
 static const double NA = std::numeric_limits<double>::quiet_NaN();
-static constexpr int ABI_VERSION = 8;
+static constexpr int ABI_VERSION = 10;  // 9 adds shared-program batch scoring.
 static constexpr int MAX_NATIVE_WORKERS = 32;
 static constexpr ssize_t SCORE_COLUMNS = 12;
 
@@ -170,6 +171,31 @@ static Plan tuple_plan(const py::handle& value, ssize_t n_fields) {
   return make_plan(Arr<int32_t>(item[0]), Arr<int32_t>(item[1]), Arr<int32_t>(item[2]),
                    Arr<int32_t>(item[3]), Arr<double>(item[4]), Arr<int32_t>(item[5]),
                    py::cast<int>(item[6]), n_fields);
+}
+
+struct SharedProgram {
+  Plan plan;
+  std::vector<int32_t> roots;
+};
+
+// A shared program is one instruction list carrying several trees: the same seven columns as a
+// plan, but the last item is an array of result slots rather than a single one.
+static SharedProgram tuple_shared_program(const py::handle& value, ssize_t n_fields) {
+  py::tuple item = py::cast<py::tuple>(value);
+  if (item.size() != 7) throw std::runtime_error("each program must be a seven-item tuple");
+  SharedProgram program;
+  program.roots = copy_1d(Arr<int32_t>(item[6]), "roots");
+  if (program.roots.empty()) throw std::runtime_error("a program must carry at least one root");
+  program.plan = make_plan(Arr<int32_t>(item[0]), Arr<int32_t>(item[1]), Arr<int32_t>(item[2]),
+                           Arr<int32_t>(item[3]), Arr<double>(item[4]), Arr<int32_t>(item[5]),
+                           program.roots[0], n_fields);
+  const size_t k = program.plan.op.size();
+  for (const int32_t root : program.roots) {
+    if (root < 0 || static_cast<size_t>(root) >= k) {
+      throw std::runtime_error("invalid root index");
+    }
+  }
+  return program;
 }
 
 // These are the compensated algorithms used by pandas' rolling mean/variance kernels. Matching
@@ -347,10 +373,18 @@ static void rolling_min_max(const Vec& x, Vec& out, ssize_t t_count, ssize_t n_s
   }
 }
 
-static void rolling_ema(const Vec& x, Vec& out, ssize_t t_count, ssize_t n_symbols, int window) {
+static void rolling_ema(const Vec& x, Vec& out, ssize_t t_count, ssize_t n_symbols, int window,
+                        bool decayed_new_weight) {
   std::fill(out.begin(), out.end(), NA);
-  const double alpha = 2.0 / (static_cast<double>(window) + 1.0);
+  const double span = static_cast<double>(window);
+  const double alpha = 2.0 / (span + 1.0);
   const double old_factor = 1.0 - alpha;
+  // pandas' EWM keeps a branch for a centre of mass of exactly one, where the new observation's
+  // weight tracks the decayed old weight instead of staying at alpha. The comment there calls it
+  // an irregular-interval correction, but it fires on regular intervals too - and com == 1 is
+  // precisely span == 3, a window this search uses constantly. Without it the two evaluators
+  // agree until a gap, then drift for the rest of the column.
+  const bool unit_center_of_mass = decayed_new_weight && (span - 1.0) == 2.0;
   for (ssize_t s = 0; s < n_symbols; ++s) {
     bool initialized = false;
     double weighted = NA;
@@ -368,9 +402,11 @@ static void rolling_ema(const Vec& x, Vec& out, ssize_t t_count, ssize_t n_symbo
       } else {
         // pandas EWM defaults: adjust=False, ignore_na=False, normalize=True.
         old_weight *= old_factor;
+        const double new_weight = unit_center_of_mass ? 1.0 - old_weight : alpha;
         if (observed) {
           if (weighted != current) {
-            weighted = (old_weight * weighted + alpha * current) / (old_weight + alpha);
+            weighted =
+                (old_weight * weighted + new_weight * current) / (old_weight + new_weight);
           }
           old_weight = 1.0;
         }
@@ -555,8 +591,15 @@ static void cross_rank(const Vec& x, Vec& out, ssize_t t_count, ssize_t n_symbol
   }
 }
 
-static void compute_plan(const double* fields, ssize_t n_fields, ssize_t t_count,
-                         ssize_t n_symbols, const Plan& plan, double* destination) {
+// Evaluate one instruction list, delivering every requested result slot to `on_root` as soon
+// as it is produced. One list can carry several trees: a population's expressions overlap
+// heavily, so emitting each distinct operation once and handing out the roots as they appear
+// removes the repeats without keeping the whole batch resident. A root counts as having one
+// extra consumer, satisfied by its own `on_root` call, so every other buffer is recycled
+// exactly as aggressively as in the single-tree case.
+template <typename OnRoot>
+static void run_plan(const double* fields, ssize_t n_fields, ssize_t t_count, ssize_t n_symbols,
+                     const Plan& plan, const std::vector<int32_t>& roots, OnRoot&& on_root) {
   const ssize_t frame_size = t_count * n_symbols;
   const size_t k_count = plan.op.size();
 
@@ -567,6 +610,15 @@ static void compute_plan(const double* fields, ssize_t n_fields, ssize_t t_count
     ++remaining[plan.a[i]];
     if (uses_b(op)) ++remaining[plan.b[i]];
     if (op == OP_WHERE) ++remaining[plan.ival[i]];
+  }
+  std::vector<std::vector<int>> root_outputs(k_count);
+  for (size_t r = 0; r < roots.size(); ++r) {
+    const int32_t root = roots[r];
+    if (root < 0 || static_cast<size_t>(root) >= k_count) {
+      throw std::runtime_error("root index out of range");
+    }
+    root_outputs[root].push_back(static_cast<int>(r));
+    ++remaining[root];
   }
 
   std::vector<Vec> slots;
@@ -583,11 +635,12 @@ static void compute_plan(const double* fields, ssize_t n_fields, ssize_t t_count
     slots.emplace_back(static_cast<size_t>(frame_size));
     return static_cast<int>(slots.size() - 1);
   };
+  auto release = [&](int index) {
+    free_slots.push_back(node_slot[index]);
+    node_slot[index] = -1;
+  };
   auto consume = [&](int dependency) {
-    if (--remaining[dependency] == 0 && dependency != plan.root) {
-      free_slots.push_back(node_slot[dependency]);
-      node_slot[dependency] = -1;
-    }
+    if (--remaining[dependency] == 0) release(dependency);
   };
 
   for (size_t i = 0; i < k_count; ++i) {
@@ -716,7 +769,7 @@ static void compute_plan(const double* fields, ssize_t n_fields, ssize_t t_count
           }
           break;
         case OP_TS_EMA:
-          rolling_ema(x, out, t_count, n_symbols, plan.ival[i]);
+          rolling_ema(x, out, t_count, n_symbols, plan.ival[i], plan.fval[i] != 0.0);
           break;
         case OP_TS_RMA:
           rolling_rma(x, out, t_count, n_symbols, plan.ival[i]);
@@ -790,11 +843,24 @@ static void compute_plan(const double* fields, ssize_t n_fields, ssize_t t_count
       if (uses_b(op)) consume(plan.b[i]);
       if (op == OP_WHERE) consume(plan.ival[i]);
     }
+    if (!root_outputs[i].empty()) {
+      const int produced = node_slot[i];
+      if (produced < 0) throw std::runtime_error("root buffer was released unexpectedly");
+      for (const int output : root_outputs[i]) on_root(output, slots[produced].data());
+      remaining[i] -= static_cast<int>(root_outputs[i].size());
+      if (remaining[i] == 0) release(i);
+    }
   }
+}
 
-  const int root_slot = node_slot[plan.root];
-  if (root_slot < 0) throw std::runtime_error("root buffer was released unexpectedly");
-  std::copy(slots[root_slot].begin(), slots[root_slot].end(), destination);
+static void compute_plan(const double* fields, ssize_t n_fields, ssize_t t_count,
+                         ssize_t n_symbols, const Plan& plan, double* destination) {
+  const ssize_t frame_size = t_count * n_symbols;
+  const std::vector<int32_t> roots{static_cast<int32_t>(plan.root)};
+  run_plan(fields, n_fields, t_count, n_symbols, plan, roots,
+           [&](int, const double* values) {
+             std::copy(values, values + frame_size, destination);
+           });
 }
 
 static py::array_t<double> evaluate(Arr<double> fields, Arr<int32_t> ops, Arr<int32_t> a_arr,
@@ -888,10 +954,55 @@ static void average_ranks(const std::vector<double>& values, std::vector<double>
   }
 }
 
-static double row_correlation(const std::vector<double>& left,
-                              const std::vector<double>& right) {
-  const size_t count = left.size();
-  if (count < 2 || right.size() != count) return NA;
+// The forward-return target is the same frame for every tree in a batch, yet `score_factor`
+// re-ranks it once per tree per date. It only has to: the pair set depends on where the *factor*
+// is missing, so in principle each tree ranks a different subset. In practice a factor is
+// complete on almost every date it scores at all - measured at 99% of scored dates on a real
+// population - and there the pair set is exactly the target's own non-NaN set, which makes the
+// resulting rank vector byte-identical across the whole batch.
+//
+// So rank the target once per batch and hand the per-tree path a lookup. The test for "this date
+// may use the cache" is a count comparison: pairs are always a subset of the target's non-NaN
+// symbols, so equal sizes mean equal sets, and equal sets in the same symbol order mean equal
+// ranks. A date that fails the test ranks the usual way. Nothing is approximated; the scores are
+// the same bits as before, which `tests/test_shared_scoring.py` and the native parity tests pin.
+struct TargetRanks {
+  std::vector<int32_t> members;  // which symbols have a target on date t, ascending
+  std::vector<double> values;    // their target values, packed in that order
+  std::vector<double> ranks;     // their average ranks, when the method ranks at all
+  std::vector<ssize_t> starts;   // date t occupies [starts[t], starts[t] + counts[t])
+  std::vector<int> counts;
+};
+
+static TargetRanks build_target_ranks(const double* forward, ssize_t t_count, ssize_t n_symbols,
+                                      bool with_ranks) {
+  TargetRanks cache;
+  cache.starts.resize(static_cast<size_t>(t_count));
+  cache.counts.resize(static_cast<size_t>(t_count));
+  cache.members.reserve(static_cast<size_t>(t_count));
+  cache.values.reserve(static_cast<size_t>(t_count));
+  std::vector<double> ranks;
+  for (ssize_t t = 0; t < t_count; ++t) {
+    const ssize_t start = static_cast<ssize_t>(cache.values.size());
+    for (ssize_t s = 0; s < n_symbols; ++s) {
+      const double y = forward[t * n_symbols + s];
+      if (std::isnan(y)) continue;
+      cache.members.push_back(static_cast<int32_t>(s));
+      cache.values.push_back(y);
+    }
+    cache.starts[static_cast<size_t>(t)] = start;
+    cache.counts[static_cast<size_t>(t)] =
+        static_cast<int>(static_cast<ssize_t>(cache.values.size()) - start);
+    if (!with_ranks) continue;
+    const std::vector<double> row(cache.values.begin() + start, cache.values.end());
+    average_ranks(row, ranks);
+    cache.ranks.insert(cache.ranks.end(), ranks.begin(), ranks.end());
+  }
+  return cache;
+}
+
+static double row_correlation(const double* left, const double* right, size_t count) {
+  if (count < 2) return NA;
   double sum_left = 0.0, sum_right = 0.0, sum_product = 0.0;
   double sum_left_sq = 0.0, sum_right_sq = 0.0;
   for (size_t i = 0; i < count; ++i) {
@@ -934,44 +1045,129 @@ static double row_correlation(const std::vector<double>& left,
   return std::isfinite(result) ? result : NA;
 }
 
-static void score_plan(const double* fields, ssize_t n_fields, ssize_t t_count,
-                       ssize_t n_symbols, const Plan& plan, const double* forward,
-                       int tree_size, int method, bool absolute, double parsimony, int min_names,
-                       int min_valid_dates, double* destination) {
-  const ssize_t frame_size = t_count * n_symbols;
-  Vec factor(frame_size);
-  compute_plan(fields, n_fields, t_count, n_symbols, plan, factor.data());
+// Scoring one already-computed factor frame. Extracted so the per-tree path and the shared
+// batch path run *identical* arithmetic: sharing subexpressions must change how often a value
+// is computed, never what it is, and the parity test pins that bit for bit.
+static inline double row_correlation(const std::vector<double>& left,
+                                     const std::vector<double>& right) {
+  if (left.size() != right.size()) return NA;
+  return row_correlation(left.data(), right.data(), left.size());
+}
 
+// Novelty compares already-ranked panels on their pairwise finite intersection.
+// Average ranks are positive half-integers bounded by the universe size, so a
+// counting pass can rerank a restricted intersection without sorting it again.
+static std::pair<double, int> ranked_correlations(Arr<double> left, Arr<double> right,
+                                                 int min_names) {
+  if (left.ndim() != 2 || right.ndim() != 2 || left.shape(0) != right.shape(0) ||
+      left.shape(1) != right.shape(1))
+    throw std::runtime_error("ranked panels must have the same (dates, symbols) shape");
+  const ssize_t dates = left.shape(0), names = left.shape(1);
+  const double* l = left.data();
+  const double* r = right.data();
+  double total = 0.0;
+  int valid_dates = 0;
+  py::gil_scoped_release release;
+  std::vector<double> x, y, histogram(static_cast<size_t>(2 * names + 1));
+  x.reserve(names);
+  y.reserve(names);
+  auto restricted_ranks = [&](std::vector<double>& values) {
+    std::fill(histogram.begin(), histogram.end(), 0.0);
+    for (double value : values) {
+      const double key = value * 2;
+      if (key < 2 || key > 2 * names || key != std::floor(key))
+        throw std::runtime_error("novelty requires finite average ranks");
+      histogram[static_cast<size_t>(key)] += 1;
+    }
+    double before = 0;
+    for (double& count : histogram) {
+      const double after = before + count;
+      count = (before + 1 + after) / 2;
+      before = after;
+    }
+    for (double& value : values) value = histogram[static_cast<size_t>(value * 2)];
+  };
+  for (ssize_t t = 0; t < dates; ++t) {
+    x.clear();
+    y.clear();
+    bool different_masks = false;
+    for (ssize_t s = 0; s < names; ++s) {
+      const double a = l[t * names + s], b = r[t * names + s];
+      const bool has_a = std::isfinite(a), has_b = std::isfinite(b);
+      different_masks |= has_a != has_b;
+      if (has_a && has_b) { x.push_back(a); y.push_back(b); }
+    }
+    if (static_cast<int>(x.size()) < std::max(3, min_names)) continue;
+    if (different_masks) { restricted_ranks(x); restricted_ranks(y); }
+    const double correlation = row_correlation(x, y);
+    if (std::isfinite(correlation)) { total += correlation; ++valid_dates; }
+  }
+  return {valid_dates ? total / valid_dates : 0.0, valid_dates};
+}
+
+static void score_factor(const double* factor, ssize_t t_count, ssize_t n_symbols,
+                         const double* forward, const TargetRanks* target_cache, int tree_size,
+                         int method, bool absolute, double parsimony, int min_names,
+                         int min_valid_dates, double* destination) {
   std::vector<double> factor_values, target_values, factor_ranks, target_ranks, daily;
-  std::vector<int> active_names;
+  std::vector<int> active_names, kept;
   factor_values.reserve(n_symbols);
   target_values.reserve(n_symbols);
   factor_ranks.reserve(n_symbols);
   target_ranks.reserve(n_symbols);
+  kept.reserve(n_symbols);
   daily.reserve(t_count);
   active_names.reserve(t_count);
   const int required_names = std::max(2, min_names);
   for (ssize_t t = 0; t < t_count; ++t) {
+    // Walk only the symbols that have a target today rather than all of them. A symbol with no
+    // forward return can never enter a pair, so the old full-width scan was re-deciding that
+    // once per tree; on a point-in-time universe, where most names are absent on most dates,
+    // that is most of the loop.
+    const size_t start = static_cast<size_t>(target_cache->starts[static_cast<size_t>(t)]);
+    const int available = target_cache->counts[static_cast<size_t>(t)];
+    const int32_t* members = target_cache->members.data() + start;
+    const double* packed_target = target_cache->values.data() + start;
     factor_values.clear();
-    target_values.clear();
-    for (ssize_t s = 0; s < n_symbols; ++s) {
-      const double x = factor[t * n_symbols + s], y = forward[t * n_symbols + s];
-      // Python daily_ic pairs on NaN only; +/- infinity remains a ranked observation.
-      if (!std::isnan(x) && !std::isnan(y)) {
-        factor_values.push_back(x);
-        target_values.push_back(y);
+    kept.clear();
+    // Python daily_ic pairs on NaN only; +/- infinity remains a ranked observation.
+    bool complete = true;
+    for (int k = 0; k < available; ++k) {
+      const double x = factor[t * n_symbols + members[k]];
+      if (std::isnan(x)) {
+        if (complete) {
+          // First hole today: everything kept so far sat at its own offset, so say so once and
+          // start recording offsets from here.
+          complete = false;
+          kept.resize(factor_values.size());
+          std::iota(kept.begin(), kept.end(), 0);
+        }
+        continue;
       }
+      factor_values.push_back(x);
+      if (!complete) kept.push_back(k);
     }
     if (static_cast<int>(factor_values.size()) < required_names) continue;
-    const std::vector<double>* x_values = &factor_values;
-    const std::vector<double>* y_values = &target_values;
+    const double* x_values = factor_values.data();
+    const double* y_values;
+    if (complete) {
+      // The pair set is the target's own, so both the packed values and the batch-wide ranks
+      // for this date are already exactly what this tree needs.
+      y_values = method == 0 ? target_cache->ranks.data() + start : packed_target;
+    } else {
+      target_values.clear();
+      for (const int offset : kept) target_values.push_back(packed_target[offset]);
+      y_values = target_values.data();
+      if (method == 0) {
+        average_ranks(target_values, target_ranks);
+        y_values = target_ranks.data();
+      }
+    }
     if (method == 0) {
       average_ranks(factor_values, factor_ranks);
-      average_ranks(target_values, target_ranks);
-      x_values = &factor_ranks;
-      y_values = &target_ranks;
+      x_values = factor_ranks.data();
     }
-    const double correlation = row_correlation(*x_values, *y_values);
+    const double correlation = row_correlation(x_values, y_values, factor_values.size());
     if (!std::isnan(correlation)) {
       daily.push_back(correlation);
       active_names.push_back(static_cast<int>(factor_values.size()));
@@ -1032,10 +1228,22 @@ static void score_plan(const double* fields, ssize_t n_fields, ssize_t t_count,
   destination[11] = minimum_active_names;
 }
 
+static void score_plan(const double* fields, ssize_t n_fields, ssize_t t_count,
+                       ssize_t n_symbols, const Plan& plan, const double* forward,
+                       const TargetRanks* target_cache, int tree_size, int method, bool absolute,
+                       double parsimony, int min_names, int min_valid_dates,
+                       double* destination, double* observed = nullptr) {
+  Vec factor(t_count * n_symbols);
+  compute_plan(fields, n_fields, t_count, n_symbols, plan, factor.data());
+  if (observed) std::copy_n(factor.data(), t_count * n_symbols, observed);
+  score_factor(factor.data(), t_count, n_symbols, forward, target_cache, tree_size, method,
+               absolute, parsimony, min_names, min_valid_dates, destination);
+}
+
 static py::array_t<double> score_many(Arr<double> fields, py::iterable plan_values,
                                       Arr<double> forward_returns, Arr<int32_t> tree_sizes,
                                       int method, bool absolute, double parsimony, int min_names,
-                                      int min_valid_dates, int workers) {
+                                      int min_valid_dates, int workers, py::object observed = py::none()) {
   const auto field_info = fields.request();
   if (field_info.ndim != 3) throw std::runtime_error("fields must be (n_fields, T, N)");
   const ssize_t n_fields = field_info.shape[0], t_count = field_info.shape[1];
@@ -1061,6 +1269,22 @@ static py::array_t<double> score_many(Arr<double> fields, py::iterable plan_valu
       std::vector<ssize_t>{static_cast<ssize_t>(plans.size()), SCORE_COLUMNS});
   double* destination = result.mutable_data();
   if (plans.empty()) return result;
+  double* observations = nullptr;
+  py::array_t<double> observed_array;
+  if (!observed.is_none()) {
+    observed_array = py::cast<py::array_t<double>>(observed);
+    if (observed_array.ndim() != 3 || observed_array.shape(0) != static_cast<ssize_t>(plans.size()) ||
+        observed_array.shape(1) != t_count || observed_array.shape(2) != n_symbols)
+      throw std::runtime_error("observed must have shape (trees, T, N)");
+    observations = observed_array.mutable_data();
+  }
+
+  // Rank the target once for the whole batch instead of once per tree per date; Pearson never
+  // ranks, so it builds nothing. The pointer is read-only for the workers, so the threads below
+  // share it without synchronisation.
+  const TargetRanks target_ranks =
+      build_target_ranks(forward_data, t_count, n_symbols, method == 0);
+  const TargetRanks* const target_cache = &target_ranks;
 
   const size_t thread_count = std::min<size_t>(
       plans.size(), static_cast<size_t>(std::clamp(workers, 1, MAX_NATIVE_WORKERS)));
@@ -1078,8 +1302,9 @@ static py::array_t<double> score_many(Arr<double> fields, py::iterable plan_valu
           const size_t index = next.fetch_add(1, std::memory_order_relaxed);
           if (index >= plans.size()) return;
           score_plan(field_data, n_fields, t_count, n_symbols, plans[index], forward_data,
-                     sizes[index], method, absolute, parsimony, min_names, min_valid_dates,
-                     destination + index * SCORE_COLUMNS);
+                     target_cache, sizes[index], method, absolute, parsimony, min_names,
+                     min_valid_dates, destination + index * SCORE_COLUMNS,
+                     observations ? observations + index * t_count * n_symbols : nullptr);
         }
       } catch (...) {
         std::lock_guard<std::mutex> lock(failure_mutex);
@@ -1100,19 +1325,130 @@ static py::array_t<double> score_many(Arr<double> fields, py::iterable plan_valu
   return result;
 }
 
+static py::array_t<double> score_shared(Arr<double> fields, py::iterable program_values,
+                                       Arr<double> forward_returns, Arr<int32_t> tree_sizes,
+                                       int method, bool absolute, double parsimony,
+                                       int min_names, int min_valid_dates, int workers, py::object observed = py::none()) {
+  const auto field_info = fields.request();
+  if (field_info.ndim != 3) throw std::runtime_error("fields must be (n_fields, T, N)");
+  const ssize_t n_fields = field_info.shape[0], t_count = field_info.shape[1];
+  const ssize_t n_symbols = field_info.shape[2];
+  const double* field_data = static_cast<const double*>(field_info.ptr);
+  const auto forward_info = forward_returns.request();
+  if (forward_info.ndim != 2 || forward_info.shape[0] != t_count ||
+      forward_info.shape[1] != n_symbols) {
+    throw std::runtime_error("forward_returns must have shape (T, N)");
+  }
+  const double* forward_data = static_cast<const double*>(forward_info.ptr);
+  if (method != 0 && method != 1) throw std::runtime_error("unknown scoring method");
+  if (!std::isfinite(parsimony)) throw std::runtime_error("parsimony must be finite");
+  if (min_names < 1 || min_valid_dates < 1) {
+    throw std::runtime_error("minimum counts must be positive");
+  }
+
+  std::vector<SharedProgram> programs;
+  for (const py::handle item : program_values) {
+    programs.push_back(tuple_shared_program(item, n_fields));
+  }
+  const std::vector<int32_t> sizes = copy_1d(tree_sizes, "tree_sizes");
+  // Results are laid out program by program, each program's roots in order, which is how the
+  // caller maps a row back to the tree it asked about.
+  std::vector<size_t> offsets(programs.size(), 0);
+  size_t total_trees = 0;
+  for (size_t i = 0; i < programs.size(); ++i) {
+    offsets[i] = total_trees;
+    total_trees += programs[i].roots.size();
+  }
+  if (sizes.size() != total_trees) throw std::runtime_error("tree_sizes length mismatch");
+  py::array_t<double> result(
+      std::vector<ssize_t>{static_cast<ssize_t>(total_trees), SCORE_COLUMNS});
+  double* destination = result.mutable_data();
+  if (programs.empty()) return result;
+  double* observations = nullptr;
+  py::array_t<double> observed_array;
+  if (!observed.is_none()) {
+    observed_array = py::cast<py::array_t<double>>(observed);
+    if (observed_array.ndim() != 3 || observed_array.shape(0) != static_cast<ssize_t>(total_trees) ||
+        observed_array.shape(1) != t_count || observed_array.shape(2) != n_symbols)
+      throw std::runtime_error("observed must have shape (trees, T, N)");
+    observations = observed_array.mutable_data();
+  }
+
+  // Rank the target once for the whole batch instead of once per tree per date; Pearson never
+  // ranks, so it builds nothing. The pointer is read-only for the workers, so the threads below
+  // share it without synchronisation.
+  const TargetRanks target_ranks =
+      build_target_ranks(forward_data, t_count, n_symbols, method == 0);
+  const TargetRanks* const target_cache = &target_ranks;
+
+  const size_t thread_count = std::min<size_t>(
+      programs.size(), static_cast<size_t>(std::clamp(workers, 1, MAX_NATIVE_WORKERS)));
+  std::exception_ptr failure;
+  std::mutex failure_mutex;
+  std::atomic<size_t> next{0};
+  std::fenv_t caller_floating_environment;
+  std::fegetenv(&caller_floating_environment);
+  {
+    py::gil_scoped_release release;
+    auto run = [&]() {
+      try {
+        std::fesetenv(&caller_floating_environment);
+        while (true) {
+          const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+          if (index >= programs.size()) return;
+          const SharedProgram& program = programs[index];
+          const size_t base = offsets[index];
+          // Each root is scored the moment it is produced, so its buffer is released
+          // immediately afterwards and the program never holds every tree at once.
+          run_plan(field_data, n_fields, t_count, n_symbols, program.plan, program.roots,
+                   [&](int output, const double* values) {
+                     if (observations) std::copy_n(values, t_count * n_symbols,
+                         observations + (base + static_cast<size_t>(output)) * t_count * n_symbols);
+                     score_factor(values, t_count, n_symbols, forward_data, target_cache,
+                                  sizes[base + static_cast<size_t>(output)], method, absolute,
+                                  parsimony, min_names, min_valid_dates,
+                                  destination + (base + static_cast<size_t>(output)) *
+                                                    SCORE_COLUMNS);
+                   });
+        }
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(failure_mutex);
+        if (!failure) failure = std::current_exception();
+        next.store(programs.size(), std::memory_order_relaxed);
+      }
+    };
+    if (thread_count == 1) {
+      run();
+    } else {
+      std::vector<std::thread> threads;
+      threads.reserve(thread_count);
+      for (size_t i = 0; i < thread_count; ++i) threads.emplace_back(run);
+      for (auto& thread : threads) thread.join();
+    }
+  }
+  if (failure) std::rethrow_exception(failure);
+  return result;
+}
+
 PYBIND11_MODULE(_evaluator, module) {
   module.doc() = "AlphaLineage deterministic native expression evaluator";
   module.attr("ABI_VERSION") = ABI_VERSION;
   module.attr("MAX_WORKERS") = MAX_NATIVE_WORKERS;
+  module.def("ranked_correlations", &ranked_correlations, py::arg("left"),
+             py::arg("right"), py::arg("min_names"));
   module.def("evaluate", &evaluate, py::arg("fields"), py::arg("ops"), py::arg("a"),
              py::arg("b"), py::arg("ival"), py::arg("fval"), py::arg("field"),
              py::arg("root"), "Evaluate one flattened expression tree.");
   module.def("evaluate_many", &evaluate_many, py::arg("fields"), py::arg("plans"),
              py::arg("workers") = 1,
              "Evaluate flattened trees in input order using bounded native workers.");
+  module.def("score_shared", &score_shared, py::arg("fields"), py::arg("programs"),
+             py::arg("forward_returns"), py::arg("tree_sizes"), py::arg("method"),
+             py::arg("absolute"), py::arg("parsimony"), py::arg("min_names"),
+             py::arg("min_valid_dates"), py::arg("workers"), py::arg("observed") = py::none());
   module.def("score_many", &score_many, py::arg("fields"), py::arg("plans"),
              py::arg("forward_returns"), py::arg("tree_sizes"), py::arg("method"),
              py::arg("absolute"), py::arg("parsimony"), py::arg("min_names"),
-             py::arg("min_valid_dates"), py::arg("workers") = 1,
+             py::arg("min_valid_dates"), py::arg("workers") = 1, py::arg("observed") = py::none(),
              "Evaluate and IC-score flattened trees in input order without materializing frames.");
 }

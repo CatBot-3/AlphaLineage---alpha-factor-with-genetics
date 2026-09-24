@@ -1,6 +1,10 @@
 // Typed client for the `app` build: submit a GP run and poll it to completion.
 
 import type {
+  SignalSeries,
+  PortfolioPreview,
+  FormulaTestBinding,
+  ExecutionTiming,
   AgentJob,
   Conversation,
   AgentMessageRequest,
@@ -38,6 +42,10 @@ import type {
   SessionSummary,
   SessionRoundSummary,
   Settings,
+  SignalSnapshot,
+  SignalSource,
+  UniverseFillJob,
+  UniverseFillPlan,
   SettingsUpdate,
   SymbolCandidate,
   SymbolValidation,
@@ -64,6 +72,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public status: number,
+    public info?: { code?: string; action?: string; retryable?: boolean; symbols?: string[]; details?: unknown },
   ) {
     super(message);
     this.name = "ApiError";
@@ -72,8 +81,10 @@ export class ApiError extends Error {
 
 async function jsonOrThrow<T>(res: Response, action: string): Promise<T> {
   if (!res.ok) {
-    const detail = (await res.json().catch(() => ({}))) as { detail?: string };
-    throw new ApiError(detail.detail ?? `${action} failed: ${res.status}`, res.status);
+    const body = await res.json().catch(() => ({}));
+    const detail = body.detail ?? body;
+    const message = typeof detail === "string" ? detail : detail.message ?? `${action} failed: ${res.status}`;
+    throw new ApiError(message, res.status, typeof detail === "object" ? detail : undefined);
   }
   return (await res.json()) as T;
 }
@@ -853,4 +864,83 @@ export async function getRoundOverlap(
   );
   if (res.status === 404) return null;
   return jsonOrThrow(res, "load overlap check");
+}
+
+export async function listSignalSources(): Promise<SignalSource[]> {
+  return jsonOrThrow(await fetch(`${BASE}/signals/sources`), "load signal sources");
+}
+
+export async function startSignalSnapshot(body: {
+  source: string;
+  universe?: string;
+  as_of?: string;
+  refresh_prices?: boolean;
+  data_mode?: "refresh" | "cached";
+  bindings?: Record<string, FormulaTestBinding>;
+  comparisons?: { source: string; bindings?: Record<string, FormulaTestBinding> }[];
+  execution?: ExecutionTiming;
+  direction?: "higher" | "lower";
+}): Promise<{ job_id: string; status: string; reused: boolean }> {
+  return jsonOrThrow(await POST("/signals/snapshot", body), "start signal snapshot");
+}
+
+/** Poll a snapshot job. `getRun` types its result as a GP run, which this job is not. */
+export async function getSignalSnapshotJob(jobId: string): Promise<{
+  job_id: string;
+  status: string;
+  result: SignalSnapshot | null;
+  error: string | null;
+  error_info?: {code: string; message: string; action: string; retryable: boolean; symbols: string[]; details?: string};
+  progress?: ProgressSnapshot | null;
+}> {
+  return jsonOrThrow(await fetch(`${BASE}/runs/${jobId}`), "poll signal snapshot");
+}
+
+export async function getUniverseFillPlan(
+  universe: string,
+  asOf: string,
+  scope: "top_up" | "full" = "top_up",
+): Promise<UniverseFillPlan> {
+  const query = new URLSearchParams({ as_of: asOf, scope });
+  return jsonOrThrow(
+    await fetch(`${BASE}/universes/${encodeURIComponent(universe)}/fill-plan?${query}`),
+    "load fill plan",
+  );
+}
+
+export async function startUniverseFill(
+  universe: string,
+  body: { as_of?: string; scope?: "top_up" | "full" } = {},
+): Promise<UniverseFillJob> {
+  return jsonOrThrow(
+    await POST(`/universes/${encodeURIComponent(universe)}/fill`, body),
+    "fill price gaps",
+  );
+}
+
+export async function saveFormulaSource(source: string, name?: string, evaluation_id?: string | null): Promise<FormulaResult> {
+  return jsonOrThrow(await POST("/formula-results", {source, name, evaluation_id}), "save formula result");
+}
+export async function resolveFormulaSource(source: string, bindings?: Record<string, FormulaTestBinding>): Promise<SignalSource & { tree: import("./types").FactorNode }> {
+  return jsonOrThrow(await POST("/signals/resolve", {source, bindings}), "inspect formula");
+}
+export async function getSignalSnapshot(id: string): Promise<SignalSnapshot> {
+  return jsonOrThrow(await fetch(`${BASE}/signals/snapshots/${encodeURIComponent(id)}`), "load snapshot");
+}
+export async function stopSignalJob(id: string): Promise<{stopping: boolean}> {
+  return jsonOrThrow(await POST(`/signals/jobs/${encodeURIComponent(id)}/stop`, {}), "stop signal preparation");
+}
+export async function getSignalSeries(id: string, symbol: string): Promise<SignalSeries> {
+  return jsonOrThrow(await fetch(`${BASE}/signals/snapshots/${encodeURIComponent(id)}/series/${encodeURIComponent(symbol)}`), "load stock history");
+}
+export async function getPortfolioPreview(id: string, strategy?: PortfolioStrategySpec, notional?: number): Promise<PortfolioPreview> {
+  return jsonOrThrow(await POST(`/signals/snapshots/${encodeURIComponent(id)}/portfolio`, {strategy, notional}), "preview portfolio");
+}
+export function signalExportUrl(id: string, kind: "ranking" | "portfolio" | "excluded", strategy?: PortfolioStrategySpec): string {
+  const params = new URLSearchParams({kind});
+  if (strategy) {
+    params.set("scheme", strategy.scheme);
+    if (strategy.quantile != null) params.set("quantile", String(strategy.quantile));
+  }
+  return `${BASE}/signals/snapshots/${encodeURIComponent(id)}/export?${params}`;
 }

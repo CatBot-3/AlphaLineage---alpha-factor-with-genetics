@@ -72,6 +72,20 @@ def langchain_missing() -> Iterator[None]:
         for name, module in saved.items():
             if module is not None:
                 sys.modules[name] = module
+        # Restoring ``sys.modules`` is not enough. Importing a submodule also rebinds it as an
+        # attribute of its parent package, so the throwaway imports above left
+        # ``alphalineage.api.sessions`` (the attribute) pointing at a module nothing else uses
+        # while ``sys.modules`` pointed at the real one. ``monkeypatch.setattr`` resolves a
+        # dotted target by attribute traversal, so a later test patching
+        # "alphalineage.api.sessions.build_report" patched the orphan and the real function
+        # went on running - which is how a cancelled finalization published a real artifact.
+        for name, module in saved.items():
+            if module is None or "." not in name:
+                continue
+            parent_name, _, child = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, child, module)
 
 
 def _agent_owned(name: str) -> bool:

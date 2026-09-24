@@ -279,6 +279,19 @@
   background: currentColor;
 }
 
+/* Between the two-row header at 900px and a comfortable desktop the tab row is the first
+   thing to run out of room; adding a tab made it overflow at 1024. Tighten its own spacing
+   there rather than dropping a tab or wrapping the header early. */
+@media (max-width: 1180px) {
+  .nav {
+    gap: var(--space-3);
+  }
+
+  .nav__list {
+    gap: var(--space-3);
+  }
+}
+
 @media (max-width: 900px) {
   :root {
     --header-height: 116px;
@@ -347,3 +360,36 @@
     flex-wrap: wrap;
   }
 }
+
+/* Compact working surfaces retain the original palette and typography. */
+.site-main { padding-top: calc(var(--header-height) + 24px); }
+.page-header { margin-bottom: 16px; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid #aaa69e; }
+.page-header__copy { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; }
+.page-header h1 { font-size: 28px; margin: 0; }
+.page-header p { font-size: 13px; }
+.page-header .view-tag { display: none; }
+.page-header .view-rule { display: none; }
+.workflow-status, .result-tabs, .signals-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.workflow-status { justify-content: space-between; border-bottom: 1px solid #b9b6ad; padding: 6px 0; margin-bottom: 16px; font-size: 13px; }
+.result-tabs { margin-bottom: 16px; }
+.result-tabs [aria-current=page], .signals-workspace [aria-pressed=true] { box-shadow: inset 0 -2px #bd9600; }
+.signals-toolbar > .field { flex: 1; min-width: 230px; }
+.signals-toolbar select { max-width: 100%; }
+.signals-comparisons { margin: 8px 0; }
+.signals-comparisons summary { cursor: pointer; padding: 4px 0; }
+.signals-freshness { display: grid; gap: 3px; border-block: 1px solid #aaa69e; padding: 8px 0; font-size: 13px; }
+.signals-freshness.is-warning { border-left: 4px solid #bd9600; padding-left: 12px; }
+.signals-grid { display: grid; grid-template-columns: minmax(240px, 29%) minmax(0, 1fr); gap: 22px; margin-top: 18px; }
+.signals-ranking { min-width: 0; }
+.signals-ranking label, .signals-ranking input { display: block; width: 100%; }
+.signals-ranking-scroll { max-height: 740px; overflow: auto; }
+.signals-workspace table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.signals-workspace td, .signals-workspace th { padding: 8px 5px; text-align: right; border-bottom: 1px solid #d0ccc3; }
+.signals-workspace th:first-child, .signals-workspace td:first-child { text-align: left; }
+.signals-workspace tr[aria-selected=true] { background: #dbd6c9; }
+.signals-detail { min-width: 0; }
+.signals-inspection { min-height: 44px; padding: 6px 0; font-size: 12px; }
+.signal-chart { width: 100%; min-height: 580px; }
+.library-inspection { border-top: 1px solid #aaa69e; padding-top: 16px; }
+.library-inspection pre { max-height: 300px; overflow: auto; }
+@media(max-width: 900px) { .signals-grid { grid-template-columns: 1fr; } .signals-ranking-scroll { max-height: 260px; } }

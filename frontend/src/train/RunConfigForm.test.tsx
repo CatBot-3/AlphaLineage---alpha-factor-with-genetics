@@ -3,7 +3,26 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FormulaSpec, PrimitiveInfo } from "../api/types";
 import type { RunRequestForm } from "./RunConfigForm";
 
-const { universeCoverage, formulaList, primitiveList } = vi.hoisted(() => ({
+const { universeCoverage, formulaList, primitiveList, fillPlan, startFill, syncJob } =
+  vi.hoisted(() => ({
+  fillPlan: vi.fn((_u?: string, _a?: string, _s?: string) =>
+    Promise.resolve({
+      name: "sp500-lite",
+      as_of: "2026-07-15",
+      mode: "top_up" as const,
+      scope: "full" as const,
+      symbols: [] as string[],
+      deferred_symbols: [] as string[],
+      cached_gap_count: 0,
+      first_time_count: 0,
+    }),
+  ),
+  startFill: vi.fn((_u?: string, _b?: unknown) =>
+    Promise.resolve({ job_id: "fill-1", status: "queued", reused: false }),
+  ),
+  syncJob: vi.fn<(id?: string) => Promise<{ job_id: string; status: string; result: unknown }>>(
+    () => Promise.resolve({ job_id: "fill-1", status: "done", result: null }),
+  ),
   universeCoverage: vi.fn((_name?: string, _asOf?: string) =>
     Promise.resolve({
       as_of: "2026-07-15",
@@ -26,6 +45,9 @@ const { universeCoverage, formulaList, primitiveList } = vi.hoisted(() => ({
 vi.mock("../api/client", () => ({
   listUniverses: () => Promise.resolve([]),
   getUniverseCoverage: (name: string, asOf: string) => universeCoverage(name, asOf),
+  getUniverseFillPlan: (u: string, a: string, s: string) => fillPlan(u, a, s),
+  startUniverseFill: (u: string, b: unknown) => startFill(u, b),
+  getDataSync: (id: string) => syncJob(id),
   listFormulaResults: () =>
     Promise.resolve([
       {
@@ -194,8 +216,8 @@ describe("RunConfigForm function space", () => {
     render(<RunConfigForm onStart={onStart} onOpenDataSync={onOpenDataSync} />);
 
     expect(await screen.findByText("Price history needs attention")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start training" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Data Sync" }));
+    expect(screen.getByRole("button", { name: "Prepare data & start" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Universe Editor" }));
     expect(onOpenDataSync).toHaveBeenCalledWith("sp500-lite");
     fireEvent.submit(screen.getByTestId("run-config-form"));
     expect(onStart).not.toHaveBeenCalled();
@@ -283,4 +305,96 @@ describe("RunConfigForm execution timing", () => {
     fireEvent.submit(screen.getByTestId("run-config-form"));
     expect((onStart.mock.calls[0][0] as RunRequestForm).config.execution).toBe("close");
   });
+
+  it("fills price gaps where the gap is reported, and defers the pulls that cost the allowance", async () => {
+    universeCoverage.mockResolvedValue({
+      as_of: "2026-07-15",
+      eligible_symbols: ["AAPL", "MSFT", "NVDA"],
+      cached_symbols: ["AAPL", "MSFT"],
+      missing_symbols: ["NVDA"],
+      incomplete_symbols: ["MSFT", "NVDA"],
+      complete: false,
+    });
+    fillPlan.mockResolvedValue({
+      name: "sp500-lite",
+      as_of: "2026-07-15",
+      mode: "top_up",
+      scope: "full",
+      symbols: ["MSFT", "NVDA"],
+      deferred_symbols: ["NVDA"],
+      cached_gap_count: 1,
+      first_time_count: 1,
+    });
+
+    render(<RunConfigForm onStart={vi.fn()} />);
+
+    await screen.findByTestId("fill-price-gaps");
+    expect(startFill).not.toHaveBeenCalled();
+
+    // The expensive half is named and waits for a deliberate press, without leaving the tab.
+    const button = await screen.findByTestId("fill-price-gaps");
+    expect(button).toHaveTextContent("Pull 2 symbols (1 new)");
+    expect(screen.getByTestId("fill-plan-note")).toHaveTextContent(
+      "have never been downloaded",
+    );
+
+    startFill.mockClear();
+    fireEvent.click(button);
+    await waitFor(() =>
+      expect(startFill).toHaveBeenCalledWith("sp500-lite", {
+        as_of: expect.any(String),
+        scope: "full",
+      }),
+    );
+  });
+
+  it("reports a pull that stopped on the provider's allowance instead of looking complete", async () => {
+    universeCoverage.mockResolvedValue({
+      as_of: "2026-07-15",
+      eligible_symbols: ["AAPL", "MSFT"],
+      cached_symbols: ["AAPL"],
+      missing_symbols: [],
+      incomplete_symbols: ["MSFT"],
+      complete: false,
+    });
+    fillPlan.mockResolvedValue({
+      name: "sp500-lite",
+      as_of: "2026-07-15",
+      mode: "top_up",
+      scope: "full",
+      symbols: ["MSFT"],
+      deferred_symbols: [],
+      cached_gap_count: 1,
+      first_time_count: 0,
+    });
+    syncJob.mockResolvedValue({
+      job_id: "fill-1",
+      status: "done",
+      result: {
+        termination_reason: "quota_exceeded",
+        quota: { provider: "tiingo", scope: "hourly", message: "over allocation" },
+      },
+    });
+
+    render(<RunConfigForm onStart={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("fill-price-gaps"));
+    expect(await screen.findByTestId("fill-notice")).toHaveTextContent(
+      "tiingo reported the hourly allowance used",
+    );
+  });
+});
+
+
+it("prepares missing history then starts automatically after coverage succeeds", async () => {
+  const missing = {as_of: "2026-07-15", eligible_symbols: ["AAPL"], cached_symbols: [], missing_symbols: ["AAPL"], incomplete_symbols: ["AAPL"], complete: false};
+  universeCoverage.mockResolvedValueOnce(missing).mockResolvedValue({...missing, cached_symbols: ["AAPL"], missing_symbols: [], incomplete_symbols: [], complete: true});
+  fillPlan.mockResolvedValue({name: "sp500-lite", as_of: "2026-07-15", mode: "top_up", scope: "full", symbols: ["AAPL"], deferred_symbols: ["AAPL"], cached_gap_count: 0, first_time_count: 1});
+  syncJob.mockResolvedValue({job_id: "fill-1", status: "done", result: {termination_reason: "completed"}});
+  const onStart = vi.fn();
+  render(<RunConfigForm onStart={onStart}/>);
+  await screen.findByTestId("fill-price-gaps");
+  fireEvent.click(screen.getByRole("button", {name: "Prepare data & start"}));
+  await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+  expect(syncJob).toHaveBeenCalledWith("fill-1");
+  expect(onStart.mock.calls[0][0].config.novelty_mode).toBe("balanced");
 });

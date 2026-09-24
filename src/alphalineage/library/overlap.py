@@ -32,9 +32,10 @@ from scipy.stats import rankdata
 from alphalineage.core.fitness import daily_ic
 from alphalineage.core.tree import Node
 
-OVERLAP_VERSION = 1
+OVERLAP_VERSION = 2
 #: |mean rank correlation| at or above which a reference factor is a near-duplicate.
-DUPLICATE_THRESHOLD = 0.7
+DUPLICATE_THRESHOLD = 0.98
+STRONG_THRESHOLD = 0.7
 #: |mean rank correlation| at or above which a reference factor counts as related and is used to
 #: explain the candidate.
 RELATED_THRESHOLD = 0.3
@@ -230,6 +231,8 @@ def verdict(max_abs_corr: float | None, unique_share: float | None) -> str:
         return "unmeasured"
     if max_abs_corr >= DUPLICATE_THRESHOLD:
         return "near_duplicate"
+    if max_abs_corr >= STRONG_THRESHOLD:
+        return "strong_overlap"
     if unique_share is not None and unique_share < 0.5:
         return "mostly_explained"
     if max_abs_corr >= RELATED_THRESHOLD:
@@ -350,6 +353,7 @@ def overlap_report(
         "thresholds": {
             "related": related_threshold,
             "near_duplicate": DUPLICATE_THRESHOLD,
+            "strong_overlap": STRONG_THRESHOLD,
             "top_k": int(top_k),
         },
         "candidate": {

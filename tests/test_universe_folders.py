@@ -86,6 +86,14 @@ def test_bundled_subsets_start_inside_collapsed_default_folders(client) -> None:
         "Technology",
     ]
     assert listed["sp500-lite"]["folder_path"] == []
+    # Subsets live only in the snapshot manifest, so they used to fall through the preset
+    # lookup and surface their slug as the name the folder tree renders.
+    assert listed["builtin-sp500-sector-energy"]["display_name"] == "S&P 500 Energy sector"
+    assert all(
+        item["display_name"] != item["name"]
+        for item in listed.values()
+        if item["source"] == "bundled"
+    )
 
 
 def test_user_can_create_rename_nest_move_and_delete_folders(client) -> None:

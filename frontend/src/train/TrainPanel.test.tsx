@@ -102,11 +102,36 @@ const DONE_SESSION = {
   },
 };
 
+const FAILED_SESSION = {
+  id: "s1",
+  segments: [],
+  cumulative_trials: 0,
+  test_reads: 0,
+  job: {
+    id: "j1",
+    status: "failed",
+    progress: null,
+    error: "max nodes (30) is too small for 3 enabled formula(s): ta_adx, ta_dx, ta_mfi.",
+  },
+  result: null,
+};
+
 afterEach(() => {
   vi.clearAllMocks();
 });
 
 describe("TrainPanel (B2)", () => {
+  it("shows why a run failed instead of pointing at a log the user cannot open", async () => {
+    createSession.mockResolvedValue({ session_id: "s1", job_id: "j1" });
+    getSession.mockResolvedValue(FAILED_SESSION);
+
+    render(<TrainPanel />);
+    fireEvent.submit(await screen.findByTestId("run-config-form"));
+
+    expect(await screen.findByText(/max nodes \(30\) is too small/)).toBeInTheDocument();
+    expect(screen.queryByText(/see the backend logs/)).not.toBeInTheDocument();
+  });
+
   it("posts the form's config (not a hardcoded one) and surfaces the result", async () => {
     createSession.mockResolvedValue({ session_id: "s1", job_id: "j1" });
     getSession.mockResolvedValue(DONE_SESSION);

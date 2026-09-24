@@ -10,16 +10,17 @@ export type Tab =
   | "dashboard"
   | "factor"
   | "genealogy"
+  | "signals"
   | "library"
   | "agent"
   | "extend";
 
 const TABS: Array<{ id: Tab; label: string; backendOnly?: boolean; beta?: boolean }> = [
   { id: "train", label: "Train", backendOnly: true },
-  { id: "dashboard", label: "Metrics" },
-  { id: "factor", label: "Best Formula Result" },
-  { id: "genealogy", label: "Genealogy" },
+  { id: "dashboard", label: "Results" },
+  // Using a formula, not measuring one: it needs the local price cache, so it is backend-only.
   { id: "library", label: "Library", backendOnly: true },
+  { id: "signals", label: "Signals", backendOnly: true },
   // Beta: the guards and the measurements are stable, but everything the model writes depends
   // on a third-party model, so the label sets expectations honestly.
   { id: "agent", label: "Agent", backendOnly: true, beta: true },
@@ -35,7 +36,7 @@ const TABS: Array<{ id: Tab; label: string; backendOnly?: boolean; beta?: boolea
  * blanked the whole page — so restoring UI state goes through this, never straight into `setTab`.
  */
 export function isTab(value: unknown): value is Tab {
-  return TABS.some((tab) => tab.id === value);
+  return value === "factor" || value === "genealogy" || TABS.some((tab) => tab.id === value);
 }
 
 export function AppShell({
@@ -91,7 +92,7 @@ export function AppShell({
                   key={item.id}
                   className={`nav__link${item.beta ? " nav__link--beta" : ""}`}
                   type="button"
-                  aria-current={tab === item.id ? "page" : undefined}
+                  aria-current={tab === item.id || (item.id === "dashboard" && ["factor", "genealogy"].includes(tab)) ? "page" : undefined}
                   aria-disabled={item.backendOnly && !backend ? "true" : undefined}
                   onClick={() => onTabChange(item.id)}
                   title={

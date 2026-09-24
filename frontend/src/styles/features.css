@@ -4,6 +4,19 @@
   color: var(--color-muted);
 }
 
+/* Shared "nothing to show yet" body: a heading, one sentence and the way out. */
+.empty-state {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-3);
+  max-width: 62ch;
+  padding-block: var(--space-5);
+}
+
+.empty-state p {
+  color: var(--color-muted);
+}
+
 .dashboard {
   display: grid;
   gap: var(--space-5);
@@ -1202,6 +1215,9 @@
   padding: var(--space-4);
 }
 
+.save-result-dialog { max-width: calc(100vw - 32px); color: var(--color-ink); }
+.save-result-dialog::backdrop { background: color-mix(in srgb, var(--color-ink) 55%, transparent); }
+
 @media (max-width: 1100px) {
   .formula-workspace__toolbar {
     grid-template-columns: 1fr;
@@ -1698,6 +1714,11 @@ select:focus {
   gap: var(--space-1);
 }
 
+.universe-preset__details small {
+  /* <small> compounds against the container's own 11px and lands below the 9px floor. */
+  font-size: inherit;
+}
+
 .universe-preset__details p {
   margin: var(--space-1) 0;
 }
@@ -2142,6 +2163,15 @@ select:focus {
   display: grid;
   min-width: 0;
   gap: 2px;
+}
+
+.run-readiness__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  /* The action row is not the banner's text column, so it must not be stretched by the grid. */
+  justify-self: end;
 }
 
 .run-readiness strong {
@@ -3593,8 +3623,6 @@ select:focus {
 }
 
 .universe-tree__root {
-  max-height: 420px;
-  overflow: auto;
   border: 1px solid color-mix(in srgb, var(--color-ink) 25%, transparent);
   background: color-mix(in srgb, var(--color-bg) 86%, white);
   padding: var(--space-2);
@@ -3662,11 +3690,6 @@ select:focus {
   box-shadow: 2px 2px 0 var(--color-accent);
 }
 
-.universe-tree__move {
-  max-width: 180px;
-  font-size: var(--type-small);
-}
-
 .universe-tree__menu {
   position: relative;
 }
@@ -3674,8 +3697,18 @@ select:focus {
 .universe-tree__menu > summary {
   list-style: none;
   cursor: pointer;
-  padding: 2px 8px;
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 var(--space-2);
   border: 1px solid color-mix(in srgb, var(--color-ink) 30%, transparent);
+  color: var(--color-muted);
+}
+
+.universe-tree__menu > summary:hover,
+.universe-tree__menu[open] > summary {
+  border-color: var(--color-ink);
+  color: var(--color-ink);
 }
 
 .universe-tree__menu > summary::-webkit-details-marker {
@@ -3774,6 +3807,13 @@ select:focus {
   max-width: 420px;
 }
 
+/* The field spans the grid so its select is not squeezed, but its explanation must not
+   inherit that width: on a wide card it ran to ~160 characters a line, which reads as a
+   wall next to the column-width hints under every other field. */
+.run-execution-field > .hint {
+  max-width: 78ch;
+}
+
 /* Overlap with known factors ------------------------------------------------------------------ */
 .factor-overlap {
   display: grid;
@@ -3798,7 +3838,11 @@ select:focus {
 
 .factor-overlap__verdict strong {
   font-family: var(--font-display);
-  font-size: var(--type-h2);
+  /* --type-h2 put the verdict at 32px, louder than the section heading above it and louder
+     than the numbers it is a label for. It only has to out-rank body text. */
+  font-size: 20px;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
 }
 
 .factor-overlap__verdict.is-ok {
@@ -3855,4 +3899,141 @@ select:focus {
 
 .overlap-bar__fill.is-negative {
   background: var(--color-danger);
+}
+
+/* Signals: using a formula ---------------------------------------------------------------- */
+.signals {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.signals-setup {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-ink) 18%, transparent);
+}
+
+.signals-field {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.signals-field > span {
+  font-size: var(--type-small);
+  letter-spacing: var(--tracking-tiny);
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+
+.signals-field .hint {
+  max-width: 62ch;
+}
+
+.signals-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.signals-intro {
+  max-width: 78ch;
+}
+
+.signals-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.signals-header h3 {
+  color: var(--color-primary);
+}
+
+.signals-header p {
+  max-width: 78ch;
+  color: var(--color-muted);
+}
+
+.signals-evidence {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--type-small);
+  white-space: nowrap;
+}
+
+.signals-evidence.is-ok {
+  border-color: var(--color-ok);
+  color: var(--color-ok);
+}
+
+.signals-evidence.is-warning {
+  border-color: color-mix(in srgb, var(--color-accent) 70%, var(--color-ink));
+  color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink));
+}
+
+/* Tall enough to be worth scrolling, short enough that the summary above stays on screen. */
+.signals-table-scroll {
+  max-height: 520px;
+  overflow: auto;
+  min-width: 0;
+}
+
+.signals-table th:first-child,
+.signals-table td:first-child {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.signals-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--color-soft);
+}
+
+.signals-change {
+  font-family: var(--font-mono);
+  font-size: var(--type-small);
+  white-space: nowrap;
+}
+
+.signals-change.is-up {
+  color: var(--color-ok);
+}
+
+.signals-change.is-down {
+  color: var(--color-danger);
+}
+
+.signals-change.is-flat {
+  color: var(--color-muted);
+}
+
+.signals-up {
+  color: var(--color-ok);
+}
+
+.signals-down {
+  color: var(--color-danger);
+}
+
+.signals-excluded {
+  margin-top: var(--space-2);
+}
+
+@media (max-width: 860px) {
+  .signals-setup {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

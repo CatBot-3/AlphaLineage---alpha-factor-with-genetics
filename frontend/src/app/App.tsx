@@ -1,3 +1,5 @@
+import { saveFormulaSource, listFormulaResults } from "../api/client";
+import type { SignalsWorkspaceState, FactorNode } from "../api/types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   finalizeSessionRound,
@@ -9,7 +11,6 @@ import {
   listSessionFinalizations,
   listSessionRounds,
   listWorkspaces,
-  saveFactor,
   saveWorkspace,
   shutdown,
 } from "../api/client";
@@ -27,6 +28,7 @@ import {
   type WorkspaceSnapshot,
 } from "../api/types";
 import { Dashboard } from "../dashboard/Dashboard";
+import { SignalsPage } from "../signals/SignalsPage";
 import { AgentPage } from "../agent/AgentPage";
 import { ExtendPanel, type ExtendPage } from "../extend/ExtendPanel";
 import { rowsFromUniverse } from "../extend/toUniversePayload";
@@ -34,6 +36,7 @@ import { BestFormulaResultPage } from "../factor/BestFormulaResultPage";
 import type { TreeNodeData } from "../factor/treeToFlow";
 import { Genealogy } from "../genealogy/Genealogy";
 import { LibraryPanel } from "../library/LibraryPanel";
+import { SaveResultDialog } from "../library/SaveResultDialog";
 import { TrainPanel } from "../train/TrainPanel";
 import { useSession } from "../train/useSession";
 import { AppShell, isTab, type Tab } from "./AppShell";
@@ -55,19 +58,23 @@ const PAGE_COPY: Record<Exclude<Tab, "extend">, { title: string; description: st
     description: "Configure a reproducible search, continue the latest checkpoint, and preserve every validation round.",
   },
   dashboard: {
-    title: "Metrics",
+    title: "Results",
     description: "Review validation robustness first, then explicitly evaluate a selected round on the locked holdout.",
   },
   factor: {
-    title: "Best Formula Result",
+    title: "Results · Formula",
     description: "Inspect the immutable formula selected by training and validation evidence for this round.",
   },
   genealogy: {
-    title: "Genealogy",
+    title: "Results · Lineage",
     description: "Trace the selected formula through generations, operations, parents, and retained champions.",
   },
+  signals: {
+    title: "Signals",
+    description: "Apply a frozen formula to the latest cached prices and read the ranking it produces.",
+  },
   library: {
-    title: "Formula Results",
+    title: "Library",
     description: "Review saved training and backtest evidence, or seed a new search from selected results.",
   },
   agent: {
@@ -75,6 +82,14 @@ const PAGE_COPY: Record<Exclude<Tab, "extend">, { title: string; description: st
     description: "Ask about a discovered formula, or put a model to work improving it. It proposes; you decide.",
   },
 };
+
+/** Tabs that only ever render a finished search segment, so all three need the same empty state. */
+type ResultTab = "dashboard" | "factor" | "genealogy";
+const RESULT_TABS: readonly ResultTab[] = ["dashboard", "factor", "genealogy"];
+
+function isResultTab(tab: Tab): tab is ResultTab {
+  return (RESULT_TABS as readonly Tab[]).includes(tab);
+}
 
 function tabFromWorkspace(snapshot: WorkspaceSnapshot | null, mode: string): Tab {
   // Checked rather than trusted: a workspace saved by an older build can name a tab that has
@@ -142,6 +157,30 @@ export function App() {
   );
   const [seedIds, setSeedIds] = useState<string[]>([]);
   const [bestFactorSaved, setBestFactorSaved] = useState(false);
+  const [saveDraft, setSaveDraft] = useState<{source: string; evaluation: string | null; name: string} | null>(null);
+  const [signalsState, setSignalsState] = useState<SignalsWorkspaceState>(initialWorkspace?.ui.signals ?? {});
+  const sourceId = run?.session_id ? `round:${run.session_id}:${selectedRound ?? run.round_index ?? run.segment ?? 0}` : null;
+  useEffect(() => {
+    if (mode !== "app" || !sourceId) { setBestFactorSaved(false); return; }
+    let active = true;
+    listFormulaResults().then(items => {
+      if (active) setBestFactorSaved(items.some(item => {
+        const identity = (item.source && "identity" in item.source ? item.source.identity : undefined) as {id?: string; evaluation_id?: string} | undefined;
+        return identity?.id === sourceId && (identity?.evaluation_id ?? null) === selectedEvaluation;
+      }));
+    }).catch(() => {if (active) setBestFactorSaved(false);});
+    return () => {active = false;};
+  }, [sourceId, selectedEvaluation, mode, tab]);
+  function applyInSignals(source: string, universe?: string | null) {
+    setSignalsState(previous => ({...previous, source, universe: universe ?? previous.universe,
+      snapshotId: undefined, jobId: undefined, execution: undefined, direction: undefined, symbol: undefined}));
+    setTab("signals");
+  }
+  function editFormulaCopy(tree: FactorNode, name: string) {
+    setFormulaDraft({name: "formula_copy", display_name: `${name} copy`, description: "Editable copy of a frozen formula.",
+      body: tree, inputs: [], arg_types: [], out_type: "signal", category: "custom", activeMode: "visual", loadedName: null, loadedRevision: null});
+    setExtendPage("formula"); setTab("extend");
+  }
   const [quitOpen, setQuitOpen] = useState(false);
   const [shutDown, setShutDown] = useState(false);
   const [extendPage, setExtendPage] = useState<ExtendPage>("universe");
@@ -167,6 +206,7 @@ export function App() {
         operatorDraft,
         ui: {
           selectedTab: tab,
+          signals: signalsState,
           selectedFactorNode: selectedNode
             ? { name: selectedNode.name, value: selectedNode.value }
             : null,
@@ -177,6 +217,7 @@ export function App() {
       }),
     [
       formulaDraft,
+      signalsState,
       operatorDraft,
       recoveredFormulaDrafts,
       run,
@@ -191,6 +232,7 @@ export function App() {
 
   const applyWorkspace = useCallback((snapshot: WorkspaceSnapshot) => {
     setRun(snapshot.run);
+    setSignalsState(snapshot.ui.signals ?? {});
     setTab(isTab(snapshot.ui.selectedTab) ? snapshot.ui.selectedTab : "dashboard");
     setSelectedNode(applyNode(snapshot.ui.selectedFactorNode));
     setSelectedLineage(snapshot.ui.selectedLineage ?? null);
@@ -391,8 +433,7 @@ export function App() {
         setSelectedRound(roundIndex ?? null);
       }
     }
-    setBestFactorSaved(false); // a fresh best formula result is not yet in the library
-    setTab("dashboard");
+    setBestFactorSaved(false); // Reconciled against stored source identity by the effect above.
     setStatus("Validation round completed - the locked holdout remains unopened");
   }
 
@@ -547,17 +588,8 @@ export function App() {
 
   async function saveLineageNode(node: LineageNode) {
     try {
-      await saveFactor({
-        name: `gen${node.generation}-#${node.id}`,
-        tree: node.tree,
-        metrics: typeof node.fitness === "number" ? { fitness: node.fitness } : {},
-        provenance: {
-          session_id: run?.session_id,
-          generation: node.generation,
-          cumulative_trials: run?.cumulative_trials,
-          test_reads: run?.test_reads,
-        },
-      });
+      if (!run?.session_id) { setStatus("Reopen the original session to save this node."); return; }
+      await saveFormulaSource(`lineage:${run.session_id}:${selectedRound ?? run.round_index ?? 0}:${node.id}`, `gen${node.generation}-#${node.id}`);
       setStatus(`Saved gen${node.generation}-#${node.id} to library`);
     } catch (e) {
       setStatus(String(e));
@@ -566,32 +598,9 @@ export function App() {
 
   async function saveBestFactor() {
     if (!run) return;
-    try {
-      await saveFactor({
-        name: "best formula result",
-        tree: parseFactor(run.best_factor),
-        metrics: run.report
-          ? {
-              oos_ic: run.report.oos_ic,
-              deflated_sharpe: run.report.deflated_sharpe,
-            }
-          : {
-              validation_median_ic:
-                run.selection?.median_oriented_ic ?? run.selection?.validation_fitness ?? 0,
-              validation_objective:
-                run.selection?.final_objective ?? run.selection?.validation_fitness ?? 0,
-            },
-        provenance: {
-          session_id: run.session_id,
-          cumulative_trials: run.cumulative_trials,
-          test_reads: run.test_reads,
-        },
-      });
-      setBestFactorSaved(true);
-      setStatus("Saved Best Formula Result to the library");
-    } catch (e) {
-      setStatus(String(e));
-    }
+    if (!sourceId) { setStatus("Reopen the original session to save its complete research context."); return; }
+    setSaveDraft({source: sourceId, evaluation: selectedEvaluation,
+      name: `${sessionController.state?.name ?? "Session"} · Round ${(selectedRound ?? run.round_index ?? 0) + 1}`});
   }
 
   function openBestFactorCopy() {
@@ -698,6 +707,19 @@ export function App() {
       }}
     >
       <section className="app-page">
+        {saveDraft && <SaveResultDialog suggestedName={saveDraft.name} onClose={() => setSaveDraft(null)} onSave={async name => {
+          await saveFormulaSource(saveDraft.source, name, saveDraft.evaluation);
+          if (sourceId === saveDraft.source && selectedEvaluation === saveDraft.evaluation) setBestFactorSaved(true);
+          setStatus("Saved result to Library");
+        }}/>}
+        {(searchRunning || run) && <div className="workflow-status" role="status">
+          <span>{searchRunning ? `Training · ${sessionController.state?.job?.progress?.phase ?? "working"}` : status ?? "Result available"}</span>
+          <button className="ghost" onClick={() => setTab(searchRunning ? "train" : "dashboard")}>{searchRunning ? "View progress" : "Review result"}</button>
+        </div>}
+        {isResultTab(tab) && <nav className="result-tabs" aria-label="Result views">
+          {([["dashboard", "Overview"], ["factor", "Formula"], ["genealogy", "Lineage"]] as const).map(([id, title]) => <button className="ghost" key={id} aria-current={tab === id ? "page" : undefined} onClick={() => setTab(id)}>{title}</button>)}
+          {run && mode === "app" && <><button className="primary-action" disabled={bestFactorSaved} onClick={() => void saveBestFactor()}>{bestFactorSaved ? "Saved to Library" : "Save to Library"}</button><button className="ghost" disabled={!sourceId} onClick={() => sourceId && applyInSignals(selectedEvaluation && run.session_id ? `evaluation:${run.session_id}:${selectedEvaluation}` : sourceId, run.context?.universe)}>Apply in Signals</button></>}
+        </nav>}
         {tab !== "extend" && (
           <PageHeader
             // Defence in depth. `tab` is validated on the way in, so a miss here means a tab was
@@ -718,6 +740,24 @@ export function App() {
         {loading && !run && <p className="surface-message">Loading...</p>}
 
         <ErrorBoundary key={tab}>
+        {!run && !loading && isResultTab(tab) && (
+          // Without this the three result tabs rendered their heading over an empty page, which
+          // reads as a broken screen rather than "there is nothing to show yet".
+          <section className="view-card" data-view="empty">
+            <div className="view-body empty-state" data-testid="no-run-yet">
+              <h3>No search results yet</h3>
+              <p>
+                {PAGE_COPY[tab].title} shows the evidence from a finished search segment.
+                Run one on the Train tab, or reopen a saved workspace from the settings menu.
+              </p>
+              {mode === "app" && (
+                <button type="button" className="primary-action" onClick={() => setTab("train")}>
+                  Go to Train
+                </button>
+              )}
+            </div>
+          </section>
+        )}
         {run && (tab === "dashboard" || tab === "factor" || tab === "genealogy") && (
           <RoundNavigator
             rounds={rounds}
@@ -727,6 +767,10 @@ export function App() {
             onContinue={tab === "dashboard" && mode === "app" ? () => setTab("train") : undefined}
           />
         )}
+        {run && isResultTab(tab) && run.selection?.training_metrics.novelty_multiplier !== undefined && <p className="surface-message">
+          {run.selection.training_metrics.novelty_measured === 0 ? "Novelty unmeasured: insufficient overlapping training observations." : (run.selection.training_metrics.novelty_correlation ?? 0) >= .98 ? "Familiar formula: near-identical to a frozen reference." : (run.selection.training_metrics.novelty_correlation ?? 0) >= .7 ? "Strong overlap with a known formula." : "Training novelty screening completed."}
+          {" "}Raw training IC {run.selection.training_metrics.ic?.toFixed(4)} · novelty deduction {run.selection.training_metrics.novelty_penalty?.toFixed(4)} · multiplier {run.selection.training_metrics.novelty_multiplier.toFixed(2)}.
+        </p>}
         {run && tab === "dashboard" && evaluations.length > 0 && (
           <EvaluationNavigator
             evaluations={evaluations}
@@ -799,10 +843,18 @@ export function App() {
           </section>
         )}
 
+        {tab === "signals" && (
+          <section className="view-card" data-view="signals">
+            <div className="view-body">
+              <SignalsPage canRun={mode === "app"} workspace={signalsState} onWorkspaceChange={setSignalsState} />
+            </div>
+          </section>
+        )}
+
         {tab === "library" && (
           <section className="view-card" data-view="library">
             <div className="view-body">
-              <LibraryPanel onSeed={startSeededSession} />
+              <LibraryPanel onSeed={startSeededSession} onApply={applyInSignals} onEdit={editFormulaCopy} />
             </div>
           </section>
         )}
