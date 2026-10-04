@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable, MutableMapping, Sequence
+from contextlib import ExitStack
 from typing import Any
 
 from alphalineage.api.resources import TRAINING_SCHEDULER, ResolvedResources, TrainingScheduler
@@ -130,9 +131,7 @@ def build_report(
     if strategy_specs is not None and scheme is not None:
         raise ValueError("pass either scheme or strategy_specs, not both")
     if strategy_specs is None:
-        selected_scheme: WeightingScheme = (
-            scheme if scheme is not None else QuantileLongShort()
-        )
+        selected_scheme: WeightingScheme = scheme if scheme is not None else QuantileLongShort()
         quantile = (
             float(selected_scheme.quantile)
             if isinstance(selected_scheme, QuantileLongShort)
@@ -203,9 +202,7 @@ def build_report(
                 {
                     "strategy_id": spec.id,
                     "spec": spec.to_dict(),
-                    "role": (
-                        "primary" if spec.id == resolved_primary_id else "comparison"
-                    ),
+                    "role": ("primary" if spec.id == resolved_primary_id else "comparison"),
                     "oos_backtest": tested,
                 }
             )
@@ -255,9 +252,7 @@ def build_report(
         payload["strategy_results"] = bundle["strategy_results"]
         payload["primary_strategy_id"] = bundle["primary_strategy_id"]
         payload["portfolio_schema_version"] = bundle["portfolio_schema_version"]
-        primary_health = dict(
-            payload["oos_backtest"].get("portfolio_health") or {}
-        )
+        primary_health = dict(payload["oos_backtest"].get("portfolio_health") or {})
         if not bool(primary_health.get("valid", False)):
             payload["significant"] = False
     return payload
@@ -277,134 +272,144 @@ def run_search(
     scheduler: TrainingScheduler = TRAINING_SCHEDULER,
 ) -> dict[str, Any]:
     """Run a GP search and return the best factor, its OOS/deflated verdict, and the lineage."""
-    split = time_split(
-        panel.dates,
-        train=train,
-        valid=valid,
-        embargo=embargo,
-        horizon=label_span(config.horizon, config.execution),
-    )
-    train_panel = Panel({f: df.loc[df.index.isin(split.train)] for f, df in panel.fields.items()})
+    with ExitStack() as training_contexts:
+        split = time_split(
+            panel.dates,
+            train=train,
+            valid=valid,
+            embargo=embargo,
+            horizon=label_span(config.horizon, config.execution),
+        )
+        train_panel = Panel(
+            {f: df.loc[df.index.isin(split.train)] for f, df in panel.fields.items()}
+        )
 
-    store = LineageStore()
-    recorder: Any = store
-    if progress is not None:  # forward recorder calls through the live snapshot (A2)
-        progress.attach(store)
-        progress.set_target(config.generations)
-        recorder = progress
+        store = LineageStore()
+        recorder: Any = store
+        if progress is not None:  # forward recorder calls through the live snapshot (A2)
+            progress.attach(store)
+            progress.set_target(config.generations)
+            recorder = progress
 
-    lease_context = scheduler.acquire(resources, cancel=stop) if resources is not None else None
-    started = time.monotonic()
-    if progress is not None and hasattr(progress, "set_phase"):
-        progress.set_phase("queued" if resources is not None else "initializing")
-
-    def execute(
-        lease: Any = None,
-    ) -> tuple[GP, ValidationSelection, dict[str, Any], dict[str, float]]:
-        workers = int(lease.max_workers) if lease is not None else 1
-        memory_budget = int(lease.memory_budget_bytes) if lease is not None else None
+        lease_context = scheduler.acquire(resources, cancel=stop) if resources is not None else None
+        started = time.monotonic()
         if progress is not None and hasattr(progress, "set_phase"):
-            progress.set_phase("initializing")
-        training_started = time.monotonic()
-        gp = GP(
-            config,
-            train_panel,
-            recorder=recorder,
-            allowed_operators=allowed_operators,
-            workers=workers,
-            memory_budget_bytes=memory_budget,
-        )
-        gp.run(stop=stop)
-        training_seconds = time.monotonic() - training_started
+            progress.set_phase("queued" if resources is not None else "initializing")
 
-        if progress is not None and hasattr(progress, "set_phase"):
-            progress.set_phase("validating")
-        report_started = time.monotonic()
-        fwd = forward_returns(panel, config.horizon, config.execution)
-        searched = gp.searched_individuals()
-        selection = select_validation_candidate(
-            searched,
-            panel,
-            fwd,
-            split.valid,
-            method=config.ic_method,
-            parsimony=config.parsimony,
-            complexity_penalty_mode=config.complexity_penalty_mode,
-            complexity_penalty_value=config.resolved_complexity_penalty_value,
-            max_nodes=config.max_nodes,
-            validation_folds=config.validation_folds,
-            fold_embargo=embargo,
-            min_names=config.min_names,
-            workers=workers,
-            memory_budget_bytes=memory_budget,
-        )
-        gp.record_formula_validation_scores(selection.candidate_validation_scores)
-        trials = orient_training_candidates(searched)
-        report_progress = (
-            progress.set_report_progress
-            if progress is not None and hasattr(progress, "set_report_progress")
-            else None
-        )
-
-        def on_finalizing() -> None:
+        def execute(
+            lease: Any = None,
+        ) -> tuple[GP, ValidationSelection, dict[str, Any], dict[str, float]]:
+            workers = int(lease.max_workers) if lease is not None else 1
+            memory_budget = int(lease.memory_budget_bytes) if lease is not None else None
             if progress is not None and hasattr(progress, "set_phase"):
-                progress.set_phase("finalizing")
+                progress.set_phase("initializing")
+            training_started = time.monotonic()
+            gp = training_contexts.enter_context(
+                GP(
+                    config,
+                    train_panel,
+                    recorder=recorder,
+                    allowed_operators=allowed_operators,
+                    workers=workers,
+                    memory_budget_bytes=memory_budget,
+                )
+            )
+            gp.run(stop=stop)
+            training_seconds = time.monotonic() - training_started
 
-        report_dict = build_report(
-            selection.oriented_tree,
-            trials,
-            split,
-            panel,
-            searched_trials=gp.trial_count,
-            min_names=config.min_names,
-            horizon=config.horizon,
-            execution=config.execution,
-            ic_method=config.ic_method,
-            n_user_operators=user_operator_count(allowed_operators),
-            progress=report_progress,
-            # A stop that ended evolution still receives the last complete population's report.
-            # A new stop requested during validation cancels before the locked test is opened.
-            stop=None if gp.termination_reason == "user_stopped" else stop,
-            on_finalizing=on_finalizing,
-            fwd=fwd,
-        )
-        report_dict["validation_passed"] = selection.validated
-        report_dict["validation_reason"] = selection.reason
-        if not selection.validated:
-            report_dict["significant"] = False
-        report_seconds = time.monotonic() - report_started
-        return gp, selection, report_dict, {
-            "training_seconds": training_seconds,
-            "reporting_seconds": report_seconds,
-            "total_seconds": time.monotonic() - started,
+            if progress is not None and hasattr(progress, "set_phase"):
+                progress.set_phase("validating")
+            report_started = time.monotonic()
+            fwd = forward_returns(panel, config.horizon, config.execution)
+            searched = gp.searched_individuals()
+            selection = select_validation_candidate(
+                searched,
+                panel,
+                fwd,
+                split.valid,
+                method=config.ic_method,
+                parsimony=config.parsimony,
+                complexity_penalty_mode=config.complexity_penalty_mode,
+                complexity_penalty_value=config.resolved_complexity_penalty_value,
+                max_nodes=config.max_nodes,
+                validation_folds=config.validation_folds,
+                fold_embargo=embargo,
+                min_names=config.min_names,
+                workers=workers,
+                memory_budget_bytes=memory_budget,
+            )
+            gp.record_formula_validation_scores(selection.candidate_validation_scores)
+            trials = orient_training_candidates(searched)
+            report_progress = (
+                progress.set_report_progress
+                if progress is not None and hasattr(progress, "set_report_progress")
+                else None
+            )
+
+            def on_finalizing() -> None:
+                if progress is not None and hasattr(progress, "set_phase"):
+                    progress.set_phase("finalizing")
+
+            report_dict = build_report(
+                selection.oriented_tree,
+                trials,
+                split,
+                panel,
+                searched_trials=gp.trial_count,
+                min_names=config.min_names,
+                horizon=config.horizon,
+                execution=config.execution,
+                ic_method=config.ic_method,
+                n_user_operators=user_operator_count(allowed_operators),
+                progress=report_progress,
+                # A stop that ended evolution still receives the last complete population's report.
+                # A new stop requested during validation cancels before the locked test is opened.
+                stop=None if gp.termination_reason == "user_stopped" else stop,
+                on_finalizing=on_finalizing,
+                fwd=fwd,
+            )
+            report_dict["validation_passed"] = selection.validated
+            report_dict["validation_reason"] = selection.reason
+            if not selection.validated:
+                report_dict["significant"] = False
+            report_seconds = time.monotonic() - report_started
+            return (
+                gp,
+                selection,
+                report_dict,
+                {
+                    "training_seconds": training_seconds,
+                    "reporting_seconds": report_seconds,
+                    "total_seconds": time.monotonic() - started,
+                },
+            )
+
+        if lease_context is None:
+            gp, selection, report_dict, timings = execute()
+        else:
+            with lease_context as lease:
+                gp, selection, report_dict, timings = execute(lease)
+
+        lineage_report = {key: value for key, value in report_dict.items() if key != "oos_backtest"}
+        store.metadata = {
+            "best_factor": to_dict(selection.oriented_tree),
+            "selected_source_factor": to_dict(selection.source_tree),
+            "selection": selection.metadata(),
+            "report": lineage_report,
         }
+        if progress is not None and hasattr(progress, "set_phase"):
+            progress.set_phase("done")
 
-    if lease_context is None:
-        gp, selection, report_dict, timings = execute()
-    else:
-        with lease_context as lease:
-            gp, selection, report_dict, timings = execute(lease)
-
-    lineage_report = {key: value for key, value in report_dict.items() if key != "oos_backtest"}
-    store.metadata = {
-        "best_factor": to_dict(selection.oriented_tree),
-        "selected_source_factor": to_dict(selection.source_tree),
-        "selection": selection.metadata(),
-        "report": lineage_report,
-    }
-    if progress is not None and hasattr(progress, "set_phase"):
-        progress.set_phase("done")
-
-    return {
-        "best_factor": to_json(selection.oriented_tree),
-        "report": report_dict,
-        "oos_backtest": report_dict.get("oos_backtest"),
-        "generations": gp.generation,
-        "history": gp.history,
-        "lineage": store.to_dict(),
-        "resources": resources.to_dict() if resources is not None else None,
-        "timings": timings,
-        "context": report_context(split, config, embargo=embargo),
-        "selection": selection.metadata(),
-        "termination_reason": gp.termination_reason,
-    }
+        return {
+            "best_factor": to_json(selection.oriented_tree),
+            "report": report_dict,
+            "oos_backtest": report_dict.get("oos_backtest"),
+            "generations": gp.generation,
+            "history": gp.history,
+            "lineage": store.to_dict(),
+            "resources": resources.to_dict() if resources is not None else None,
+            "timings": timings,
+            "context": report_context(split, config, embargo=embargo),
+            "selection": selection.metadata(),
+            "termination_reason": gp.termination_reason,
+        }

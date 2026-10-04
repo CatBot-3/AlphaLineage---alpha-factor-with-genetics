@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -82,41 +83,44 @@ def measurement(symbols, scenario, mode, count, catalog=False):
     monitor = threading.Thread(target=sample, daemon=True)
     monitor.start()
     started = time.perf_counter()
-    gp = GP(
-        GPConfig(population_size=count, generations=1, max_nodes=20, novelty_mode=mode),
-        train,
-        workers=1,
-        memory_budget_bytes=512 * 1024 * 1024,
-        novelty_state={"references": refs},
-    )
-    gp._individuals(trees, phase="initializing")
-    trained = time.perf_counter()
-    candidates = gp.validation_candidates()
-    select_validation_candidate(
-        candidates,
-        panel,
-        forward_returns(panel),
-        dates[340:],
-        min_names=5,
-        validation_folds=3,
-        fold_embargo=1,
-    )
-    elapsed = time.perf_counter() - started
-    done.set()
-    monitor.join()
-    return {
-        "symbols": symbols,
-        "scenario": scenario,
-        "mode": mode,
-        "reference_count": len(refs),
-        "candidates": count,
-        "label_evaluations": gp.trial_count,
-        "structural_skips": gp.structural_skips,
-        "validation_candidates": len(candidates),
-        "training_seconds": trained - started,
-        "elapsed_seconds": elapsed,
-        "peak_rss_mb": max(rss, default=0) / 1024**2,
-    }
+    with ExitStack() as training_contexts:
+        gp = training_contexts.enter_context(
+            GP(
+                GPConfig(population_size=count, generations=1, max_nodes=20, novelty_mode=mode),
+                train,
+                workers=1,
+                memory_budget_bytes=512 * 1024 * 1024,
+                novelty_state={"references": refs},
+            )
+        )
+        gp._individuals(trees, phase="initializing")
+        trained = time.perf_counter()
+        candidates = gp.validation_candidates()
+        select_validation_candidate(
+            candidates,
+            panel,
+            forward_returns(panel),
+            dates[340:],
+            min_names=5,
+            validation_folds=3,
+            fold_embargo=1,
+        )
+        elapsed = time.perf_counter() - started
+        done.set()
+        monitor.join()
+        return {
+            "symbols": symbols,
+            "scenario": scenario,
+            "mode": mode,
+            "reference_count": len(refs),
+            "candidates": count,
+            "label_evaluations": gp.trial_count,
+            "structural_skips": gp.structural_skips,
+            "validation_candidates": len(candidates),
+            "training_seconds": trained - started,
+            "elapsed_seconds": elapsed,
+            "peak_rss_mb": max(rss, default=0) / 1024**2,
+        }
 
 
 def main():

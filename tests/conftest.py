@@ -18,6 +18,7 @@ def temp_data_dir(tmp_path, monkeypatch):
     """Redirect the local data store to a per-test temp directory."""
     data_dir = tmp_path / "data_cache"
     monkeypatch.setenv("ALPHALINEAGE_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("ALPHALINEAGE_TEMP_DIR", raising=False)
     return data_dir
 
 

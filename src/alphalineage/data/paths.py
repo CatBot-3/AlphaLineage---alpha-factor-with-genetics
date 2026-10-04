@@ -30,6 +30,17 @@ def data_dir() -> Path:
     return Path(override) if override else Path.cwd() / _DEFAULT_DIRNAME
 
 
+def temporary_dir() -> Path:
+    """Application scratch storage; never silently fall back to the system temp drive."""
+    override = os.environ.get("ALPHALINEAGE_TEMP_DIR")
+    root = (Path(override) if override else data_dir() / "tmp").resolve()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OSError(f"Cannot create AlphaLineage temporary storage at {root}: {exc}") from exc
+    return root
+
+
 def prices_dir() -> Path:
     return data_dir() / "prices"
 

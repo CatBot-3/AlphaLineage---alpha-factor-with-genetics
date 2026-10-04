@@ -156,6 +156,16 @@ the API and web app at
 [http://localhost:8000](http://localhost:8000), and opens a browser. Use **Quit** in the application
 header or press `Ctrl+C` in the launcher terminal to stop it.
 
+Application scratch files live in `data_cache/tmp` by default. The Windows launcher sets
+`TEMP`, `TMP`, and `TMPDIR` before starting Python or frontend tools, so this checkout keeps
+those temporary files on F:. Set `ALPHALINEAGE_TEMP_DIR` to choose another writable directory.
+Novelty stores screening samples and expressions rather than full panels for every trial. Full
+rank panels are rebuilt as needed and use an 8 GiB cache that evicts old entries and leaves
+1 GiB free for essential writes; insufficient cache space falls back to one panel in RAM.
+Novelty mappings are closed before their scratch folder is removed. Training sessions save an
+atomic recovery checkpoint after initialization and each completed generation, including the
+matching lineage and data fingerprint; interrupted generations are retried from the last save.
+
 **After pulling changes, reinstall.** New releases sometimes add a Python dependency, and an
 existing `.venv` will not pick it up on its own. Run the install again with the interpreter the
 launcher uses:

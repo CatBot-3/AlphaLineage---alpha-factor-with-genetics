@@ -57,6 +57,67 @@ def _poll_job(client: TestClient, job_id: str, *, timeout: float = 60.0) -> dict
     return payload
 
 
+def test_interrupted_training_recovers_committed_population_and_matching_lineage(
+    client, signal_panel, monkeypatch
+):
+    import json
+
+    from alphalineage.core.gp import GP, GPConfig
+    from alphalineage.core.panel import Panel
+    from alphalineage.library.store import LineageStore
+
+    step = GP._step
+
+    def interrupt_next_generation(engine, **kwargs):
+        if engine.generation == 1:
+            raise RuntimeError("simulated process interruption")
+        return step(engine, **kwargs)
+
+    monkeypatch.setattr(GP, "_step", interrupt_next_generation)
+    config = {**_SMALL, "novelty_mode": "balanced"}
+    created = client.post(
+        "/sessions", json={"name": "recovery", "universe": "sp500-lite", "config": config}
+    ).json()
+    failed = _poll_job(client, created["job_id"])
+    assert failed["status"] == "failed"
+    session_id = created["session_id"]
+    directory = api_app.sessions.session_dir(session_id)
+    snapshot = json.loads((directory / "checkpoint.json").read_text(encoding="utf-8"))
+    assert snapshot["generation"] == 1
+    lineage = snapshot["session_state"]["lineage"]
+    assert max(node["generation"] for node in lineage["nodes"]) == 1
+    assert not (directory / "lineage.json").exists()
+    assert list((directory.parent.parent / "tmp").iterdir()) == []
+
+    monkeypatch.setattr(GP, "_step", step)
+    continued = client.post(f"/sessions/{session_id}/continue", json={"generations": 1})
+    assert continued.status_code == 200, continued.text
+    assert _poll_job(client, continued.json()["job_id"])["status"] == "done"
+    recovered = json.loads((directory / "checkpoint.json").read_text(encoding="utf-8"))
+    assert recovered["generation"] == 2
+    store = LineageStore.from_dict(recovered["session_state"]["lineage"])
+    assert len(store._current_gen_ids) == len(recovered["population"])
+    assert all(parent < node.id for node in store.nodes for parent in node.parents)
+
+    session = api_app.sessions.load_session(session_id)
+    panel = signal_panel[0]
+    split = api_app.sessions.split_from_boundaries(
+        panel.dates, api_app.sessions.Boundaries.from_dict(session["boundaries"])
+    )
+    training = Panel({name: frame.loc[split.train] for name, frame in panel.fields.items()})
+    settings = GPConfig.from_dict(session["config"])
+    allowed = api_app._allowed_operators(
+        settings, {item["name"] for item in session["formula_revisions"]}, set()
+    )
+    with GP(
+        settings, training, allowed_operators=allowed, novelty_state=session["novelty"]
+    ) as straight:
+        straight.run()
+        expected = straight.checkpoint_state()
+    for field in ("population", "history", "rng_state", "trials", "score_cache", "novelty"):
+        assert recovered[field] == expected[field]
+
+
 def _create(client: TestClient, **overrides) -> tuple[str, dict]:
     body = {"name": "s", "universe": "sp500-lite", "config": _SMALL, **overrides}
     created = client.post("/sessions", json=body)
@@ -165,8 +226,7 @@ def test_session_create_run_complete(client):
     compatibility_plan_id = finalized["result"]["strategy_plan_id"]
     assert compatibility_plan_id.startswith("compat-q20-r0-")
     compatibility_plan = client.get(
-        f"/sessions/{session_id}/rounds/0/finalization-plans/"
-        f"{compatibility_plan_id}"
+        f"/sessions/{session_id}/rounds/0/finalization-plans/{compatibility_plan_id}"
     ).json()
     assert compatibility_plan["source"] == "compatibility_default"
     assert compatibility_plan["strategies"] == [
@@ -202,9 +262,7 @@ def test_completed_validation_rounds_are_immutable_with_latest_alias(client):
     assert first_round["report"] is None
     assert first_round["selection"] == first["result"]["selection"]
 
-    continued = client.post(
-        f"/sessions/{session_id}/continue", json={"generations": 1}
-    ).json()
+    continued = client.post(f"/sessions/{session_id}/continue", json={"generations": 1}).json()
     second = _poll_job(client, continued["job_id"])
     assert second["status"] == "done", second
 
@@ -234,9 +292,7 @@ def test_completed_validation_rounds_are_immutable_with_latest_alias(client):
     assert [item["same_holdout_read_index"] for item in finalizations] == [1, 2]
 
 
-def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
-    client, monkeypatch
-):
+def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(client, monkeypatch):
     session_id, _ = _create(client)
     real_compare = api_app.sessions.compare_validation_strategies
 
@@ -271,8 +327,7 @@ def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
     completed = _poll_job(client, handle["job_id"])
     assert completed["status"] == "done", completed
     detail = client.get(
-        f"/sessions/{session_id}/rounds/0/strategy-comparisons/"
-        f"{handle['comparison_id']}"
+        f"/sessions/{session_id}/rounds/0/strategy-comparisons/{handle['comparison_id']}"
     ).json()
     assert detail["status"] == "done"
     assert [item["strategy_id"] for item in detail["strategy_results"]] == [
@@ -293,8 +348,7 @@ def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
     plan = plan_response.json()
     assert plan["primary_strategy_id"] == "rank"
     loaded_plan = client.get(
-        f"/sessions/{session_id}/rounds/0/finalization-plans/"
-        f"{plan['strategy_plan_id']}"
+        f"/sessions/{session_id}/rounds/0/finalization-plans/{plan['strategy_plan_id']}"
     ).json()
     assert loaded_plan == plan
 
@@ -314,9 +368,7 @@ def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
         "q20",
         "rank",
     ]
-    primary = next(
-        item for item in artifact["strategy_results"] if item["role"] == "primary"
-    )
+    primary = next(item for item in artifact["strategy_results"] if item["role"] == "primary")
     assert artifact["oos_backtest"] == primary["oos_backtest"]
     assert artifact["report"]["n_trials"] % 2 == 0
 
@@ -326,20 +378,14 @@ def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
 
     blocked = client.post(
         f"/sessions/{session_id}/rounds/0/strategy-comparisons",
-        json={
-            "strategies": [
-                {"id": "q25", "scheme": "quantile_ls", "quantile": 0.25}
-            ]
-        },
+        json={"strategies": [{"id": "q25", "scheme": "quantile_ls", "quantile": 0.25}]},
     )
     assert blocked.status_code == 409
     assert "confirm_repeat=true" in blocked.text
     confirmed = client.post(
         f"/sessions/{session_id}/rounds/0/strategy-comparisons",
         json={
-            "strategies": [
-                {"id": "q25", "scheme": "quantile_ls", "quantile": 0.25}
-            ],
+            "strategies": [{"id": "q25", "scheme": "quantile_ls", "quantile": 0.25}],
             "confirm_repeat": True,
         },
     )
@@ -347,8 +393,7 @@ def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
     confirmed_job = _poll_job(client, confirmed.json()["job_id"])
     assert confirmed_job["status"] == "done", confirmed_job
     confirmed_detail = client.get(
-        f"/sessions/{session_id}/rounds/0/strategy-comparisons/"
-        f"{confirmed.json()['comparison_id']}"
+        f"/sessions/{session_id}/rounds/0/strategy-comparisons/{confirmed.json()['comparison_id']}"
     ).json()
     assert confirmed_detail["evidence_status"] == "post_holdout_adaptive"
     assert confirmed_detail["prior_holdout_reads"] == 1
@@ -356,9 +401,7 @@ def test_strategy_comparison_plan_and_multistrategy_finalization_are_pinned(
 
 def test_round_lineage_is_truncated_at_its_generation_boundary(client):
     session_id, _ = _create(client)
-    continued = client.post(
-        f"/sessions/{session_id}/continue", json={"generations": 1}
-    ).json()
+    continued = client.post(f"/sessions/{session_id}/continue", json={"generations": 1}).json()
     assert _poll_job(client, continued["job_id"])["status"] == "done"
 
     first = client.get(f"/sessions/{session_id}/lineage?round=0")
@@ -398,9 +441,7 @@ def test_legacy_latest_result_is_exposed_and_pinned_before_continue(client):
     assert before[0]["legacy"] is True
     assert client.get(f"/sessions/{session_id}/rounds/0").json()["round_index"] == 0
 
-    continued = client.post(
-        f"/sessions/{session_id}/continue", json={"generations": 1}
-    ).json()
+    continued = client.post(f"/sessions/{session_id}/continue", json={"generations": 1}).json()
     assert _poll_job(client, continued["job_id"])["status"] == "done"
     after = client.get(f"/sessions/{session_id}/rounds").json()
     assert [item["index"] for item in after] == [0, 1]
@@ -431,9 +472,7 @@ def test_contaminated_legacy_report_is_viewable_but_requires_restart(client):
     detail = client.get(f"/sessions/{session_id}/rounds/0").json()
     assert detail["validity"] == "invalid_legacy_semantics"
 
-    continued = client.post(
-        f"/sessions/{session_id}/continue", json={"generations": 1}
-    )
+    continued = client.post(f"/sessions/{session_id}/continue", json={"generations": 1})
     assert continued.status_code == 409
     assert "Restart with the same setup" in continued.json()["detail"]
 
@@ -799,9 +838,7 @@ def test_report_summary_cache_roundtrip_and_context_invalidation(signal_panel, t
     session = {"universe": "cache-test", "as_of": "2019-12-31"}
     config = GPConfig(population_size=10, generations=1, horizon=1)
     context = sessions._report_cache_context(session, panel, boundaries, config)
-    summary = summarize_report_returns(
-        pd.Series(0.001, index=panel.dates), panel.dates, n_blocks=4
-    )
+    summary = summarize_report_returns(pd.Series(0.001, index=panel.dates), panel.dates, n_blocks=4)
     path = tmp_path / "report_stats.json"
 
     sessions._save_report_cache(path, context, {"factor": summary})

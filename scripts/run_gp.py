@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -89,9 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     if not cpp.backend_enabled():
         fallback_reason = "native evaluator unavailable or disabled"
     elif not accelerated:
-        fallback_reason = (
-            f"{gp_config.ic_method} scoring uses the parity-safe Python evaluator"
-        )
+        fallback_reason = f"{gp_config.ic_method} scoring uses the parity-safe Python evaluator"
     else:
         fallback_reason = None
     resources = resolve_resources(
@@ -128,79 +127,82 @@ def main(argv: list[str] | None = None) -> int:
     )
     if resources.fallback_reason:
         print(f"resource fallback: {resources.fallback_reason}")
-    with TRAINING_SCHEDULER.acquire(resources) as lease:
-        if args.resume and ckpt and Path(ckpt).exists():
-            gp = GP.from_checkpoint(
-                ckpt,
-                train_panel,
-                workers=lease.max_workers,
-                memory_budget_bytes=lease.memory_budget_bytes,
+    with ExitStack() as training_contexts:
+        with TRAINING_SCHEDULER.acquire(resources) as lease:
+            if args.resume and ckpt and Path(ckpt).exists():
+                gp = training_contexts.enter_context(
+                    GP.from_checkpoint(
+                        ckpt,
+                        train_panel,
+                        workers=lease.max_workers,
+                        memory_budget_bytes=lease.memory_budget_bytes,
+                    )
+                )
+                print(f"resumed from {ckpt} at generation {gp.generation}")
+            else:
+                gp = training_contexts.enter_context(
+                    GP(
+                        gp_config,
+                        train_panel,
+                        workers=lease.max_workers,
+                        memory_budget_bytes=lease.memory_budget_bytes,
+                    )
+                )
+            best = gp.run(checkpoint_path=ckpt)
+        for row in gp.history:
+            print(
+                f"  gen {int(row['generation']):>3}  best={row['best_fitness']:.4f}  "
+                f"mean={row['mean_fitness']:.4f}  ic={row['best_ic']:.4f}"
             )
-            print(f"resumed from {ckpt} at generation {gp.generation}")
-        else:
-            gp = GP(
-                gp_config,
-                train_panel,
-                workers=lease.max_workers,
-                memory_budget_bytes=lease.memory_budget_bytes,
-            )
-        best = gp.run(checkpoint_path=ckpt)
-    for row in gp.history:
-        print(
-            f"  gen {int(row['generation']):>3}  best={row['best_fitness']:.4f}  "
-            f"mean={row['mean_fitness']:.4f}  ic={row['best_ic']:.4f}"
+
+        trials = [ind.tree for ind in gp.population]
+        bt = cfg.get("backtest", {})
+        costs = TransactionCostModel(
+            commission_bps=float(bt.get("commission_bps", 1.0)),
+            slippage_bps=float(bt.get("slippage_bps", 5.0)),
         )
+        scheme = QuantileLongShort(float(bt.get("quantile", 0.2)))
 
-    trials = [ind.tree for ind in gp.population]
-    bt = cfg.get("backtest", {})
-    costs = TransactionCostModel(
-        commission_bps=float(bt.get("commission_bps", 1.0)),
-        slippage_bps=float(bt.get("slippage_bps", 5.0)),
-    )
-    scheme = QuantileLongShort(float(bt.get("quantile", 0.2)))
-
-    print("\nbest factor:", best.tree)
-    # ``build_report`` owns the sole LockedTestSet unlock and reuses that same factor evaluation
-    # for the rich holdout report. Do not inspect or compare the test split before this call.
-    report = build_report(
-        best.tree,
-        trials,
-        split,
-        panel,
-        searched_trials=gp.trial_count,
-        horizon=gp_config.horizon,
-        execution=gp_config.execution,
-        ic_method=gp_config.ic_method,
-        min_names=gp_config.min_names,
-        scheme=scheme,
-        costs=costs,
-    )
-    holdout = report.get("oos_backtest") or {}
-    holdout_metrics = holdout.get("metrics") or {}
-    print("\nlocked holdout portfolio (quantile long/short, net of costs):")
-    print(
-        "  "
-        f"net Sharpe={_metric(holdout_metrics.get('net_sharpe'))}  "
-        f"gross Sharpe={_metric(holdout_metrics.get('gross_sharpe'))}  "
-        f"drawdown={_metric(holdout_metrics.get('max_drawdown'))}  "
-        f"turnover={_metric(holdout_metrics.get('turnover'))}"
-    )
-    print(
-        f"\ntrials searched      = {report['n_trials']}  "
-        f"({gp.trial_count} factor candidates, one pinned scheme)"
-    )
-    print(f"train    |rank IC|   = {report['train_ic']:.4f}")
-    print(f"OOS test |rank IC|   = {report['oos_ic']:.4f}   <- default, honest metric")
-    print(f"net deflated Sharpe  = {report['deflated_sharpe']:.4f}   (>0.95 significant)")
-    print(f"PBO (net)            = {report['pbo']:.4f}   (>=0.5 overfit red flag)")
-    verdict = (
-        "PLAUSIBLE"
-        if report["significant"]
-        else "NOT SIGNIFICANT (likely overfit / luck)"
-    )
-    print(f"verdict              = {verdict}")
-    print("\n" + _DISCLAIMER)
-    return 0
+        print("\nbest factor:", best.tree)
+        # ``build_report`` owns the sole LockedTestSet unlock and reuses that same factor evaluation
+        # for the rich holdout report. Do not inspect or compare the test split before this call.
+        report = build_report(
+            best.tree,
+            trials,
+            split,
+            panel,
+            searched_trials=gp.trial_count,
+            horizon=gp_config.horizon,
+            execution=gp_config.execution,
+            ic_method=gp_config.ic_method,
+            min_names=gp_config.min_names,
+            scheme=scheme,
+            costs=costs,
+        )
+        holdout = report.get("oos_backtest") or {}
+        holdout_metrics = holdout.get("metrics") or {}
+        print("\nlocked holdout portfolio (quantile long/short, net of costs):")
+        print(
+            "  "
+            f"net Sharpe={_metric(holdout_metrics.get('net_sharpe'))}  "
+            f"gross Sharpe={_metric(holdout_metrics.get('gross_sharpe'))}  "
+            f"drawdown={_metric(holdout_metrics.get('max_drawdown'))}  "
+            f"turnover={_metric(holdout_metrics.get('turnover'))}"
+        )
+        print(
+            f"\ntrials searched      = {report['n_trials']}  "
+            f"({gp.trial_count} factor candidates, one pinned scheme)"
+        )
+        print(f"train    |rank IC|   = {report['train_ic']:.4f}")
+        print(f"OOS test |rank IC|   = {report['oos_ic']:.4f}   <- default, honest metric")
+        print(f"net deflated Sharpe  = {report['deflated_sharpe']:.4f}   (>0.95 significant)")
+        print(f"PBO (net)            = {report['pbo']:.4f}   (>=0.5 overfit red flag)")
+        verdict = (
+            "PLAUSIBLE" if report["significant"] else "NOT SIGNIFICANT (likely overfit / luck)"
+        )
+        print(f"verdict              = {verdict}")
+        print("\n" + _DISCLAIMER)
+        return 0
 
 
 if __name__ == "__main__":

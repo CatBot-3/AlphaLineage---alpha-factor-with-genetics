@@ -8,7 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
+import shutil
 import tempfile
+import weakref
+from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +27,30 @@ from alphalineage.core.evaluate import evaluate
 from alphalineage.core.extensions import expand_all
 from alphalineage.core.simplify import simplify
 from alphalineage.core.tree import Node, from_dict, to_dict, to_json
+from alphalineage.data.paths import temporary_dir
 
 NOVELTY_VERSION = 1
+# Full panels are an expendable acceleration cache, not search state. Keep enough
+# free space for screening arrays and the atomically replaced recovery checkpoint.
+RANK_CACHE_BYTES = 8 * 1024**3
+SCRATCH_RESERVE_BYTES = 1024**3
+logger = logging.getLogger(__name__)
+
+
+def _cleanup_storage(directory, mappings):
+    # The finalizer owns the directory and mappings, but never the context itself. This
+    # also keeps TemporaryDirectory's finalizer from running before its mappings close.
+    for mapping in list(mappings.values()):
+        try:
+            if not mapping.closed:
+                mapping.close()
+        except (OSError, BufferError):
+            logger.warning("Could not close a novelty mapping in %s", directory.name, exc_info=True)
+    mappings.clear()
+    try:
+        directory.cleanup()
+    except OSError:
+        logger.warning("Novelty scratch remains at %s after cleanup", directory.name, exc_info=True)
 
 
 def standardized(values, min_names):
@@ -88,7 +116,14 @@ class NoveltyContext:
         memory_budget_bytes: int | None = None,
         families: list[dict[str, Any]] | None = None,
         progress=None,
+        rank_cache_budget_bytes: int = RANK_CACHE_BYTES,
     ):
+        if (
+            isinstance(rank_cache_budget_bytes, bool)
+            or not isinstance(rank_cache_budget_bytes, int)
+            or rank_cache_budget_bytes < 0
+        ):
+            raise ValueError("rank_cache_budget_bytes must be a nonnegative integer")
         self.panel, self.references, self.min_names = panel, references, min_names
         self.fingerprint = hashlib.sha256(
             json.dumps(references, sort_keys=True).encode()
@@ -96,28 +131,80 @@ class NoveltyContext:
         self.sample = np.unique(
             np.linspace(0, len(panel.dates) - 1, min(128, len(panel.dates)), dtype=int)
         )
-        self.directory = tempfile.TemporaryDirectory(prefix="alphalineage-novelty-")
+        self.directory = tempfile.TemporaryDirectory(
+            prefix="alphalineage-novelty-", dir=temporary_dir()
+        )
+        self._mappings = {}
+        self._closed = False
+        self._finalizer = weakref.finalize(self, _cleanup_storage, self.directory, self._mappings)
         self.memory_budget = max(1, (memory_budget_bytes or 256 * 1024 * 1024) // 4)
         self.items: list[dict[str, Any]] = []
         self.families: list[dict[str, Any]] = []
         self.unavailable: list[str] = []
         self.blocks = []
         self.block_size = 16
-        total = len(references) + len(families or [])
-        if progress is not None:
-            progress(0, total)
-        for index, reference in enumerate(references):
-            try:
-                self._add(reference, known=True)
-            except (ValueError, KeyError, TypeError, FloatingPointError):
-                self.unavailable.append(reference["key"])
+        self.rank_cache_budget = int(rank_cache_budget_bytes)
+        self._rank_cache = OrderedDict()
+        self._rank_cache_bytes = 0
+        self._pinned_ranks = {}
+        try:
+            total = len(references) + len(families or [])
             if progress is not None:
-                progress(index + 1, total)
-        for index, item in enumerate(families or []):
-            self._add(item, known=False)
-            self.families.append(item)
-            if progress is not None:
-                progress(len(references) + index + 1, total)
+                progress(0, total)
+            for index, reference in enumerate(references):
+                try:
+                    self._add(reference, known=True)
+                except (ValueError, KeyError, TypeError, FloatingPointError):
+                    self.unavailable.append(reference["key"])
+                if progress is not None:
+                    progress(index + 1, total)
+            for index, item in enumerate(families or []):
+                self._add(item, known=False)
+                self.families.append(item)
+                if progress is not None:
+                    progress(len(references) + index + 1, total)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._finalizer()
+            self.items.clear()
+            self.blocks.clear()
+            self._rank_cache.clear()
+            self._rank_cache_bytes = 0
+
+    def _ensure_open(self):
+        if self._closed:
+            raise RuntimeError("Novelty context is closed")
+
+    def _own(self, array):
+        if isinstance(array, np.memmap):
+            self._mappings[id(array._mmap)] = array._mmap
+        return array
+
+    def _release(self, array):
+        if isinstance(array, np.memmap):
+            mapping = array._mmap
+            if not mapping.closed:
+                mapping.close()
+            self._mappings.pop(id(mapping), None)
+
+    def _save_array(self, path, values):
+        self._reserve_scratch(values.nbytes + 256)
+        try:
+            np.save(path, values, allow_pickle=False)
+        except OSError as exc:
+            raise OSError(f"Cannot write novelty scratch at {path}: {exc}") from exc
 
     def _add(
         self,
@@ -128,6 +215,7 @@ class NoveltyContext:
         already_ranked: bool = False,
         screened: tuple | None = None,
     ):
+        self._ensure_open()
         tree = from_dict(spec["tree"])
         key = identity(tree)
         for index, item in enumerate(self.items):
@@ -138,10 +226,9 @@ class NoveltyContext:
             if not isinstance(evaluated, pd.DataFrame):
                 raise ValueError("Reference does not produce a panel")
             values = evaluated.to_numpy(dtype=float)
-        path = Path(self.directory.name) / f"{len(self.items)}.npy"
-        # Only screen dates need ranks until a reference clears the screening threshold.
-        # Preserve raw float64 values on disk so lazy ranking cannot introduce false ties.
-        np.save(path, values.astype(np.float32) if already_ranked else values, allow_pickle=False)
+        path = Path(self.directory.name) / f"{len(self.items)}.ranks.npy"
+        # Retain the exact screening ranks and expression, not a full raw panel for
+        # every trial. Full confirmations can rebuild ranks from the training panel.
         sample = (
             screened[0]
             if screened is not None
@@ -151,9 +238,9 @@ class NoveltyContext:
         ).astype(np.float32)
         # Samples stay mapped as well when the configured memory share is exhausted.
         if sum(item["sample"].nbytes for item in self.items) + sample.nbytes > self.memory_budget:
-            sample_path = path.with_suffix(".sample.npy")
-            np.save(sample_path, sample, allow_pickle=False)
-            sample = np.load(sample_path, mmap_mode="r")
+            sample_path = path.with_name(f"{len(self.items)}.sample.npy")
+            self._save_array(sample_path, sample)
+            sample = self._own(np.load(sample_path, mmap_mode="r"))
         unit, valid, whole_rows = (
             screened[1:] if screened is not None else standardized(sample, self.min_names)
         )
@@ -161,20 +248,22 @@ class NoveltyContext:
         block_index, slot = divmod(index, self.block_size)
         if block_index == len(self.blocks):
             shape = (self.block_size, sample.size)
-            if (block_index + 1) * np.prod(shape) * 4 < self.memory_budget // 2:
+            if (block_index + 1) * math.prod(shape) * 4 < self.memory_budget // 2:
                 block = np.zeros(shape, dtype=np.float32)
             else:
-                block = np.lib.format.open_memmap(
-                    Path(self.directory.name) / f"block-{block_index}.npy",
-                    mode="w+",
-                    dtype=np.float32,
-                    shape=shape,
+                self._reserve_scratch(math.prod(shape) * 4 + 256)
+                block = self._own(
+                    np.lib.format.open_memmap(
+                        Path(self.directory.name) / f"block-{block_index}.npy",
+                        mode="w+",
+                        dtype=np.float32,
+                        shape=shape,
+                    )
                 )
             self.blocks.append(block)
         self.blocks[block_index][slot] = unit.ravel()
         self.items.append(
             {
-                "ranked": already_ranked,
                 "valid": valid,
                 "whole_rows": whole_rows,
                 "spec": spec,
@@ -186,17 +275,108 @@ class NoveltyContext:
         )
         return index
 
+    def _discard_cached_ranks(self, path):
+        # Call only after mapped readers close, including on Windows.
+        path.unlink(missing_ok=True)
+        self._rank_cache_bytes -= self._rank_cache.pop(path, 0)
+
+    def _evict_oldest(self):
+        victim = next((p for p in self._rank_cache if p not in self._pinned_ranks), None)
+        if victim is None:
+            return False
+        try:
+            self._discard_cached_ranks(victim)
+        except OSError:
+            logger.warning("Cannot evict novelty ranks at %s", victim, exc_info=True)
+            return False
+        return True
+
+    def _reserve_scratch(self, required):
+        # Growing screening arrays take priority over optional full-panel caches.
+        while self._rank_cache:
+            try:
+                free = shutil.disk_usage(self.directory.name).free
+            except OSError:
+                return
+            if free >= required + SCRATCH_RESERVE_BYTES or not self._evict_oldest():
+                return
+
+    def _make_cache_room(self, required):
+        if required > self.rank_cache_budget:
+            return False
+        try:
+            free = shutil.disk_usage(self.directory.name).free
+        except OSError:
+            return False
+        capacity = min(
+            self.rank_cache_budget,
+            max(0, self._rank_cache_bytes + free - SCRATCH_RESERVE_BYTES),
+        )
+        while self._rank_cache_bytes + required > capacity:
+            if not self._evict_oldest():
+                return False
+        return True
+
+    @staticmethod
+    def _fill_ranks(destination, values):
+        # Rank the original float64 values before narrowing the ordinal ranks, so
+        # close values never turn into artificial ties when rebuilding an eviction.
+        for offset in range(0, len(values), 128):
+            destination[offset : offset + 128] = ranks(values[offset : offset + 128])
+
+    @contextmanager
     def _full_ranks(self, item):
-        if item["ranked"]:
-            return np.load(item["path"], mmap_mode="r")
-        raw = np.load(item["path"], mmap_mode="r")
-        path = item["path"].with_suffix(".ranks.npy")
-        ranked = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=raw.shape)
-        for offset in range(0, len(raw), 128):
-            ranked[offset : offset + 128] = ranks(raw[offset : offset + 128])
-        ranked.flush()
-        item["path"], item["ranked"] = path, True
-        return ranked
+        self._ensure_open()
+        path = item["path"]
+        ranked = None
+        pinned = False
+        try:
+            if path in self._rank_cache:
+                ranked = self._own(np.load(path, mmap_mode="r"))
+                self._rank_cache.move_to_end(path)
+            if ranked is None:
+                evaluated = evaluate(from_dict(item["spec"]["tree"]), self.panel)
+                if not isinstance(evaluated, pd.DataFrame):
+                    raise ValueError("Reference does not produce a panel")
+                values = evaluated.to_numpy(dtype=float)
+                if self._make_cache_room(values.size * 4 + 256):
+                    try:
+                        ranked = self._own(
+                            np.lib.format.open_memmap(
+                                path, mode="w+", dtype=np.float32, shape=values.shape
+                            )
+                        )
+                        self._fill_ranks(ranked, values)
+                        ranked.flush()
+                        size = path.stat().st_size
+                        self._rank_cache[path] = size
+                        self._rank_cache_bytes += size
+                    except OSError:
+                        # Caching is optional. A storage failure must not lose a
+                        # generation when a single transient panel still fits RAM.
+                        self._release(ranked)
+                        ranked = None
+                        self._discard_cached_ranks(path)
+                        logger.warning("Cannot cache novelty ranks at %s; using RAM", path)
+                if ranked is None:
+                    ranked = np.empty(values.shape, dtype=np.float32)
+                    self._fill_ranks(ranked, values)
+                del values, evaluated
+            if isinstance(ranked, np.memmap):
+                self._pinned_ranks[path] = self._pinned_ranks.get(path, 0) + 1
+                pinned = True
+            yield ranked
+        finally:
+            self._release(ranked)
+            if pinned:
+                self._pinned_ranks[path] -= 1
+                if not self._pinned_ranks[path]:
+                    del self._pinned_ranks[path]
+            if path not in self._rank_cache:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Cannot remove incomplete novelty ranks at %s", path)
 
     def state(self):
         return {
@@ -212,10 +392,24 @@ class NoveltyContext:
         return len(self.items), len(self.families)
 
     def rollback(self, mark):
+        for item in self.items[mark[0] :]:
+            self._release(item["sample"])
+            try:
+                self._discard_cached_ranks(item["path"])
+                if isinstance(item["sample"], np.memmap):
+                    Path(item["sample"].filename).unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Cannot remove rolled-back novelty scratch", exc_info=True)
+                self._rank_cache_bytes -= self._rank_cache.pop(item["path"], 0)
+        keep_blocks = (mark[0] + self.block_size - 1) // self.block_size
+        for block in self.blocks[keep_blocks:]:
+            self._release(block)
+        del self.blocks[keep_blocks:]
         del self.items[mark[0] :]
         del self.families[mark[1] :]
 
     def apply(self, tree: Node, values: np.ndarray, scored):
+        self._ensure_open()
         fitness, metrics = scored
         metrics = dict(metrics)
         candidate = None
@@ -250,20 +444,20 @@ class NoveltyContext:
         for known in (True, False):
             choices = [(corr, i) for corr, i in screened if self.items[i]["known"] == known]
             for _, i in sorted(choices, key=lambda item: (-item[0], item[1]))[:3]:
-                other = self._full_ranks(self.items[i])
-                if candidate is None:
-                    candidate = ranks(values)
-                # Stream the full confirmation in fixed date blocks to bound temporary arrays.
-                total, count = 0.0, 0
-                for offset in range(0, len(candidate), 128):
-                    corr, n = correlations(
-                        candidate[offset : offset + 128],
-                        other[offset : offset + 128],
-                        self.min_names,
-                    )
-                    if n > 0:
-                        total += corr * n
-                        count += n
+                with self._full_ranks(self.items[i]) as other:
+                    if candidate is None:
+                        candidate = ranks(values)
+                    # Stream confirmations without retaining mapped panels between calls.
+                    total, count = 0.0, 0
+                    for offset in range(0, len(candidate), 128):
+                        corr, n = correlations(
+                            candidate[offset : offset + 128],
+                            other[offset : offset + 128],
+                            self.min_names,
+                        )
+                        if n > 0:
+                            total += corr * n
+                            count += n
                 if count >= max(5, int(len(candidate) * 0.6)):
                     rho = abs(total / count)
                     if known:
@@ -278,7 +472,7 @@ class NoveltyContext:
                 "key": "candidate:" + hashlib.sha256(identity(tree).encode()).hexdigest(),
                 "tree": to_dict(simplify(expand_all(tree), preserve_missing=True)),
             }
-            # Family prototypes consume disk, not a population's worth of RAM.
+            # Screening prototypes grow with the search; full panels use a bounded cache.
             family = self._add(
                 spec,
                 known=False,

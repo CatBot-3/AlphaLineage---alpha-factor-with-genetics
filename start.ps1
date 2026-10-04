@@ -17,6 +17,30 @@ $RepoRoot = $PSScriptRoot
 $FrontendDir = Join-Path $RepoRoot "frontend"
 $DistDir = Join-Path $FrontendDir "dist"
 
+# Configure scratch before any Python/npm child starts (including installation and probes).
+if (-not $env:ALPHALINEAGE_DATA_DIR) {
+    $env:ALPHALINEAGE_DATA_DIR = Join-Path $RepoRoot "data_cache"
+}
+if (-not $env:ALPHALINEAGE_TEMP_DIR) {
+    $env:ALPHALINEAGE_TEMP_DIR = Join-Path $env:ALPHALINEAGE_DATA_DIR "tmp"
+}
+$TempRoot = [System.IO.Path]::GetFullPath($env:ALPHALINEAGE_TEMP_DIR)
+New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
+$TempProbe = Join-Path $TempRoot ([System.IO.Path]::GetRandomFileName())
+try {
+    [System.IO.File]::WriteAllText($TempProbe, "")
+}
+catch {
+    throw "AlphaLineage temporary storage is not writable at ${TempRoot}: $_"
+}
+finally {
+    if (Test-Path -LiteralPath $TempProbe) { Remove-Item -LiteralPath $TempProbe }
+}
+$env:ALPHALINEAGE_TEMP_DIR = $TempRoot
+$env:TEMP = $TempRoot
+$env:TMP = $TempRoot
+$env:TMPDIR = $TempRoot
+
 # --- locate python + npm ----------------------------------------------------------
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $Python)) {
@@ -40,9 +64,6 @@ if (-not $NoBuild -or -not (Test-Path -LiteralPath $DistDir)) {
 $env:ALPHALINEAGE_STATIC_DIR = $DistDir
 $env:ALPHALINEAGE_ALLOW_SHUTDOWN = "1"   # let the in-app Quit stop this process
 $env:PYTHONPATH = Join-Path $RepoRoot "src"
-if (-not $env:ALPHALINEAGE_DATA_DIR) {
-    $env:ALPHALINEAGE_DATA_DIR = Join-Path $RepoRoot "data_cache"
-}
 
 $RuntimeDir = Join-Path $RepoRoot ".runtime"
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null

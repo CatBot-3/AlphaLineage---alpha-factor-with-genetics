@@ -43,6 +43,7 @@ from alphalineage.core.simplify import simplify
 from alphalineage.core.tree import Node, from_dict, from_json, to_dict, to_json, validate
 from alphalineage.core.tuning import WorkerTuner
 from alphalineage.core.types import DType, is_subtype
+from alphalineage.data.identifiers import atomic_write_text
 
 Path_ = str | Path
 Position = tuple[tuple[int, ...], DType, Node]
@@ -103,9 +104,7 @@ class ExplorationSettings:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["parameter_step_multipliers"] = list(
-            self.parameter_step_multipliers
-        )
+        payload["parameter_step_multipliers"] = list(self.parameter_step_multipliers)
         return payload
 
     def with_stagnation_boost(self, generations_without_improvement: int) -> ExplorationSettings:
@@ -127,9 +126,7 @@ def resolve_exploration_settings(profile: str | None) -> ExplorationSettings:
         return ExplorationSettings(resolved, 0.10, 0.20, 0.10, 0.15, 0.10, (1, 2, 4))
     if resolved == "aggressive":
         return ExplorationSettings(resolved, 0.20, 0.40, 0.20, 0.15, 0.10, (1, 2, 4))
-    raise ValueError(
-        "exploration_profile must be 'classic', 'balanced', 'aggressive', or None"
-    )
+    raise ValueError("exploration_profile must be 'classic', 'balanced', 'aggressive', or None")
 
 
 def active_scorer_backend(method: str) -> str:
@@ -236,8 +233,7 @@ class GPConfig:
             and self.exploration_profile not in EXPLORATION_PROFILES
         ):
             raise ValueError(
-                "exploration_profile must be 'classic', 'balanced', "
-                "'aggressive', or None"
+                "exploration_profile must be 'classic', 'balanced', 'aggressive', or None"
             )
 
         for name in (
@@ -265,9 +261,7 @@ class GPConfig:
                 f"parsimony must be a finite non-negative number, got {self.parsimony!r}"
             )
         if self.complexity_penalty_mode not in COMPLEXITY_PENALTY_MODES:
-            raise ValueError(
-                "complexity_penalty_mode must be 'per_node' or 'normalized_budget'"
-            )
+            raise ValueError("complexity_penalty_mode must be 'per_node' or 'normalized_budget'")
         if self.complexity_penalty_value is not None and (
             isinstance(self.complexity_penalty_value, bool)
             or not isinstance(self.complexity_penalty_value, (int, float))
@@ -310,8 +304,7 @@ class GPConfig:
                 raise ValueError("enabled_categories must not contain duplicates")
         if self.enabled_formula_names is not None:
             if not isinstance(self.enabled_formula_names, list) or any(
-                not isinstance(name, str) or not name.strip()
-                for name in self.enabled_formula_names
+                not isinstance(name, str) or not name.strip() for name in self.enabled_formula_names
             ):
                 raise ValueError(
                     "enabled_formula_names must be a list of non-empty strings or None"
@@ -388,11 +381,7 @@ def iter_variation_positions(tree: Node, root_type: DType) -> list[Position]:
             return
         inputs = (prim.macro_policy or {}).get("inputs") or []
         for index, child in enumerate(node.children):
-            item = (
-                inputs[index]
-                if index < len(inputs) and isinstance(inputs[index], dict)
-                else {}
-            )
+            item = inputs[index] if index < len(inputs) and isinstance(inputs[index], dict) else {}
             if item.get("role") == "parameter":
                 continue
             walk(child, (*path, index), prim.arg_types[index])
@@ -428,9 +417,7 @@ def validate_seed(
     compact_depth = tree.depth()
     compact_size = tree.size()
     if compact_depth > max_depth or compact_size > max_nodes:
-        raise ValueError(
-            f"seed compact expression exceeds depth/nodes {max_depth}/{max_nodes}"
-        )
+        raise ValueError(f"seed compact expression exceeds depth/nodes {max_depth}/{max_nodes}")
     expansion_depth = _expansion_depth_limit(tree, max_depth)
     expand_all(tree, max_depth=expansion_depth, max_nodes=max_nodes)
     return tree
@@ -546,19 +533,13 @@ class GP:
             or memory_budget_bytes <= 0
         ):
             raise ValueError("memory_budget_bytes must be a positive integer or None")
-        from .novelty import NoveltyContext
-        self.novelty = (NoveltyContext(panel, (novelty_state or {}).get("references", []),
-            min_names=int((novelty_state or {}).get("min_names", config.min_names)), memory_budget_bytes=memory_budget_bytes,
-            families=(novelty_state or {}).get("families", []),
-            progress=getattr(recorder, "on_reference_preparation", None))
-            if config.novelty_mode == "balanced" else None)
+        self.novelty = None
+        self._closed = False
         self.structural_skips = int((novelty_state or {}).get("structural_skips", 0))
         self.config = config
         self.panel = panel
         self.fwd = (
-            fwd
-            if fwd is not None
-            else forward_returns(panel, config.horizon, config.execution)
+            fwd if fwd is not None else forward_returns(panel, config.horizon, config.execution)
         )
         self.root_type = root_type
         # Optional lineage recorder (duck-typed: on_init(trees), on_generation(gen, entries)).
@@ -609,6 +590,31 @@ class GP:
         self._managed_formula_defaults: list[Node] = []
         self._pending_formula_defaults: list[Node] = []
         self._formula_validation_best: dict[str, float] = {}
+        from .novelty import NoveltyContext
+
+        if config.novelty_mode == "balanced":
+            self.novelty = NoveltyContext(
+                panel,
+                (novelty_state or {}).get("references", []),
+                min_names=int((novelty_state or {}).get("min_names", config.min_names)),
+                memory_budget_bytes=memory_budget_bytes,
+                families=(novelty_state or {}).get("families", []),
+                progress=getattr(recorder, "on_reference_preparation", None),
+            )
+
+    def __enter__(self) -> GP:
+        if self._closed:
+            raise RuntimeError("Training engine is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            if self.novelty is not None:
+                self.novelty.close()
 
     @property
     def trial_count(self) -> int:
@@ -628,7 +634,17 @@ class GP:
         for index, candidate in enumerate(individuals):
             family = candidate.metrics.get("novelty_family", f"unmeasured:{index}")
             previous = families.get(family)
-            if previous is None or (candidate.fitness, -candidate.metrics.get("expanded_complexity", candidate.tree.size()), -index) > (individuals[previous].fitness, -individuals[previous].metrics.get("expanded_complexity", individuals[previous].tree.size()), -previous):
+            if previous is None or (
+                candidate.fitness,
+                -candidate.metrics.get("expanded_complexity", candidate.tree.size()),
+                -index,
+            ) > (
+                individuals[previous].fitness,
+                -individuals[previous].metrics.get(
+                    "expanded_complexity", individuals[previous].tree.size()
+                ),
+                -previous,
+            ):
                 families[family] = index
         return sorted(families.values())
 
@@ -644,17 +660,27 @@ class GP:
                     keep.add(index)
                     extra.add(family)
         indices = sorted(keep)
-        return [population[i] for i in indices], [entries[i] for i in indices] if entries else entries
+        return [population[i] for i in indices], [
+            entries[i] for i in indices
+        ] if entries else entries
 
     def validation_candidates(self):
         candidates = self.searched_individuals()
-        return [candidates[i] for i in self._family_indices(candidates)] if self.novelty else candidates
+        return (
+            [candidates[i] for i in self._family_indices(candidates)]
+            if self.novelty
+            else candidates
+        )
 
     def novelty_diagnostics(self):
-        return {"mode": self.config.novelty_mode, "structural_skips": self.structural_skips,
-                "predictive_trials": self.trial_count, "family_count": len(self.validation_candidates()),
-                "reference_fingerprint": self.novelty.fingerprint if self.novelty else None,
-                "references": len(self.novelty.references) if self.novelty else 0}
+        return {
+            "mode": self.config.novelty_mode,
+            "structural_skips": self.structural_skips,
+            "predictive_trials": self.trial_count,
+            "family_count": len(self.validation_candidates()),
+            "reference_fingerprint": self.novelty.fingerprint if self.novelty else None,
+            "references": len(self.novelty.references) if self.novelty else 0,
+        }
 
     def _base_exploration_settings(self) -> ExplorationSettings:
         return resolve_exploration_settings(self.config.exploration_profile)
@@ -666,6 +692,7 @@ class GP:
 
     def _cache_key(self, tree: Node) -> str:
         from .novelty import identity
+
         return identity(tree) if self.novelty is not None else to_json(simplify(tree))
 
     def _prepare_tree(self, tree: Node) -> Node:
@@ -698,9 +725,7 @@ class GP:
 
     def formula_exploration(self) -> dict[str, dict[str, float | int | None]]:
         """Per-managed-formula coverage over every distinct searched compact tree."""
-        names = list(
-            dict.fromkeys(call.name for call in self._managed_formula_defaults)
-        )
+        names = list(dict.fromkeys(call.name for call in self._managed_formula_defaults))
         calls: Counter[str] = Counter()
         parameter_values: dict[str, set[tuple[float | int | None, ...]]] = {}
         best_training: dict[str, float] = {}
@@ -709,9 +734,7 @@ class GP:
                 if call.name not in names:
                     names.append(call.name)
                 calls[call.name] += 1
-                parameter_values.setdefault(call.name, set()).add(
-                    self._parameter_tuple(call)
-                )
+                parameter_values.setdefault(call.name, set()).add(self._parameter_tuple(call))
                 best_training[call.name] = max(
                     best_training.get(call.name, -math.inf), float(fitness)
                 )
@@ -722,9 +745,7 @@ class GP:
             key=lambda candidate: candidate.fitness,
             reverse=True,
         ):
-            for name in dict.fromkeys(
-                call.name for call in self._formula_calls(individual.tree)
-            ):
+            for name in dict.fromkeys(call.name for call in self._formula_calls(individual.tree)):
                 if beam_members[name] < PARAMETER_BEAM_WIDTH:
                     beam_members[name] += 1
         return {
@@ -754,17 +775,13 @@ class GP:
                     sum(self._formula_move_counts.get(name, Counter()).values())
                 ),
                 "diagonal_moves_searched": int(
-                    self._formula_move_counts.get(name, Counter()).get(
-                        "diagonal", 0
-                    )
+                    self._formula_move_counts.get(name, Counter()).get("diagonal", 0)
                 ),
             }
             for name in names
         }
 
-    def record_formula_validation_scores(
-        self, candidates: Sequence[tuple[Node, float]]
-    ) -> None:
+    def record_formula_validation_scores(self, candidates: Sequence[tuple[Node, float]]) -> None:
         """Attach validation evidence without altering fitness or the population.
 
         The caller may save a checkpoint again after validation to retain these values. The
@@ -790,11 +807,7 @@ class GP:
                 distance = 0.0
                 found = False
                 for index, item in enumerate(inputs):
-                    child_value = (
-                        call.children[index].value
-                        if index < len(call.children)
-                        else None
-                    )
+                    child_value = call.children[index].value if index < len(call.children) else None
                     if (
                         index >= len(call.children)
                         or not isinstance(item, dict)
@@ -807,9 +820,7 @@ class GP:
                     step = float(item["tuning"].get("step", 1.0))
                     if not math.isfinite(step) or step <= 0.0:
                         continue
-                    distance += abs(
-                        float(child_value) - float(item["default"])
-                    ) / step
+                    distance += abs(float(child_value) - float(item["default"])) / step
                     found = True
                 if found:
                     distances.setdefault(call.name, []).append(distance)
@@ -829,16 +840,24 @@ class GP:
         if self.novelty is None:
             return scored
         from .fitness import complexity_deduction
+
         fitness, metrics = scored
         metrics = dict(metrics)
         expanded = expand_all(tree)
-        penalty = complexity_deduction(expanded.size(), parsimony=self.config.parsimony,
+        penalty = complexity_deduction(
+            expanded.size(),
+            parsimony=self.config.parsimony,
             complexity_penalty_mode=self.config.complexity_penalty_mode,
-            complexity_penalty_value=self.config.complexity_penalty_value, max_nodes=self.config.max_nodes)
-        metrics.update(expanded_complexity=float(expanded.size()),
-                       expanded_unique_nodes=float(expanded.unique_computation_size()), complexity_penalty=penalty)
-        raw = metrics.get("raw_objective", metrics.get("ic", 0.))
-        return raw * metrics.get("novelty_multiplier", 1.) - penalty, metrics
+            complexity_penalty_value=self.config.complexity_penalty_value,
+            max_nodes=self.config.max_nodes,
+        )
+        metrics.update(
+            expanded_complexity=float(expanded.size()),
+            expanded_unique_nodes=float(expanded.unique_computation_size()),
+            complexity_penalty=penalty,
+        )
+        raw = metrics.get("raw_objective", metrics.get("ic", 0.0))
+        return raw * metrics.get("novelty_multiplier", 1.0) - penalty, metrics
 
     def _score(self, tree: Node) -> tuple[float, dict[str, float]]:
         tree = self._prepare_tree(tree)
@@ -939,7 +958,10 @@ class GP:
         chunk_size = self._scoring_chunk_size(total)
         if self.novelty:
             output_bytes = max(1, len(self.panel.dates) * len(self.panel.symbols) * 8)
-            chunk_size = min(chunk_size, max(1, (self.memory_budget_bytes or 256*1024*1024) // 4 // output_bytes))
+            chunk_size = min(
+                chunk_size,
+                max(1, (self.memory_budget_bytes or 256 * 1024 * 1024) // 4 // output_bytes),
+            )
         for offset in range(0, total, chunk_size):
             if stop is not None and stop():
                 raise TrainingCancelled("training cancelled before scoring completed")
@@ -1028,9 +1050,7 @@ class GP:
             )
 
     # --- selection & variation ---------------------------------------------------
-    def _tournament(
-        self, eligible_indices: Sequence[int] | None = None
-    ) -> tuple[Individual, int]:
+    def _tournament(self, eligible_indices: Sequence[int] | None = None) -> tuple[Individual, int]:
         # Index-based selection (same RNG draws as choice(population)) so we can record parents.
         n = len(self.population)
         pool: Sequence[int] = range(n) if eligible_indices is None else eligible_indices
@@ -1136,9 +1156,7 @@ class GP:
         if self.allowed_operators is None:
             missing = sorted(logical_names - matched)
             if missing:
-                raise ValueError(
-                    f"enabled managed formula(s) unavailable: {', '.join(missing)}"
-                )
+                raise ValueError(f"enabled managed formula(s) unavailable: {', '.join(missing)}")
         return defaults
 
     def _take_pending_formula_default(self, counts: Counter[str]) -> Node | None:
@@ -1242,9 +1260,7 @@ class GP:
                     child.name,
                     value=int(value) if child.name == "window" else float(value),
                 )
-            candidate = self._prepare_tree(
-                replace_at(tree, path, Node(call.name, tuple(children)))
-            )
+            candidate = self._prepare_tree(replace_at(tree, path, Node(call.name, tuple(children))))
             key = self._cache_key(candidate)
             if candidate == tree or key in seen or not self._fits_complexity(candidate):
                 return
@@ -1252,9 +1268,7 @@ class GP:
             moves.append((candidate, kind))
 
         signed_multipliers = [
-            signed
-            for multiplier in multipliers
-            for signed in (multiplier, -multiplier)
+            signed for multiplier in multipliers for signed in (multiplier, -multiplier)
         ]
         for index in tunable:
             item = inputs[index]
@@ -1285,12 +1299,10 @@ class GP:
                             (-1, 1),
                         ):
                             left_value = (
-                                left_child.value
-                                + left_tuning["step"] * multiplier * left_sign
+                                left_child.value + left_tuning["step"] * multiplier * left_sign
                             )
                             right_value = (
-                                right_child.value
-                                + right_tuning["step"] * multiplier * right_sign
+                                right_child.value + right_tuning["step"] * multiplier * right_sign
                             )
                             if (
                                 left_value < left_tuning["min"]
@@ -1416,9 +1428,7 @@ class GP:
                 width=settings.beam_width,
             )
             if lane == "beam"
-            else self._parameter_frontier_sources(
-                eligible_indices=eligible_indices
-            )
+            else self._parameter_frontier_sources(eligible_indices=eligible_indices)
         )
         if not sources:
             return None
@@ -1427,29 +1437,16 @@ class GP:
             moves = self._policy_move_candidates(
                 tree,
                 path,
-                multipliers=(
-                    (1,)
-                    if lane == "beam"
-                    else settings.parameter_step_multipliers
-                ),
+                multipliers=((1,) if lane == "beam" else settings.parameter_step_multipliers),
                 include_diagonal=lane == "frontier",
             )
-            candidates.extend(
-                (candidate, parent_index, name, kind)
-                for candidate, kind in moves
-            )
+            candidates.extend((candidate, parent_index, name, kind) for candidate, kind in moves)
         if not candidates:
             return None
-        cursor_name = (
-            "_parameter_beam_cursor"
-            if lane == "beam"
-            else "_parameter_frontier_cursor"
-        )
+        cursor_name = "_parameter_beam_cursor" if lane == "beam" else "_parameter_frontier_cursor"
         cursor = int(getattr(self, cursor_name))
         for offset in range(len(candidates)):
-            candidate, parent_index, name, kind = candidates[
-                (cursor + offset) % len(candidates)
-            ]
+            candidate, parent_index, name, kind = candidates[(cursor + offset) % len(candidates)]
             if self._cache_key(candidate) in self._cache:
                 continue
             setattr(self, cursor_name, cursor + offset + 1)
@@ -1539,9 +1536,7 @@ class GP:
 
     def _insertion_mutation(self, tree: Node) -> Node:
         """Wrap a chosen subtree while preserving it as an input to the new operator."""
-        path, required, subtree = self.rng.choice(
-            iter_variation_positions(tree, self.root_type)
-        )
+        path, required, subtree = self.rng.choice(iter_variation_positions(tree, self.root_type))
         depth_budget = self.config.max_depth - len(path)
         node_budget = self.config.max_nodes - (tree.size() - subtree.size())
         if depth_budget < 2 or node_budget <= subtree.size():
@@ -1553,10 +1548,7 @@ class GP:
             and primitive.arity > 0
             and operator_allowed(primitive, self.allowed_operators)
             and is_subtype(primitive.out_type, required)
-            and any(
-                is_subtype(subtree.out_type, arg_type)
-                for arg_type in primitive.arg_types
-            )
+            and any(is_subtype(subtree.out_type, arg_type) for arg_type in primitive.arg_types)
         ]
         self.rng.shuffle(operators)
         for primitive in operators[:16]:
@@ -1575,9 +1567,7 @@ class GP:
                         children.append(subtree)
                         continue
                     remaining_arguments = sum(
-                        1
-                        for later in range(index + 1, primitive.arity)
-                        if later != anchor
+                        1 for later in range(index + 1, primitive.arity) if later != anchor
                     )
                     budget = max(1, remaining - remaining_arguments)
                     try:
@@ -1818,9 +1808,7 @@ class GP:
         return {
             "parameter": min(slots, int(round(slots * parameter_fraction))),
             "two_edit": min(slots, int(round(slots * settings.two_edit_fraction))),
-            "composition": min(
-                slots, int(round(slots * settings.composition_fraction))
-            ),
+            "composition": min(slots, int(round(slots * settings.composition_fraction))),
             "insertion": min(slots, int(round(slots * settings.insertion_fraction))),
         }
 
@@ -1857,12 +1845,8 @@ class GP:
         diversity_ratio = unique_count / len(self.population)
         exploration = dict(self._last_exploration_diagnostics)
         exploration["niche_occupancy"] = self._niche_occupancy()
-        exploration["parameter_distance_from_defaults"] = (
-            self._parameter_distance_from_defaults()
-        )
-        exploration["champion_stepping_stone_ancestors"] = list(
-            best.stepping_stone_ancestors
-        )
+        exploration["parameter_distance_from_defaults"] = self._parameter_distance_from_defaults()
+        exploration["champion_stepping_stone_ancestors"] = list(best.stepping_stone_ancestors)
         self._last_exploration_diagnostics = exploration
         if self.novelty:
             exploration["novelty"] = self.novelty_diagnostics()
@@ -1881,16 +1865,10 @@ class GP:
                 "duplicate_count": float(len(self.population) - unique_count),
                 "novel_offspring_count": float(self._last_novel_offspring),
                 "parameter_neighbor_count": float(self._last_parameter_neighbors),
-                "formula_default_injection_count": float(
-                    self._last_formula_default_injections
-                ),
+                "formula_default_injection_count": float(self._last_formula_default_injections),
                 "champion_age": float(self._champion_age),
-                "generations_since_improvement": float(
-                    self._generations_since_improvement
-                ),
-                "diversity_warning": float(
-                    diversity_ratio < DIVERSITY_WARNING_THRESHOLD
-                ),
+                "generations_since_improvement": float(self._generations_since_improvement),
+                "diversity_warning": float(diversity_ratio < DIVERSITY_WARNING_THRESHOLD),
                 "formula_exploration": self.formula_exploration(),
                 "exploration": exploration,
             }
@@ -1933,9 +1911,7 @@ class GP:
             self.config.population_size - len(explicit_seed_trees),
         )
         formula_seed_trees = self._managed_formula_defaults[:formula_capacity]
-        self._pending_formula_defaults = list(
-            self._managed_formula_defaults[formula_capacity:]
-        )
+        self._pending_formula_defaults = list(self._managed_formula_defaults[formula_capacity:])
         seed_trees = [*explicit_seed_trees, *formula_seed_trees]
         generated_count = self.config.population_size - len(seed_trees)
         generated = self.generator.ramped_half_and_half(
@@ -2015,28 +1991,18 @@ class GP:
             "two_edit_attempts": 0,
             "two_edit_successes": 0,
             "duplicate_rejections": 0,
-            "hard_limit_rejections": (
-                self._complexity_rejections - complexity_rejections_before
-            ),
+            "hard_limit_rejections": (self._complexity_rejections - complexity_rejections_before),
             "operation_attempts": {},
             "operation_successes": {},
             "operation_rejections": {},
             "parent_contribution": {},
             "no_op_crossover_rate": 0.0,
-            "complexity_rejections": (
-                self._complexity_rejections - complexity_rejections_before
-            ),
-            "pre_cache_simplifications": (
-                self._pre_cache_simplifications - simplifications_before
-            ),
+            "complexity_rejections": (self._complexity_rejections - complexity_rejections_before),
+            "pre_cache_simplifications": (self._pre_cache_simplifications - simplifications_before),
         }
         if self.recorder is not None:
-            seed_keys = Counter(
-                self._canonical_key(tree) for tree in explicit_seed_trees
-            )
-            formula_keys = Counter(
-                self._canonical_key(tree) for tree in formula_seed_trees
-            )
+            seed_keys = Counter(self._canonical_key(tree) for tree in explicit_seed_trees)
+            formula_keys = Counter(self._canonical_key(tree) for tree in formula_seed_trees)
             ops = []
             for tree in (individual.tree for individual in self.population):
                 key = self._canonical_key(tree)
@@ -2065,8 +2031,7 @@ class GP:
         simplification_state = self._pre_cache_simplifications
         complexity_rejection_state = self._complexity_rejections
         formula_move_counts_state = {
-            name: Counter(counts)
-            for name, counts in self._formula_move_counts.items()
+            name: Counter(counts) for name, counts in self._formula_move_counts.items()
         }
         simplifications_before = self._pre_cache_simplifications
         complexity_rejections_before = self._complexity_rejections
@@ -2116,9 +2081,7 @@ class GP:
                 stepping_stone_ancestors=ancestry,
             )
             next_pop.append(carried)
-            entries.append(
-                (carried.tree, [index], "stepping_stone", carried.fitness)
-            )
+            entries.append((carried.tree, [index], "stepping_stone", carried.fitness))
             accepted_stepping_indices.append(index)
 
         previous_keys = {self._canonical_key(ind.tree) for ind in self.population}
@@ -2169,14 +2132,10 @@ class GP:
         while len(next_pop) + len(offspring) < self.config.population_size:
             lane, lane_cursor = self._next_lane(scheduled, lane_targets, lane_cursor)
             protected_pool: list[int] | None = None
-            if (
-                protected_parent_offspring < protected_parent_target
-                and accepted_stepping_indices
-            ):
+            if protected_parent_offspring < protected_parent_target and accepted_stepping_indices:
                 protected_pool = [
                     accepted_stepping_indices[
-                        self._protected_parent_cursor
-                        % len(accepted_stepping_indices)
+                        self._protected_parent_cursor % len(accepted_stepping_indices)
                     ]
                 ]
                 self._protected_parent_cursor += 1
@@ -2196,9 +2155,7 @@ class GP:
                     elif protected_pool is None:
                         candidate, parents, op = self._offspring()
                     else:
-                        candidate, parents, op = self._offspring(
-                            protected_indices=protected_pool
-                        )
+                        candidate, parents, op = self._offspring(protected_indices=protected_pool)
                 elif lane == "two_edit":
                     actual["two_edit_attempts"] += 1
                     candidate, parents, op = self._two_edit_offspring(
@@ -2218,16 +2175,12 @@ class GP:
                     if protected_pool is None:
                         candidate, parents, op = self._offspring()
                     else:
-                        candidate, parents, op = self._offspring(
-                            protected_indices=protected_pool
-                        )
+                        candidate, parents, op = self._offspring(protected_indices=protected_pool)
                 candidate = self._prepare_tree(candidate)
                 if "crossover" in op:
                     actual["crossover_attempts"] += 1
-                    if (
-                        parents
-                        and self._canonical_key(candidate)
-                        == self._canonical_key(self.population[parents[0]].tree)
+                    if parents and self._canonical_key(candidate) == self._canonical_key(
+                        self.population[parents[0]].tree
                     ):
                         actual["no_op_crossovers"] += 1
                 if self._accept_under_copy_limit(candidate, counts):
@@ -2248,9 +2201,7 @@ class GP:
                 actual[f"{mode}_neighbors"] += 1
                 if move_kind == "diagonal":
                     actual["diagonal_parameter_moves"] += 1
-                self._formula_move_counts.setdefault(
-                    formula_name, Counter()
-                )[move_kind] += 1
+                self._formula_move_counts.setdefault(formula_name, Counter())[move_kind] += 1
             if op.startswith("two_edit:") and parents:
                 actual["two_edit_successes"] += int(
                     self._canonical_key(tree)
@@ -2266,11 +2217,7 @@ class GP:
                     self._canonical_key(tree)
                     != self._canonical_key(self.population[parents[0]].tree)
                 )
-            if (
-                protected_pool is not None
-                and parents
-                and parents[0] in set(protected_pool)
-            ):
+            if protected_pool is not None and parents and parents[0] in set(protected_pool):
                 protected_parent_offspring += 1
             parent_contribution.update(parents)
             if self._canonical_key(tree) not in previous_keys:
@@ -2296,8 +2243,7 @@ class GP:
             self._pre_cache_simplifications = simplification_state
             self._complexity_rejections = complexity_rejection_state
             self._formula_move_counts = {
-                str(name): Counter(counts)
-                for name, counts in formula_move_counts_state.items()
+                str(name): Counter(counts) for name, counts in formula_move_counts_state.items()
             }
             raise
         stepping_index_set = set(accepted_stepping_indices)
@@ -2334,12 +2280,8 @@ class GP:
             "stepping_stone_survivors": len(accepted_stepping_indices),
             "protected_parent_offspring": protected_parent_offspring,
             "parameter_beam_neighbors": int(actual["parameter_beam_neighbors"]),
-            "parameter_frontier_neighbors": int(
-                actual["parameter_frontier_neighbors"]
-            ),
-            "diagonal_parameter_moves": int(
-                actual["diagonal_parameter_moves"]
-            ),
+            "parameter_frontier_neighbors": int(actual["parameter_frontier_neighbors"]),
+            "diagonal_parameter_moves": int(actual["diagonal_parameter_moves"]),
             "composition_attempts": int(actual["composition_attempts"]),
             "composition_successes": int(actual["composition_successes"]),
             "insertion_attempts": int(actual["insertion_attempts"]),
@@ -2347,27 +2289,20 @@ class GP:
             "two_edit_attempts": int(actual["two_edit_attempts"]),
             "two_edit_successes": int(actual["two_edit_successes"]),
             "duplicate_rejections": duplicate_rejections,
-            "hard_limit_rejections": (
-                self._complexity_rejections - complexity_rejections_before
-            ),
+            "hard_limit_rejections": (self._complexity_rejections - complexity_rejections_before),
             "operation_attempts": dict(sorted(operation_attempts.items())),
             "operation_successes": dict(sorted(operation_successes.items())),
             "operation_rejections": dict(sorted(operation_rejections.items())),
             "parent_contribution": {
-                str(index): count
-                for index, count in sorted(parent_contribution.items())
+                str(index): count for index, count in sorted(parent_contribution.items())
             },
             "no_op_crossover_rate": (
                 float(actual["no_op_crossovers"] / actual["crossover_attempts"])
                 if actual["crossover_attempts"]
                 else 0.0
             ),
-            "complexity_rejections": (
-                self._complexity_rejections - complexity_rejections_before
-            ),
-            "pre_cache_simplifications": (
-                self._pre_cache_simplifications - simplifications_before
-            ),
+            "complexity_rejections": (self._complexity_rejections - complexity_rejections_before),
+            "pre_cache_simplifications": (self._pre_cache_simplifications - simplifications_before),
         }
         if self.recorder is not None:
             self.recorder.on_generation(self.generation, entries)
@@ -2380,7 +2315,17 @@ class GP:
         *,
         seeds: Sequence[Node] = (),
         stop: Callable[[], bool] | None = None,
+        on_commit: Callable[[GP], None] | None = None,
     ) -> Individual:
+        if self._closed:
+            raise RuntimeError("Training engine is closed")
+
+        def persist_committed_state() -> None:
+            if checkpoint_path is not None:
+                self.save_checkpoint(checkpoint_path)
+            if on_commit is not None:
+                on_commit(self)
+
         target = generations if generations is not None else self.config.generations
         self.termination_reason = "completed"
         if self._requires_rescore and self.population:
@@ -2391,8 +2336,7 @@ class GP:
             except TrainingCancelled:
                 self.termination_reason = "user_stopped"
                 raise
-            if checkpoint_path is not None:
-                self.save_checkpoint(checkpoint_path)
+            persist_committed_state()
         start = time.monotonic()
 
         def should_stop() -> bool:
@@ -2415,25 +2359,19 @@ class GP:
             except TrainingCancelled:
                 # The staged generation and its score-cache additions were not committed.
                 break
-            if checkpoint_path is not None:
-                self.save_checkpoint(checkpoint_path)
+            persist_committed_state()
             if should_stop():
                 break
         return self.best()
 
-    def _rescore_after_scorer_upgrade(
-        self, *, stop: Callable[[], bool] | None = None
-    ) -> None:
+    def _rescore_after_scorer_upgrade(self, *, stop: Callable[[], bool] | None = None) -> None:
         """Re-score a legacy checkpoint once without inflating its historical trial count."""
         previous_trials = self.trial_count
         old_cache, old_prior = self._cache, self._prior_trials
         self._cache = {}
         self._prior_trials = 0
         try:
-            historical = [
-                self._validate_seed(tree)
-                for tree in self._pending_rescore_trees
-            ]
+            historical = [self._validate_seed(tree) for tree in self._pending_rescore_trees]
             if historical:
                 self._individuals(
                     historical,
@@ -2451,9 +2389,7 @@ class GP:
                     birth_generation=original.birth_generation,
                     stepping_stone_ancestors=original.stepping_stone_ancestors,
                 )
-                for scored, original in zip(
-                    scored_population, self.population, strict=True
-                )
+                for scored, original in zip(scored_population, self.population, strict=True)
             ]
         except Exception:
             self._cache, self._prior_trials = old_cache, old_prior
@@ -2501,9 +2437,7 @@ class GP:
                 birth_generation=original.birth_generation,
                 stepping_stone_ancestors=original.stepping_stone_ancestors,
             )
-            for scored, original in zip(
-                scored_population, self.population, strict=True
-            )
+            for scored, original in zip(scored_population, self.population, strict=True)
         ]
 
     def best(self, *, simplified: bool = True) -> Individual:
@@ -2519,7 +2453,8 @@ class GP:
         return top
 
     # --- checkpointing -----------------------------------------------------------
-    def save_checkpoint(self, path: Path_) -> None:
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Serialize only committed search state; callers may bundle session recovery data."""
         version, internal, gauss = self.rng.getstate()
         used_formula_policies: dict[str, dict[str, Any]] = {}
 
@@ -2537,7 +2472,9 @@ class GP:
         for individual in self.population:
             collect_policy(individual.tree)
         state = {
-            "novelty": {**self.novelty.state(), "structural_skips": self.structural_skips} if self.novelty else None,
+            "novelty": {**self.novelty.state(), "structural_skips": self.structural_skips}
+            if self.novelty
+            else None,
             "scorer_version": SCORER_VERSION,
             "evolution_version": EVOLUTION_VERSION,
             "scorer_backend": self.scorer_backend,
@@ -2565,29 +2502,20 @@ class GP:
                 "generations_since_improvement": self._generations_since_improvement,
                 "last_novel_offspring": self._last_novel_offspring,
                 "last_parameter_neighbors": self._last_parameter_neighbors,
-                "last_formula_default_injections": (
-                    self._last_formula_default_injections
-                ),
+                "last_formula_default_injections": (self._last_formula_default_injections),
             },
             "formula_exploration": self.formula_exploration(),
             "formula_exploration_state": {
-                "managed_defaults": [
-                    to_dict(tree) for tree in self._managed_formula_defaults
-                ],
-                "pending_defaults": [
-                    to_dict(tree) for tree in self._pending_formula_defaults
-                ],
+                "managed_defaults": [to_dict(tree) for tree in self._managed_formula_defaults],
+                "pending_defaults": [to_dict(tree) for tree in self._pending_formula_defaults],
                 "validation_best": self._formula_validation_best,
                 "move_counts": {
-                    name: dict(counts)
-                    for name, counts in self._formula_move_counts.items()
+                    name: dict(counts) for name, counts in self._formula_move_counts.items()
                 },
             },
             # Machine timings, not search state: a continued run reuses them instead of
             # recalibrating, and a checkpoint moved to another machine simply ignores them.
-            "worker_tuning": (
-                self.tuner.snapshot().to_dict() if self.tuner is not None else None
-            ),
+            "worker_tuning": (self.tuner.snapshot().to_dict() if self.tuner is not None else None),
             "exploration_state": {
                 "parameter_beam_cursor": self._parameter_beam_cursor,
                 "parameter_frontier_cursor": self._parameter_frontier_cursor,
@@ -2604,14 +2532,15 @@ class GP:
                     "fitness": ind.fitness,
                     "metrics": ind.metrics,
                     "birth_generation": ind.birth_generation,
-                    "stepping_stone_ancestors": list(
-                        ind.stepping_stone_ancestors
-                    ),
+                    "stepping_stone_ancestors": list(ind.stepping_stone_ancestors),
                 }
                 for ind in self.population
             ],
         }
-        Path(path).write_text(json.dumps(state), encoding="utf-8")
+        return state
+
+    def save_checkpoint(self, path: Path_) -> None:
+        atomic_write_text(Path(path), json.dumps(self.checkpoint_state()))
 
     @classmethod
     def from_checkpoint(
@@ -2638,144 +2567,122 @@ class GP:
             tuner=tuner,
             novelty_state=state.get("novelty"),
         )
-        if tuner is not None:
-            tuner.restore(state.get("worker_tuning"))
-        version, internal, gauss = state["rng_state"]
-        gp.rng.setstate((version, tuple(internal), gauss))
-        gp.generation = int(state["generation"])
-        gp.history = state["history"]
-        gp.population = [
-            Individual(
-                simplify(from_dict(p["tree"])),
-                float(p["fitness"]),
-                dict(p["metrics"]),
-                int(p.get("birth_generation", gp.generation)),
-                tuple(
-                    str(value)
-                    for value in p.get("stepping_stone_ancestors", ())
-                ),
-            )
-            for p in state["population"]
-        ]
-        diversity_state = state.get("diversity_state") or {}
-        gp._champion_key = diversity_state.get("champion_key")
-        gp._champion_age = int(diversity_state.get("champion_age", 0))
-        gp._best_ever = float(
-            diversity_state.get(
-                "best_ever",
-                max((individual.fitness for individual in gp.population), default=-math.inf),
-            )
-        )
-        gp._generations_since_improvement = int(
-            diversity_state.get("generations_since_improvement", 0)
-        )
-        gp._last_novel_offspring = int(
-            diversity_state.get("last_novel_offspring", 0)
-        )
-        gp._last_parameter_neighbors = int(
-            diversity_state.get("last_parameter_neighbors", 0)
-        )
-        gp._last_formula_default_injections = int(
-            diversity_state.get("last_formula_default_injections", 0)
-        )
-        formula_state = state.get("formula_exploration_state") or {}
-        gp._managed_formula_defaults = [
-            from_dict(tree) for tree in formula_state.get("managed_defaults") or []
-        ]
-        gp._pending_formula_defaults = [
-            from_dict(tree) for tree in formula_state.get("pending_defaults") or []
-        ]
-        gp._formula_validation_best = {
-            str(name): float(value)
-            for name, value in (formula_state.get("validation_best") or {}).items()
-            if math.isfinite(float(value))
-        }
-        gp._formula_move_counts = {
-            str(name): Counter(
-                {
-                    str(kind): int(count)
-                    for kind, count in dict(counts).items()
-                }
-            )
-            for name, counts in (formula_state.get("move_counts") or {}).items()
-        }
-        exploration_state = state.get("exploration_state") or {}
-        gp._parameter_beam_cursor = int(
-            exploration_state.get("parameter_beam_cursor", 0)
-        )
-        gp._parameter_frontier_cursor = int(
-            exploration_state.get("parameter_frontier_cursor", 0)
-        )
-        gp._parameter_lane_cursor = int(
-            exploration_state.get("parameter_lane_cursor", 0)
-        )
-        gp._protected_parent_cursor = int(
-            exploration_state.get("protected_parent_cursor", 0)
-        )
-        gp._pre_cache_simplifications = int(
-            exploration_state.get("pre_cache_simplifications", 0)
-        )
-        gp._complexity_rejections = int(
-            exploration_state.get("complexity_rejections", 0)
-        )
-        gp._last_exploration_diagnostics = dict(
-            exploration_state.get("last_diagnostics") or {}
-        )
-        for name, policy in (state.get("formula_policies") or {}).items():
-            primitive = OPERATORS.get(name)
-            if primitive is None or primitive.macro_policy != policy:
-                raise ValueError(
-                    f"checkpoint formula policy for {name!r} is unavailable or has changed"
+        try:
+            if tuner is not None:
+                tuner.restore(state.get("worker_tuning"))
+            version, internal, gauss = state["rng_state"]
+            gp.rng.setstate((version, tuple(internal), gauss))
+            gp.generation = int(state["generation"])
+            gp.history = state["history"]
+            gp.population = [
+                Individual(
+                    simplify(from_dict(p["tree"]), preserve_missing=gp.novelty is not None),
+                    float(p["fitness"]),
+                    dict(p["metrics"]),
+                    int(p.get("birth_generation", gp.generation)),
+                    tuple(str(value) for value in p.get("stepping_stone_ancestors", ())),
                 )
-        saved_trials = int(state.get("trials", 0))
-        saved_scorer = int(state.get("scorer_version", 1))
-        saved_evolution = int(state.get("evolution_version", 1))
-        saved_backend = state.get("scorer_backend")
-        if saved_evolution != EVOLUTION_VERSION:
-            raise ValueError(
-                "checkpoint uses an incompatible evolution version; "
-                "restart with the same setup"
-            )
-        saved_exploration = state.get("resolved_exploration")
-        if (
-            saved_exploration is not None
-            and saved_exploration != gp._base_exploration_settings().to_dict()
-        ):
-            raise ValueError(
-                "checkpoint uses incompatible resolved exploration settings; "
-                "restart with the same setup"
-            )
-        saved_cache: list[Individual] = []
-        for cached in state.get("score_cache") or []:
-            try:
-                saved_cache.append(
-                    Individual(
-                        simplify(from_dict(cached["tree"])),
-                        float(cached["fitness"]),
-                        dict(cached["metrics"]),
-                        0,
-                    )
-                )
-            except (KeyError, TypeError, ValueError):
-                saved_cache = []
-                break
-        if (
-            saved_scorer == SCORER_VERSION
-            and saved_backend == gp.scorer_backend
-        ):
-            # New checkpoints restore all searched formulas; legacy checkpoints at least retain
-            # free current-population hits.
-            for individual in saved_cache or gp.population:
-                gp._cache_trees.setdefault(gp._cache_key(individual.tree), individual.tree)
-                gp._cache.setdefault(
-                    gp._cache_key(individual.tree),
-                    (individual.fitness, individual.metrics),
-                )
-            gp._prior_trials = max(0, saved_trials - len(gp._cache))
-        else:
-            gp._prior_trials = saved_trials
-            gp._requires_rescore = True
-            gp._pending_rescore_trees = [
-                individual.tree for individual in saved_cache
+                for p in state["population"]
             ]
-        return gp
+            diversity_state = state.get("diversity_state") or {}
+            gp._champion_key = diversity_state.get("champion_key")
+            gp._champion_age = int(diversity_state.get("champion_age", 0))
+            gp._best_ever = float(
+                diversity_state.get(
+                    "best_ever",
+                    max((individual.fitness for individual in gp.population), default=-math.inf),
+                )
+            )
+            gp._generations_since_improvement = int(
+                diversity_state.get("generations_since_improvement", 0)
+            )
+            gp._last_novel_offspring = int(diversity_state.get("last_novel_offspring", 0))
+            gp._last_parameter_neighbors = int(diversity_state.get("last_parameter_neighbors", 0))
+            gp._last_formula_default_injections = int(
+                diversity_state.get("last_formula_default_injections", 0)
+            )
+            formula_state = state.get("formula_exploration_state") or {}
+            gp._managed_formula_defaults = [
+                from_dict(tree) for tree in formula_state.get("managed_defaults") or []
+            ]
+            gp._pending_formula_defaults = [
+                from_dict(tree) for tree in formula_state.get("pending_defaults") or []
+            ]
+            gp._formula_validation_best = {
+                str(name): float(value)
+                for name, value in (formula_state.get("validation_best") or {}).items()
+                if math.isfinite(float(value))
+            }
+            gp._formula_move_counts = {
+                str(name): Counter({str(kind): int(count) for kind, count in dict(counts).items()})
+                for name, counts in (formula_state.get("move_counts") or {}).items()
+            }
+            exploration_state = state.get("exploration_state") or {}
+            gp._parameter_beam_cursor = int(exploration_state.get("parameter_beam_cursor", 0))
+            gp._parameter_frontier_cursor = int(
+                exploration_state.get("parameter_frontier_cursor", 0)
+            )
+            gp._parameter_lane_cursor = int(exploration_state.get("parameter_lane_cursor", 0))
+            gp._protected_parent_cursor = int(exploration_state.get("protected_parent_cursor", 0))
+            gp._pre_cache_simplifications = int(
+                exploration_state.get("pre_cache_simplifications", 0)
+            )
+            gp._complexity_rejections = int(exploration_state.get("complexity_rejections", 0))
+            gp._last_exploration_diagnostics = dict(exploration_state.get("last_diagnostics") or {})
+            for name, policy in (state.get("formula_policies") or {}).items():
+                primitive = OPERATORS.get(name)
+                if primitive is None or primitive.macro_policy != policy:
+                    raise ValueError(
+                        f"checkpoint formula policy for {name!r} is unavailable or has changed"
+                    )
+            saved_trials = int(state.get("trials", 0))
+            saved_scorer = int(state.get("scorer_version", 1))
+            saved_evolution = int(state.get("evolution_version", 1))
+            saved_backend = state.get("scorer_backend")
+            if saved_evolution != EVOLUTION_VERSION:
+                raise ValueError(
+                    "checkpoint uses an incompatible evolution version; restart with the same setup"
+                )
+            saved_exploration = state.get("resolved_exploration")
+            if (
+                saved_exploration is not None
+                and saved_exploration != gp._base_exploration_settings().to_dict()
+            ):
+                raise ValueError(
+                    "checkpoint uses incompatible resolved exploration settings; "
+                    "restart with the same setup"
+                )
+            saved_cache: list[Individual] = []
+            for cached in state.get("score_cache") or []:
+                try:
+                    saved_cache.append(
+                        Individual(
+                            simplify(
+                                from_dict(cached["tree"]), preserve_missing=gp.novelty is not None
+                            ),
+                            float(cached["fitness"]),
+                            dict(cached["metrics"]),
+                            0,
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    saved_cache = []
+                    break
+            if saved_scorer == SCORER_VERSION and saved_backend == gp.scorer_backend:
+                # New checkpoints restore all searched formulas; legacy checkpoints at least retain
+                # free current-population hits.
+                for individual in saved_cache or gp.population:
+                    gp._cache_trees.setdefault(gp._cache_key(individual.tree), individual.tree)
+                    gp._cache.setdefault(
+                        gp._cache_key(individual.tree),
+                        (individual.fitness, individual.metrics),
+                    )
+                gp._prior_trials = max(0, saved_trials - len(gp._cache))
+            else:
+                gp._prior_trials = saved_trials
+                gp._requires_rescore = True
+                gp._pending_rescore_trees = [individual.tree for individual in saved_cache]
+            return gp
+        except BaseException:
+            gp.close()
+            raise

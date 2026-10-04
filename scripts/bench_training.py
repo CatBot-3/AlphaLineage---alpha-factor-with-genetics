@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -144,17 +145,13 @@ def _canonical_hash_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("trajectory mappings must use string keys")
-        return {
-            key: _canonical_hash_value(value[key])
-            for key in sorted(value)
-        }
+        return {key: _canonical_hash_value(value[key]) for key in sorted(value)}
     if isinstance(value, (list, tuple)):
         return [_canonical_hash_value(item) for item in value]
     if isinstance(value, np.ndarray):
         return _canonical_hash_value(value.tolist())
     raise TypeError(
-        f"unsupported trajectory value {type(value).__module__}."
-        f"{type(value).__qualname__}"
+        f"unsupported trajectory value {type(value).__module__}.{type(value).__qualname__}"
     )
 
 
@@ -343,43 +340,46 @@ def _run_child(case: _Case) -> dict[str, Any]:
         generations=case.generations,
         seed=case.seed,
     )
-    gp = GP(
-        config,
-        panel,
-        fwd,
-        recorder=recorder,
-        workers=workers,
-        memory_budget_bytes=guard,
-    )
+    with ExitStack() as training_contexts:
+        gp = training_contexts.enter_context(
+            GP(
+                config,
+                panel,
+                fwd,
+                recorder=recorder,
+                workers=workers,
+                memory_budget_bytes=guard,
+            )
+        )
 
-    # Exclude one-time extension import and panel-array materialization from each timed run.
-    if cpp.backend_enabled():
-        cpp.evaluate_cpp(Node("close"), panel)
-    gc.collect()
-    with _MemoryMonitor(case.memory_sample_ms) as memory:
-        start = time.perf_counter()
-        gp.run()
-        elapsed = time.perf_counter() - start
+        # Exclude one-time extension import and panel-array materialization from each timed run.
+        if cpp.backend_enabled():
+            cpp.evaluate_cpp(Node("close"), panel)
+        gc.collect()
+        with _MemoryMonitor(case.memory_sample_ms) as memory:
+            start = time.perf_counter()
+            gp.run()
+            elapsed = time.perf_counter() - start
 
-    trajectory = _trajectory(gp, recorder)
-    result = {
-        **case.to_dict(),
-        "workers": workers,
-        "native_available": cpp.available(),
-        "native_enabled": cpp.backend_enabled(),
-        "elapsed_seconds": elapsed,
-        "trials": gp.trial_count,
-        "factors_per_second": gp.trial_count / elapsed if elapsed > 0.0 else None,
-        "rss_source": memory.source,
-        "baseline_rss_bytes": memory.baseline_bytes,
-        "peak_rss_bytes": memory.peak_bytes,
-        "peak_rss_delta_bytes": memory.delta_bytes,
-        "memory_guard_bytes": guard,
-        "memory_guard_ok": memory.source != "unavailable" and memory.delta_bytes <= guard,
-        "resources": resources,
-        "trajectory": trajectory,
-    }
-    return result
+        trajectory = _trajectory(gp, recorder)
+        result = {
+            **case.to_dict(),
+            "workers": workers,
+            "native_available": cpp.available(),
+            "native_enabled": cpp.backend_enabled(),
+            "elapsed_seconds": elapsed,
+            "trials": gp.trial_count,
+            "factors_per_second": gp.trial_count / elapsed if elapsed > 0.0 else None,
+            "rss_source": memory.source,
+            "baseline_rss_bytes": memory.baseline_bytes,
+            "peak_rss_bytes": memory.peak_bytes,
+            "peak_rss_delta_bytes": memory.delta_bytes,
+            "memory_guard_bytes": guard,
+            "memory_guard_ok": memory.source != "unavailable" and memory.delta_bytes <= guard,
+            "resources": resources,
+            "trajectory": trajectory,
+        }
+        return result
 
 
 def _parse_csv(raw: str, *, choices: set[str] | None = None) -> list[str]:
@@ -453,9 +453,7 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--min-speedup must be positive")
     if args.enforce and args.quick:
         parser.error("--enforce requires the real workload sizes; remove --quick")
-    if args.enforce and (
-        200 not in args.panels or not {"serial", "auto"}.issubset(args.resources)
-    ):
+    if args.enforce and (200 not in args.panels or not {"serial", "auto"}.issubset(args.resources)):
         parser.error("--enforce requires panel 200 and both serial and auto resources")
     if bool(args._case_file) != bool(args._result_file):
         parser.error("internal case and result paths must be supplied together")
@@ -595,9 +593,7 @@ def _print_results(results: list[dict[str, Any]], gates: dict[str, Any]) -> None
         key = (str(result["workload"]), int(result["symbols"]), str(result["resource_mode"]))
         grouped.setdefault(key, []).append(result)
 
-    print(
-        "workload  symbols  mode       workers   median s   factors/s   peak delta / guard"
-    )
+    print("workload  symbols  mode       workers   median s   factors/s   peak delta / guard")
     print("-" * 88)
     for (workload, symbols, mode), rows in grouped.items():
         elapsed = _median(rows, "elapsed_seconds")
@@ -641,9 +637,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for workload in args.workloads:
         target_population, target_generations = WORKLOADS[workload]
         population, generations = (
-            QUICK_WORKLOADS[workload]
-            if args.quick
-            else (target_population, target_generations)
+            QUICK_WORKLOADS[workload] if args.quick else (target_population, target_generations)
         )
         for symbols in args.panels:
             for resource_mode in args.resources:

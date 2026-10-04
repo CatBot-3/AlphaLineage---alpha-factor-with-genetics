@@ -18,6 +18,7 @@ from typing import Any
 from alphalineage.core.tree import Node
 from alphalineage.core.tree import from_dict as tree_from_dict
 from alphalineage.core.tree import to_dict as tree_to_dict
+from alphalineage.data.identifiers import atomic_write_text
 
 
 @dataclass
@@ -119,12 +120,15 @@ class LineageStore:
     def save(self, path: str | Path) -> Path:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(self.to_dict()), encoding="utf-8")
+        atomic_write_text(target, json.dumps(self.to_dict()))
         return target
 
     @classmethod
     def load(cls, path: str | Path) -> LineageStore:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LineageStore:
         store = cls(run_id=data.get("run_id", "run"))
         store.metadata = data.get("metadata", {})
         store.nodes = [
@@ -139,4 +143,5 @@ class LineageStore:
             for n in data["nodes"]
         ]
         store._next_id = max((n.id for n in store.nodes), default=-1) + 1
+        store.continue_from(max((n.generation for n in store.nodes), default=0))
         return store

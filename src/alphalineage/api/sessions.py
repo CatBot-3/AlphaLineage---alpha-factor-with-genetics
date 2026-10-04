@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -197,9 +198,7 @@ def _report_tree_key(tree: Node) -> str:
     return hashlib.sha256(expanded.encode("utf-8")).hexdigest()
 
 
-def _load_report_cache(
-    path: Path, context: str
-) -> dict[str, ReportReturnSummary]:
+def _load_report_cache(path: Path, context: str) -> dict[str, ReportReturnSummary]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -213,9 +212,7 @@ def _load_report_cache(
     return dict(payload["entries"])
 
 
-def _save_report_cache(
-    path: Path, context: str, entries: dict[str, ReportReturnSummary]
-) -> None:
+def _save_report_cache(path: Path, context: str, entries: dict[str, ReportReturnSummary]) -> None:
     payload = {
         "version": _REPORT_CACHE_VERSION,
         "context": context,
@@ -315,63 +312,59 @@ def _round_summary_from_result(
     metadata = dict(result.get("round_metadata") or {})
     raw_test_read_index = metadata.get("test_read_index", result.get("test_read_index"))
     test_read_index = (
-        _int_or(raw_test_read_index, index + 1)
-        if raw_test_read_index is not None
-        else None
+        _int_or(raw_test_read_index, index + 1) if raw_test_read_index is not None else None
     )
     report_available = result.get("report") is not None
-    return _with_round_validity({
-        "index": index,
-        "segment_index": _int_or(
-            metadata.get("segment_index", result.get("segment")), index
-        ),
-        "report_available": report_available,
-        "validation_only": bool(
-            metadata.get("validation_only", result.get("validation_only", not report_available))
-        ),
-        "finalization_available": bool(metadata.get("finalization_available", report_available)),
-        "latest_finalization_id": metadata.get("latest_finalization_id"),
-        "latest_strategy_comparison_id": metadata.get(
-            "latest_strategy_comparison_id"
-        ),
-        "latest_strategy_plan_id": metadata.get("latest_strategy_plan_id"),
-        "test_read_index": test_read_index,
-        "evidence_status": metadata.get(
-            "evidence_status",
-            (
-                "locked"
-                if test_read_index == 1
-                else "exploratory_repeat"
-                if test_read_index is not None
-                else "validation_only"
+    return _with_round_validity(
+        {
+            "index": index,
+            "segment_index": _int_or(metadata.get("segment_index", result.get("segment")), index),
+            "report_available": report_available,
+            "validation_only": bool(
+                metadata.get("validation_only", result.get("validation_only", not report_available))
             ),
-        ),
-        "status": metadata.get(
-            "status",
-            "stopped" if result.get("termination_reason") == "user_stopped" else "done",
-        ),
-        "started_at": metadata.get("started_at"),
-        "completed_at": metadata.get("completed_at"),
-        "requested_generations": metadata.get("requested_generations"),
-        "gen_start": metadata.get("gen_start"),
-        "gen_end": metadata.get("gen_end", result.get("generations")),
-        "termination_reason": metadata.get(
-            "termination_reason", result.get("termination_reason")
-        ),
-        "selected_lineage_node_id": metadata.get("selected_lineage_node_id"),
-        "resources": metadata.get("resources", result.get("resources")),
-        "timings": metadata.get("timings", result.get("timings")),
-        "panel_fingerprint": metadata.get("panel_fingerprint"),
-        "scorer_version": metadata.get("scorer_version"),
-        "evolution_version": metadata.get("evolution_version"),
-        "adjustment_version": metadata.get("adjustment_version"),
-        "portfolio_schema_version": metadata.get("portfolio_schema_version"),
-        "validation_selection_version": metadata.get(
-            "validation_selection_version"
-        ),
-        "selection": metadata.get("selection", result.get("selection")),
-        "legacy": legacy,
-    })
+            "finalization_available": bool(
+                metadata.get("finalization_available", report_available)
+            ),
+            "latest_finalization_id": metadata.get("latest_finalization_id"),
+            "latest_strategy_comparison_id": metadata.get("latest_strategy_comparison_id"),
+            "latest_strategy_plan_id": metadata.get("latest_strategy_plan_id"),
+            "test_read_index": test_read_index,
+            "evidence_status": metadata.get(
+                "evidence_status",
+                (
+                    "locked"
+                    if test_read_index == 1
+                    else "exploratory_repeat"
+                    if test_read_index is not None
+                    else "validation_only"
+                ),
+            ),
+            "status": metadata.get(
+                "status",
+                "stopped" if result.get("termination_reason") == "user_stopped" else "done",
+            ),
+            "started_at": metadata.get("started_at"),
+            "completed_at": metadata.get("completed_at"),
+            "requested_generations": metadata.get("requested_generations"),
+            "gen_start": metadata.get("gen_start"),
+            "gen_end": metadata.get("gen_end", result.get("generations")),
+            "termination_reason": metadata.get(
+                "termination_reason", result.get("termination_reason")
+            ),
+            "selected_lineage_node_id": metadata.get("selected_lineage_node_id"),
+            "resources": metadata.get("resources", result.get("resources")),
+            "timings": metadata.get("timings", result.get("timings")),
+            "panel_fingerprint": metadata.get("panel_fingerprint"),
+            "scorer_version": metadata.get("scorer_version"),
+            "evolution_version": metadata.get("evolution_version"),
+            "adjustment_version": metadata.get("adjustment_version"),
+            "portfolio_schema_version": metadata.get("portfolio_schema_version"),
+            "validation_selection_version": metadata.get("validation_selection_version"),
+            "selection": metadata.get("selection", result.get("selection")),
+            "legacy": legacy,
+        }
+    )
 
 
 def _with_round_validity(summary: dict[str, Any]) -> dict[str, Any]:
@@ -415,8 +408,7 @@ def _legacy_round_summary(
         (
             item
             for item in segments
-            if isinstance(item, dict)
-            and _int_or(item.get("index"), -1) == segment_index
+            if isinstance(item, dict) and _int_or(item.get("index"), -1) == segment_index
         ),
         {},
     )
@@ -460,11 +452,7 @@ def list_rounds(session_id: str) -> list[dict[str, Any]]:
     session = load_session(session_id)
     stored = session.get("rounds")
     if isinstance(stored, list) and stored:
-        return [
-            _with_round_validity(dict(item))
-            for item in stored
-            if isinstance(item, dict)
-        ]
+        return [_with_round_validity(dict(item)) for item in stored if isinstance(item, dict)]
     legacy = _read_result(session_dir(session_id) / "result.json")
     if legacy is None or legacy.get("report") is None:
         return []
@@ -527,9 +515,7 @@ def _comparison_summary(artifact: dict[str, Any]) -> dict[str, Any]:
         "evidence_status": artifact.get("evidence_status"),
         "prior_holdout_reads": int(artifact.get("prior_holdout_reads", 0)),
         "strategy_ids": [
-            str(item.get("id"))
-            for item in artifact.get("strategies", [])
-            if isinstance(item, dict)
+            str(item.get("id")) for item in artifact.get("strategies", []) if isinstance(item, dict)
         ],
         "created_at": artifact.get("created_at"),
         "completed_at": artifact.get("completed_at"),
@@ -597,9 +583,7 @@ def claim_strategy_comparison(
             "job_id": job_id,
             "status": "queued",
             "evidence_status": (
-                "post_holdout_adaptive"
-                if prior_holdout_reads > 0
-                else "validation_only"
+                "post_holdout_adaptive" if prior_holdout_reads > 0 else "validation_only"
             ),
             "prior_holdout_reads": prior_holdout_reads,
             "created_at": created_at,
@@ -611,14 +595,10 @@ def claim_strategy_comparison(
             },
             "strategies": [item.to_dict() for item in strategies],
             "strategy_results": [],
-            "formula_fingerprint": hashlib.sha256(
-                best_factor.encode("utf-8")
-            ).hexdigest(),
+            "formula_fingerprint": hashlib.sha256(best_factor.encode("utf-8")).hexdigest(),
             "holdout_fingerprint": (
                 round_payload.get("holdout_fingerprint")
-                or (round_payload.get("round_metadata") or {}).get(
-                    "holdout_fingerprint"
-                )
+                or (round_payload.get("round_metadata") or {}).get("holdout_fingerprint")
             ),
         }
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -758,15 +738,11 @@ def _plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "strategy_plan_id": str(plan["strategy_plan_id"]),
         "round_index": int(plan["round_index"]),
         "comparison_id": (
-            str(plan["comparison_id"])
-            if plan.get("comparison_id") is not None
-            else None
+            str(plan["comparison_id"]) if plan.get("comparison_id") is not None else None
         ),
         "primary_strategy_id": str(plan["primary_strategy_id"]),
         "strategy_ids": [
-            str(item.get("id"))
-            for item in plan.get("strategies", [])
-            if isinstance(item, dict)
+            str(item.get("id")) for item in plan.get("strategies", []) if isinstance(item, dict)
         ],
         "created_at": plan.get("created_at"),
     }
@@ -813,8 +789,7 @@ def create_finalization_plan(
             (
                 item
                 for item in comparison.get("strategy_results", [])
-                if isinstance(item, dict)
-                and item.get("strategy_id") == primary_strategy_id
+                if isinstance(item, dict) and item.get("strategy_id") == primary_strategy_id
             ),
             None,
         )
@@ -897,9 +872,7 @@ def _ensure_compatibility_finalization_plan(
             "slippage_bps": costs.slippage_bps,
         },
         "portfolio_schema_version": PORTFOLIO_SCHEMA_VERSION,
-        "formula_fingerprint": hashlib.sha256(
-            best_factor.encode("utf-8")
-        ).hexdigest(),
+        "formula_fingerprint": hashlib.sha256(best_factor.encode("utf-8")).hexdigest(),
         "holdout_fingerprint": holdout_fingerprint_value,
         "source": "compatibility_default",
         "created_at": _utc_now(),
@@ -937,9 +910,7 @@ def _finalization_summary(
         "started_at": artifact.get("started_at"),
         "completed_at": artifact.get("completed_at"),
         "report_available": artifact.get("report") is not None,
-        "inherited_evidence_sources": list(
-            artifact.get("inherited_evidence_sources") or []
-        ),
+        "inherited_evidence_sources": list(artifact.get("inherited_evidence_sources") or []),
         "inherited_test_reads": int(artifact.get("inherited_test_reads", 0)),
         "test_reads": int(artifact.get("test_reads", 0)),
         "legacy": legacy,
@@ -970,27 +941,19 @@ def _legacy_finalizations(session_id: str) -> list[dict[str, Any]]:
                 "round_index": int(summary["index"]),
                 "status": "done",
                 "evidence_status": (
-                    "locked_first_read"
-                    if read_index == 1
-                    else "repeated_same_holdout"
+                    "locked_first_read" if read_index == 1 else "repeated_same_holdout"
                 ),
                 "same_holdout_read_index": read_index,
                 "session_holdout_reads": session_reads,
                 "holdout_fingerprint": (
                     payload.get("holdout_fingerprint")
-                    or (payload.get("round_metadata") or {}).get(
-                        "holdout_fingerprint"
-                    )
+                    or (payload.get("round_metadata") or {}).get("holdout_fingerprint")
                     or "legacy-unknown"
                 ),
                 "started_at": (payload.get("round_metadata") or {}).get("started_at"),
-                "completed_at": (payload.get("round_metadata") or {}).get(
-                    "completed_at"
-                ),
+                "completed_at": (payload.get("round_metadata") or {}).get("completed_at"),
                 "report_available": True,
-                "inherited_evidence_sources": list(
-                    session.get("inherited_evidence_sources") or []
-                ),
+                "inherited_evidence_sources": list(session.get("inherited_evidence_sources") or []),
                 "inherited_test_reads": inherited,
                 "test_reads": inherited + session_reads,
                 "legacy": True,
@@ -1015,9 +978,7 @@ def _adapt_legacy_no_exposure(report: Any) -> Any:
     avg_gross = metrics.get("avg_gross")
     avg_positions = metrics.get("avg_positions")
     try:
-        no_exposure = float(avg_gross or 0.0) <= 1e-12 and float(
-            avg_positions or 0.0
-        ) <= 1e-12
+        no_exposure = float(avg_gross or 0.0) <= 1e-12 and float(avg_positions or 0.0) <= 1e-12
     except (TypeError, ValueError):
         no_exposure = False
     if not no_exposure:
@@ -1077,9 +1038,7 @@ def _adapt_finalization_payload(payload: dict[str, Any]) -> dict[str, Any]:
         report["oos_backtest"] = oos
     for item in payload.get("strategy_results", []):
         if isinstance(item, dict):
-            item["oos_backtest"] = _adapt_legacy_no_exposure(
-                item.get("oos_backtest")
-            )
+            item["oos_backtest"] = _adapt_legacy_no_exposure(item.get("oos_backtest"))
     return payload
 
 
@@ -1107,16 +1066,18 @@ def load_finalization(
     )
     if summary is None:
         return None
-    return _adapt_finalization_payload({
-        "schema_version": 0,
-        **summary,
-        "best_factor": round_payload.get("best_factor"),
-        "report": round_payload.get("report"),
-        "oos_backtest": round_payload.get("oos_backtest")
-        or (round_payload.get("report") or {}).get("oos_backtest"),
-        "context": round_payload.get("context"),
-        "selection": round_payload.get("selection"),
-    })
+    return _adapt_finalization_payload(
+        {
+            "schema_version": 0,
+            **summary,
+            "best_factor": round_payload.get("best_factor"),
+            "report": round_payload.get("report"),
+            "oos_backtest": round_payload.get("oos_backtest")
+            or (round_payload.get("report") or {}).get("oos_backtest"),
+            "context": round_payload.get("context"),
+            "selection": round_payload.get("selection"),
+        }
+    )
 
 
 def _migrate_legacy_result(session: dict[str, Any]) -> None:
@@ -1209,9 +1170,7 @@ def lineage_for_round(session_id: str, index: int) -> dict[str, Any] | None:
 
 def _ensure_evidence_fields(session: dict[str, Any]) -> None:
     """Populate separated inherited/session evidence counters for old sessions."""
-    legacy_reports = sum(
-        bool(item.get("report_available")) for item in session.get("rounds", [])
-    )
+    legacy_reports = sum(bool(item.get("report_available")) for item in session.get("rounds", []))
     if legacy_reports == 0:
         latest = _read_result(session_dir(session["id"]) / "result.json")
         legacy_reports = int(bool(latest is not None and latest.get("report") is not None))
@@ -1314,9 +1273,7 @@ def claim_finalization(
             "holdout_fingerprint": holdout_fingerprint_value,
             "strategy_plan_id": strategy_plan_id,
             "comparison_id": plan.get("comparison_id") if plan is not None else None,
-            "primary_strategy_id": (
-                plan.get("primary_strategy_id") if plan is not None else None
-            ),
+            "primary_strategy_id": (plan.get("primary_strategy_id") if plan is not None else None),
             "status": "queued",
             "started_at": _utc_now(),
         }
@@ -1426,9 +1383,7 @@ def finish_job(session_id: str, job_id: str, status: str, *, error: str | None =
                 }
             )
             session["last_job"] = last_job
-            committed = any(
-                item.get("job_id") == job_id for item in session.get("segments", [])
-            )
+            committed = any(item.get("job_id") == job_id for item in session.get("segments", []))
             if not committed and status in {"stopped", "failed", "interrupted"}:
                 session.setdefault("segments", []).append(
                     {
@@ -1442,9 +1397,7 @@ def finish_job(session_id: str, job_id: str, status: str, *, error: str | None =
                         "new_trials": 0,
                         "status": status,
                         "resources": last_job.get("resources") or None,
-                        "termination_reason": (
-                            "user_stopped" if status == "stopped" else status
-                        ),
+                        "termination_reason": ("user_stopped" if status == "stopped" else status),
                         "report_cancelled": True,
                         "report_available": False,
                         "started_at": last_job.get("started_at"),
@@ -1547,321 +1500,362 @@ def run_segment(
     scheduler: TrainingScheduler = TRAINING_SCHEDULER,
 ) -> dict[str, Any]:
     """Run one segment (fresh start or warm continue) and persist all session state."""
-    directory = session_dir(session_id)
-    session = load_session(session_id)
-    _migrate_legacy_result(session)
-    session.setdefault("rounds", [])
-    # Persist a migrated legacy result before this segment can replace result.json.
-    save_session(session)
-    boundaries = Boundaries.from_dict(session["boundaries"])
-    panel_fingerprint = _panel_fingerprint(panel)
-    wall_started_at = (
-        (session.get("last_job") or {}).get("started_at")
-        or (session.get("last_job") or {}).get("queued_at")
-        or _utc_now()
-    )
-
-    split = split_from_boundaries(panel.dates, boundaries)  # ValueError if locked segs empty (P1)
-    train_panel = Panel({f: df.loc[df.index.isin(split.train)] for f, df in panel.fields.items()})
-    test_start = pd.Timestamp(boundaries.test_start)
-    if len(train_panel.dates) and train_panel.dates.max() >= test_start:
-        raise RuntimeError("train panel leaked a locked test date (invariant 1)")
-
-    checkpoint = directory / "checkpoint.json"
-    lineage_path = directory / "lineage.json"
-    warm = checkpoint.exists()
-    if warm:
-        restart_reason = continuation_restart_reason(session_id)
-        if restart_reason:
-            raise RuntimeError(f"Restart with the same setup: {restart_reason}")
-        completed_rounds = list_rounds(session_id)
-        prior_fingerprint = (
-            completed_rounds[-1].get("panel_fingerprint")
-            if completed_rounds
-            else (session.get("segments") or [{}])[-1].get("panel_fingerprint")
+    with ExitStack() as training_contexts:
+        directory = session_dir(session_id)
+        session = load_session(session_id)
+        _migrate_legacy_result(session)
+        session.setdefault("rounds", [])
+        # Persist a migrated legacy result before this segment can replace result.json.
+        save_session(session)
+        boundaries = Boundaries.from_dict(session["boundaries"])
+        panel_fingerprint = _panel_fingerprint(panel)
+        wall_started_at = (
+            (session.get("last_job") or {}).get("started_at")
+            or (session.get("last_job") or {}).get("queued_at")
+            or _utc_now()
         )
-        if prior_fingerprint is not None and prior_fingerprint != panel_fingerprint:
-            # The population structure is compatible, but every cached fitness belongs
-            # to a different data revision and must be recomputed before evolution.
-            rescore = True
 
-    store = (
-        LineageStore.load(lineage_path)
-        if lineage_path.exists()
-        else LineageStore(run_id=session_id)
-    )
-    recorder: Any = store
-    if progress is not None:
-        progress.attach(store)
-        recorder = progress
+        split = split_from_boundaries(
+            panel.dates, boundaries
+        )  # ValueError if locked segs empty (P1)
+        train_panel = Panel(
+            {f: df.loc[df.index.isin(split.train)] for f, df in panel.fields.items()}
+        )
+        test_start = pd.Timestamp(boundaries.test_start)
+        if len(train_panel.dates) and train_panel.dates.max() >= test_start:
+            raise RuntimeError("train panel leaked a locked test date (invariant 1)")
 
-    prev_cumulative = int(session["cumulative_trials"])
-    started = time.monotonic()
-    lease_context = scheduler.acquire(resources, cancel=stop) if resources is not None else None
-    if progress is not None and hasattr(progress, "set_phase"):
-        progress.set_phase("queued" if resources is not None else "initializing")
-
-    def execute(
-        lease: Any = None,
-    ) -> tuple[
-        GP,
-        ValidationSelection,
-        list[Node],
-        int,
-        int,
-        dict[str, float],
-    ]:
-        workers = int(lease.max_workers) if lease is not None else 1
-        memory_budget = int(lease.memory_budget_bytes) if lease is not None else None
-        # The lease reserves the ceiling; the tuner decides how much of it each batch is worth.
-        # Timings carry across segments in the checkpoint because they describe the machine,
-        # not the search - and worker count cannot change what a search finds.
-        tuner = WorkerTuner(workers)
-        if progress is not None and hasattr(progress, "set_tuning"):
-            progress.set_tuning(tuner.snapshot().to_dict())
-        if progress is not None and hasattr(progress, "set_phase"):
-            progress.set_phase("preparing_references" if config.novelty_mode == "balanced" else "initializing")
-        training_started = time.monotonic()
+        checkpoint = directory / "checkpoint.json"
+        lineage_path = directory / "lineage.json"
+        warm = checkpoint.exists()
+        checkpoint_payload = _read_result(checkpoint) if warm else None
+        recovery = (checkpoint_payload or {}).get("session_state") or {}
         if warm:
-            store.continue_from(_last_generation(store))
-            gp = GP.from_checkpoint(
-                checkpoint,
-                train_panel,
-                recorder=recorder,
-                allowed_operators=allowed_operators,
-                workers=workers,
-                memory_budget_bytes=memory_budget,
-                tuner=tuner,
+            restart_reason = continuation_restart_reason(session_id)
+            if restart_reason:
+                raise RuntimeError(f"Restart with the same setup: {restart_reason}")
+            completed_rounds = list_rounds(session_id)
+            prior_fingerprint = recovery.get("panel_fingerprint") or (
+                completed_rounds[-1].get("panel_fingerprint")
+                if completed_rounds
+                else (session.get("segments") or [{}])[-1].get("panel_fingerprint")
             )
-            gp.config = config  # apply any continue-time overrides
-            if rescore:
-                gp.rescore_population()
-            if extra_seeds:
-                _inject_seeds(gp, extra_seeds)
-            gen_start = gp.generation
-            target = gp.generation + generations
-            if progress is not None:
-                progress.set_target(target)
-            gp.run(generations=target, stop=stop)
-        else:
-            gp = GP(
-                config,
-                train_panel,
-                recorder=recorder,
-                allowed_operators=allowed_operators,
-                workers=workers,
-                memory_budget_bytes=memory_budget,
-                tuner=tuner,
-                novelty_state=session.get("novelty"),
-            )
-            gen_start = 0
-            target = generations
-            if progress is not None:
-                progress.set_target(target)
-            gp.run(generations=target, seeds=list(seeds), stop=stop)
-        training_seconds = time.monotonic() - training_started
-        if progress is not None and hasattr(progress, "set_tuning"):
-            progress.set_tuning(tuner.snapshot().to_dict())
+            if prior_fingerprint is not None and prior_fingerprint != panel_fingerprint:
+                # The population structure is compatible, but every cached fitness belongs
+                # to a different data revision and must be recomputed before evolution.
+                rescore = True
 
-        gp.save_checkpoint(checkpoint)
-        store.save(lineage_path)
-        if progress is not None and hasattr(progress, "set_phase"):
-            progress.set_phase("validating")
-        validation_started = time.monotonic()
-        fwd = forward_returns(panel, gp.config.horizon, gp.config.execution)
-        searched_candidates = gp.searched_individuals()
-        selection_result = select_validation_candidate(
-            gp.validation_candidates(),
-            panel,
-            fwd,
-            split.valid,
-            method=gp.config.ic_method,
-            parsimony=gp.config.parsimony,
-            complexity_penalty_mode=getattr(
-                gp.config,
-                "complexity_penalty_mode",
-                "per_node",
-            ),
-            complexity_penalty_value=getattr(
-                gp.config,
-                "resolved_complexity_penalty_value",
-                gp.config.parsimony,
-            ),
-            max_nodes=gp.config.max_nodes,
-            validation_folds=getattr(gp.config, "validation_folds", 3),
-            fold_embargo=boundaries.embargo,
-            min_names=gp.config.min_names,
-            workers=workers,
-            memory_budget_bytes=memory_budget,
+        store = (
+            LineageStore.from_dict(recovery["lineage"])
+            if "lineage" in recovery
+            else LineageStore.load(lineage_path)
+            if lineage_path.exists()
+            else LineageStore(run_id=session_id)
         )
-        record_validation = getattr(gp, "record_formula_validation_scores", None)
-        if callable(record_validation):
-            record_validation(selection_result.candidate_validation_scores)
-            gp.save_checkpoint(checkpoint)
-        trials = orient_training_candidates(searched_candidates)
-        return gp, selection_result, trials, gen_start, target, {
-            "training_seconds": training_seconds,
-            "validation_seconds": time.monotonic() - validation_started,
-            "reporting_seconds": 0.0,
-            "total_seconds": time.monotonic() - started,
-        }
+        if recovery and _last_generation(store) != (checkpoint_payload or {}).get("generation"):
+            raise ValueError("Recovery checkpoint and lineage generations do not match")
 
-    if lease_context is None:
-        gp, selection_result, report_trials, gen_start, target, timings = execute()
-    else:
-        with lease_context as lease:
-            gp, selection_result, report_trials, gen_start, target, timings = execute(lease)
+        def persist_snapshot(engine: GP) -> None:
+            payload = engine.checkpoint_state()
+            payload["session_state"] = {
+                "version": 1,
+                "panel_fingerprint": panel_fingerprint,
+                "lineage": store.to_dict(),
+            }
+            try:
+                atomic_write_text(checkpoint, json.dumps(payload))
+            except OSError as exc:
+                raise OSError(
+                    f"Cannot save training recovery checkpoint at {checkpoint}; "
+                    f"the previous complete snapshot is preserved: {exc}"
+                ) from exc
 
-    session["cumulative_trials"] = gp.trial_count
-    _ensure_evidence_fields(session)
-    session["last_job_id"] = job_id
-    termination_reason = gp.termination_reason
-    stopped_early = termination_reason == "user_stopped"
-    resolved_resources = resources.to_dict() if resources is not None else None
-    completed_at = _utc_now()
-    segment_index = len(session["segments"])
-    segment_status = "stopped" if stopped_early else "done"
-    selected_lineage_node_id = _selected_lineage_node_id(
-        store,
-        selection_result.source_tree,
-        gp.generation,
-    )
-    selection = selection_result.metadata()
-    coverage_source = getattr(gp, "formula_exploration", {})
-    if callable(coverage_source):
-        coverage_source = coverage_source()
-    parameter_coverage = (
-        dict(coverage_source) if isinstance(coverage_source, dict) else {}
-    )
-    evidence_status = (
-        "post_holdout_adaptive"
-        if int(session.get("session_holdout_reads", 0)) > 0
-        else "validation_only"
-    )
-    frozen_holdout_fingerprint = holdout_fingerprint(panel, boundaries, config)
-    segment = {
-        "index": segment_index,
-        "job_id": job_id,
-        "universe": session["universe"],
-        "universe_definition": session.get("universe_definition"),
-        "config": config.to_dict(),
-        "requested_generations": int(generations),
-        "gen_start": gen_start,
-        "gen_end": gp.generation,
-        "new_trials": gp.trial_count - prev_cumulative,
-        "status": segment_status,
-        "resources": resolved_resources,
-        "termination_reason": termination_reason,
-        "report_cancelled": False,
-        "report_available": False,
-        "started_at": wall_started_at,
-        "completed_at": completed_at,
-        "timings": timings,
-        "panel_fingerprint": panel_fingerprint,
-        "scorer_version": SCORER_VERSION,
-        "evolution_version": EVOLUTION_VERSION,
-        "adjustment_version": _adjustment_version(),
-        "portfolio_schema_version": PORTFOLIO_SCHEMA_VERSION,
-        "validation_selection_version": VALIDATION_SELECTION_VERSION,
-        "selected_lineage_node_id": selected_lineage_node_id,
-        "selection": selection,
-        "parameter_coverage": parameter_coverage,
-        "evidence_status": evidence_status,
-    }
-    session["segments"].append(segment)
-    session["last_requested_generations"] = int(generations)
+        recorder: Any = store
+        if progress is not None:
+            progress.attach(store)
+            recorder = progress
 
-    result = {
-        "best_factor": to_json(selection_result.oriented_tree),
-        "report": None,
-        "oos_backtest": None,
-        "validation_only": True,
-        "generations": gp.generation,
-        "history": gp.history,
-        "lineage": store.to_dict(),
-        "session_id": session_id,
-        "segment": segment_index,
-        "test_reads": session["test_reads"],
-        "session_holdout_reads": int(session["session_holdout_reads"]),
-        "inherited_test_reads": int(session["inherited_test_reads"]),
-        "inherited_evidence_sources": list(
-            session.get("inherited_evidence_sources") or []
-        ),
-        "holdout_fingerprint": frozen_holdout_fingerprint,
-        "cumulative_trials": session["cumulative_trials"],
-        "repeated_oos_warning": int(session["session_holdout_reads"]) > 1,
-        "test_read_index": None,
-        "evidence_status": evidence_status,
-        "resources": resolved_resources,
-        "termination_reason": termination_reason,
-        "timings": timings,
-        "context": {
-            **report_context(split, gp.config, embargo=boundaries.embargo),
+        prev_cumulative = int(session["cumulative_trials"])
+        started = time.monotonic()
+        lease_context = scheduler.acquire(resources, cancel=stop) if resources is not None else None
+        if progress is not None and hasattr(progress, "set_phase"):
+            progress.set_phase("queued" if resources is not None else "initializing")
+
+        def execute(
+            lease: Any = None,
+        ) -> tuple[
+            GP,
+            ValidationSelection,
+            list[Node],
+            int,
+            int,
+            dict[str, float],
+        ]:
+            workers = int(lease.max_workers) if lease is not None else 1
+            memory_budget = int(lease.memory_budget_bytes) if lease is not None else None
+            # The lease reserves the ceiling; the tuner decides how much of it each batch is worth.
+            # Timings carry across segments in the checkpoint because they describe the machine,
+            # not the search - and worker count cannot change what a search finds.
+            tuner = WorkerTuner(workers)
+            if progress is not None and hasattr(progress, "set_tuning"):
+                progress.set_tuning(tuner.snapshot().to_dict())
+            if progress is not None and hasattr(progress, "set_phase"):
+                progress.set_phase(
+                    "preparing_references" if config.novelty_mode == "balanced" else "initializing"
+                )
+            training_started = time.monotonic()
+            if warm:
+                store.continue_from(_last_generation(store))
+                gp = training_contexts.enter_context(
+                    GP.from_checkpoint(
+                        checkpoint,
+                        train_panel,
+                        recorder=recorder,
+                        allowed_operators=allowed_operators,
+                        workers=workers,
+                        memory_budget_bytes=memory_budget,
+                        tuner=tuner,
+                    )
+                )
+                gp.config = config  # apply any continue-time overrides
+                if rescore:
+                    gp.rescore_population()
+                if extra_seeds:
+                    _inject_seeds(gp, extra_seeds)
+                gen_start = gp.generation
+                target = gp.generation + generations
+                if progress is not None:
+                    progress.set_target(target)
+                gp.run(generations=target, stop=stop, on_commit=persist_snapshot)
+            else:
+                gp = training_contexts.enter_context(
+                    GP(
+                        config,
+                        train_panel,
+                        recorder=recorder,
+                        allowed_operators=allowed_operators,
+                        workers=workers,
+                        memory_budget_bytes=memory_budget,
+                        tuner=tuner,
+                        novelty_state=session.get("novelty"),
+                    )
+                )
+                gen_start = 0
+                target = generations
+                if progress is not None:
+                    progress.set_target(target)
+                gp.run(
+                    generations=target,
+                    seeds=list(seeds),
+                    stop=stop,
+                    on_commit=persist_snapshot,
+                )
+            training_seconds = time.monotonic() - training_started
+            if progress is not None and hasattr(progress, "set_tuning"):
+                progress.set_tuning(tuner.snapshot().to_dict())
+
+            persist_snapshot(gp)
+            store.save(lineage_path)
+            if progress is not None and hasattr(progress, "set_phase"):
+                progress.set_phase("validating")
+            validation_started = time.monotonic()
+            fwd = forward_returns(panel, gp.config.horizon, gp.config.execution)
+            searched_candidates = gp.searched_individuals()
+            selection_result = select_validation_candidate(
+                gp.validation_candidates(),
+                panel,
+                fwd,
+                split.valid,
+                method=gp.config.ic_method,
+                parsimony=gp.config.parsimony,
+                complexity_penalty_mode=getattr(
+                    gp.config,
+                    "complexity_penalty_mode",
+                    "per_node",
+                ),
+                complexity_penalty_value=getattr(
+                    gp.config,
+                    "resolved_complexity_penalty_value",
+                    gp.config.parsimony,
+                ),
+                max_nodes=gp.config.max_nodes,
+                validation_folds=getattr(gp.config, "validation_folds", 3),
+                fold_embargo=boundaries.embargo,
+                min_names=gp.config.min_names,
+                workers=workers,
+                memory_budget_bytes=memory_budget,
+            )
+            record_validation = getattr(gp, "record_formula_validation_scores", None)
+            if callable(record_validation):
+                record_validation(selection_result.candidate_validation_scores)
+                persist_snapshot(gp)
+            trials = orient_training_candidates(searched_candidates)
+            return (
+                gp,
+                selection_result,
+                trials,
+                gen_start,
+                target,
+                {
+                    "training_seconds": training_seconds,
+                    "validation_seconds": time.monotonic() - validation_started,
+                    "reporting_seconds": 0.0,
+                    "total_seconds": time.monotonic() - started,
+                },
+            )
+
+        if lease_context is None:
+            gp, selection_result, report_trials, gen_start, target, timings = execute()
+        else:
+            with lease_context as lease:
+                gp, selection_result, report_trials, gen_start, target, timings = execute(lease)
+
+        session["cumulative_trials"] = gp.trial_count
+        _ensure_evidence_fields(session)
+        session["last_job_id"] = job_id
+        termination_reason = gp.termination_reason
+        stopped_early = termination_reason == "user_stopped"
+        resolved_resources = resources.to_dict() if resources is not None else None
+        completed_at = _utc_now()
+        segment_index = len(session["segments"])
+        segment_status = "stopped" if stopped_early else "done"
+        selected_lineage_node_id = _selected_lineage_node_id(
+            store,
+            selection_result.source_tree,
+            gp.generation,
+        )
+        selection = selection_result.metadata()
+        coverage_source = getattr(gp, "formula_exploration", {})
+        if callable(coverage_source):
+            coverage_source = coverage_source()
+        parameter_coverage = dict(coverage_source) if isinstance(coverage_source, dict) else {}
+        evidence_status = (
+            "post_holdout_adaptive"
+            if int(session.get("session_holdout_reads", 0)) > 0
+            else "validation_only"
+        )
+        frozen_holdout_fingerprint = holdout_fingerprint(panel, boundaries, config)
+        segment = {
+            "index": segment_index,
+            "job_id": job_id,
             "universe": session["universe"],
-            "universe_revision": (session.get("universe_definition") or {}).get("fingerprint"),
             "universe_definition": session.get("universe_definition"),
-            "as_of": session["as_of"],
-        },
-        "report_cancelled": False,
-        "selection": selection,
-        "parameter_coverage": parameter_coverage,
-        "report_trials": [to_json(tree) for tree in report_trials],
-        "searched_trials": int(session["trial_baseline"]) + gp.trial_count,
-        "n_user_operators": user_operator_count(allowed_operators),
-    }
-    # A committed generation produces one immutable validation round. The locked
-    # holdout remains untouched until the user explicitly finalizes a selected round.
-    round_index = len(session["rounds"])
-    while round_path(session_id, round_index).exists():
-        round_index += 1
-    round_metadata = {
-        "schema_version": ROUND_SCHEMA_VERSION,
-        "index": round_index,
-        "segment_index": segment_index,
-        "validation_only": True,
-        "report_available": False,
-        "finalization_available": False,
-        "latest_finalization_id": None,
-        "latest_strategy_comparison_id": None,
-        "latest_strategy_plan_id": None,
-        "test_read_index": None,
-        "evidence_status": evidence_status,
-        "status": segment_status,
-        "started_at": wall_started_at,
-        "completed_at": completed_at,
-        "requested_generations": int(generations),
-        "gen_start": gen_start,
-        "gen_end": gp.generation,
-        "termination_reason": termination_reason,
-        "selected_lineage_node_id": selected_lineage_node_id,
-        "resources": resolved_resources,
-        "timings": timings,
-        "panel_fingerprint": panel_fingerprint,
-        "holdout_fingerprint": frozen_holdout_fingerprint,
-        "scorer_version": SCORER_VERSION,
-        "evolution_version": EVOLUTION_VERSION,
-        "adjustment_version": _adjustment_version(),
-        "portfolio_schema_version": PORTFOLIO_SCHEMA_VERSION,
-        "validation_selection_version": VALIDATION_SELECTION_VERSION,
-        "selection": selection,
-        "parameter_coverage": parameter_coverage,
-        "config": config.to_dict(),
-        "searched_trials": result["searched_trials"],
-        "n_user_operators": result["n_user_operators"],
-    }
-    result["round_index"] = round_index
-    result["round_metadata"] = round_metadata
-    artifact_path = round_path(session_id, round_index)
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(artifact_path, json.dumps(result))
-    atomic_write_text(directory / "result.json", json.dumps(result))
-    summary = _round_summary_from_result(result, index=round_index)
-    session["rounds"].append(summary)
-    segment["round_index"] = round_index
-    save_session(session)
-    if progress is not None and hasattr(progress, "set_phase"):
-        progress.set_phase("done")
-    return {key: value for key, value in result.items() if key != "report_trials"}
+            "config": config.to_dict(),
+            "requested_generations": int(generations),
+            "gen_start": gen_start,
+            "gen_end": gp.generation,
+            "new_trials": gp.trial_count - prev_cumulative,
+            "status": segment_status,
+            "resources": resolved_resources,
+            "termination_reason": termination_reason,
+            "report_cancelled": False,
+            "report_available": False,
+            "started_at": wall_started_at,
+            "completed_at": completed_at,
+            "timings": timings,
+            "panel_fingerprint": panel_fingerprint,
+            "scorer_version": SCORER_VERSION,
+            "evolution_version": EVOLUTION_VERSION,
+            "adjustment_version": _adjustment_version(),
+            "portfolio_schema_version": PORTFOLIO_SCHEMA_VERSION,
+            "validation_selection_version": VALIDATION_SELECTION_VERSION,
+            "selected_lineage_node_id": selected_lineage_node_id,
+            "selection": selection,
+            "parameter_coverage": parameter_coverage,
+            "evidence_status": evidence_status,
+        }
+        session["segments"].append(segment)
+        session["last_requested_generations"] = int(generations)
+
+        result = {
+            "best_factor": to_json(selection_result.oriented_tree),
+            "report": None,
+            "oos_backtest": None,
+            "validation_only": True,
+            "generations": gp.generation,
+            "history": gp.history,
+            "lineage": store.to_dict(),
+            "session_id": session_id,
+            "segment": segment_index,
+            "test_reads": session["test_reads"],
+            "session_holdout_reads": int(session["session_holdout_reads"]),
+            "inherited_test_reads": int(session["inherited_test_reads"]),
+            "inherited_evidence_sources": list(session.get("inherited_evidence_sources") or []),
+            "holdout_fingerprint": frozen_holdout_fingerprint,
+            "cumulative_trials": session["cumulative_trials"],
+            "repeated_oos_warning": int(session["session_holdout_reads"]) > 1,
+            "test_read_index": None,
+            "evidence_status": evidence_status,
+            "resources": resolved_resources,
+            "termination_reason": termination_reason,
+            "timings": timings,
+            "context": {
+                **report_context(split, gp.config, embargo=boundaries.embargo),
+                "universe": session["universe"],
+                "universe_revision": (session.get("universe_definition") or {}).get("fingerprint"),
+                "universe_definition": session.get("universe_definition"),
+                "as_of": session["as_of"],
+            },
+            "report_cancelled": False,
+            "selection": selection,
+            "parameter_coverage": parameter_coverage,
+            "report_trials": [to_json(tree) for tree in report_trials],
+            "searched_trials": int(session["trial_baseline"]) + gp.trial_count,
+            "n_user_operators": user_operator_count(allowed_operators),
+        }
+        # A committed generation produces one immutable validation round. The locked
+        # holdout remains untouched until the user explicitly finalizes a selected round.
+        round_index = len(session["rounds"])
+        while round_path(session_id, round_index).exists():
+            round_index += 1
+        round_metadata = {
+            "schema_version": ROUND_SCHEMA_VERSION,
+            "index": round_index,
+            "segment_index": segment_index,
+            "validation_only": True,
+            "report_available": False,
+            "finalization_available": False,
+            "latest_finalization_id": None,
+            "latest_strategy_comparison_id": None,
+            "latest_strategy_plan_id": None,
+            "test_read_index": None,
+            "evidence_status": evidence_status,
+            "status": segment_status,
+            "started_at": wall_started_at,
+            "completed_at": completed_at,
+            "requested_generations": int(generations),
+            "gen_start": gen_start,
+            "gen_end": gp.generation,
+            "termination_reason": termination_reason,
+            "selected_lineage_node_id": selected_lineage_node_id,
+            "resources": resolved_resources,
+            "timings": timings,
+            "panel_fingerprint": panel_fingerprint,
+            "holdout_fingerprint": frozen_holdout_fingerprint,
+            "scorer_version": SCORER_VERSION,
+            "evolution_version": EVOLUTION_VERSION,
+            "adjustment_version": _adjustment_version(),
+            "portfolio_schema_version": PORTFOLIO_SCHEMA_VERSION,
+            "validation_selection_version": VALIDATION_SELECTION_VERSION,
+            "selection": selection,
+            "parameter_coverage": parameter_coverage,
+            "config": config.to_dict(),
+            "searched_trials": result["searched_trials"],
+            "n_user_operators": result["n_user_operators"],
+        }
+        result["round_index"] = round_index
+        result["round_metadata"] = round_metadata
+        artifact_path = round_path(session_id, round_index)
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(artifact_path, json.dumps(result))
+        atomic_write_text(directory / "result.json", json.dumps(result))
+        summary = _round_summary_from_result(result, index=round_index)
+        session["rounds"].append(summary)
+        segment["round_index"] = round_index
+        save_session(session)
+        if progress is not None and hasattr(progress, "set_phase"):
+            progress.set_phase("done")
+        return {key: value for key, value in result.items() if key != "report_trials"}
 
 
 def finalize_round(
@@ -1925,10 +1919,7 @@ def finalize_round(
         cost_model = _round_cost_model(round_payload)
     else:
         strategy_plan = load_finalization_plan(session_id, strategy_plan_id)
-        if (
-            strategy_plan is None
-            or int(strategy_plan.get("round_index", -1)) != round_index
-        ):
+        if strategy_plan is None or int(strategy_plan.get("round_index", -1)) != round_index:
             raise ValueError("unknown strategy finalization plan for this round")
         if strategy_plan.get("holdout_fingerprint") not in {None, fingerprint}:
             raise RuntimeError("strategy plan holdout fingerprint no longer matches")
@@ -1941,8 +1932,7 @@ def finalize_round(
         comparison_id = str(strategy_plan.get("comparison_id") or "") or None
         comparison_fingerprint = strategy_plan.get("comparison_fingerprint")
         comparison_evidence_status = str(
-            strategy_plan.get("source_comparison_evidence_status")
-            or "validation_only"
+            strategy_plan.get("source_comparison_evidence_status") or "validation_only"
         )
         pinned_costs = dict(strategy_plan.get("costs") or {})
         cost_model = TransactionCostModel(
@@ -2022,18 +2012,13 @@ def finalize_round(
         session = load_session(session_id)
         _ensure_evidence_fields(session)
         active = dict(session.get("active_finalization") or {})
-        if (
-            active.get("job_id") != job_id
-            or active.get("strategy_plan_id") != strategy_plan_id
-        ):
+        if active.get("job_id") != job_id or active.get("strategy_plan_id") != strategy_plan_id:
             raise RuntimeError("finalization reservation was released before commit")
         read_counts = dict(session.get("holdout_read_counts") or {})
         same_read_index = _int_or(read_counts.get(fingerprint), 0) + 1
         session_read_index = int(session["session_holdout_reads"]) + 1
         evidence_status = (
-            "locked_first_read"
-            if session_read_index == 1
-            else "repeated_same_holdout"
+            "locked_first_read" if session_read_index == 1 else "repeated_same_holdout"
         )
         source_status = str(metadata.get("evidence_status") or "validation_only")
         if (
@@ -2058,16 +2043,12 @@ def finalize_round(
             "strategy_plan_id": strategy_plan_id,
             "comparison_id": comparison_id,
             "comparison_fingerprint": comparison_fingerprint,
-            "primary_strategy_id": report.get(
-                "primary_strategy_id", primary_strategy_id
-            ),
+            "primary_strategy_id": report.get("primary_strategy_id", primary_strategy_id),
             "strategy_results": list(report.get("strategy_results") or []),
             "started_at": started_at,
             "completed_at": completed_at,
             "report_available": True,
-            "inherited_evidence_sources": list(
-                session.get("inherited_evidence_sources") or []
-            ),
+            "inherited_evidence_sources": list(session.get("inherited_evidence_sources") or []),
             "inherited_test_reads": int(session["inherited_test_reads"]),
             "test_reads": int(session["inherited_test_reads"]) + session_read_index,
             "best_factor": best_factor,
@@ -2076,22 +2057,16 @@ def finalize_round(
             "context": {
                 **report_context(split, config, embargo=boundaries.embargo),
                 "weighting_scheme": next(
-                    item.scheme
-                    for item in strategy_specs
-                    if item.id == primary_strategy_id
+                    item.scheme for item in strategy_specs if item.id == primary_strategy_id
                 ),
                 "quantile": next(
-                    item.quantile
-                    for item in strategy_specs
-                    if item.id == primary_strategy_id
+                    item.quantile for item in strategy_specs if item.id == primary_strategy_id
                 ),
                 "commission_bps": cost_model.commission_bps,
                 "slippage_bps": cost_model.slippage_bps,
                 "strategies": [item.to_dict() for item in strategy_specs],
                 "universe": session["universe"],
-                "universe_revision": (
-                    session.get("universe_definition") or {}
-                ).get("fingerprint"),
+                "universe_revision": (session.get("universe_definition") or {}).get("fingerprint"),
                 "universe_definition": session.get("universe_definition"),
                 "as_of": session["as_of"],
             },
