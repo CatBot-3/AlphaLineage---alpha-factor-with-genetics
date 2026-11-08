@@ -367,3 +367,62 @@ def test_sharpe_ratio_and_trial_counter():
     assert counter.add() == 4
     counter.reset()
     assert counter.count == 0
+
+
+def test_report_summaries_evaluate_each_trial_once_across_strategies(signal_panel, monkeypatch):
+    """Two strategies derive from one factor frame; summaries match the per-strategy path."""
+    from alphalineage.validation import pipeline
+
+    panel, _ = signal_panel
+    split = time_split(panel.dates, train=0.5, valid=0.2, embargo=3)
+    fwd = forward_returns(panel)
+    trials = [Node("volume"), Node("close"), Node("open")]
+
+    def long_leg(tree: Node) -> pd.Series:
+        return tree_returns(tree, panel, fwd)
+
+    def short_leg(tree: Node) -> pd.Series:
+        return -tree_returns(tree, panel, fwd)
+
+    def run(variants):
+        cache: dict = {}
+        judge(
+            trials[0],
+            trials,
+            split,
+            panel,
+            LockedTestSet(split.test),
+            n_trials=len(trials),
+            n_blocks=2,
+            fwd=fwd,
+            return_variants=variants,
+            summary_cache=cache,
+            summary_key=to_json,
+        )
+        return cache
+
+    separate = run(
+        [
+            ("long", long_leg, None),
+            ("short", short_leg, None),
+        ]
+    )
+
+    calls = []
+    real_evaluate = pipeline.evaluate
+
+    def counting_evaluate(tree, data):
+        calls.append(to_json(tree))
+        return real_evaluate(tree, data)
+
+    monkeypatch.setattr(pipeline, "evaluate", counting_evaluate)
+    shared = run(
+        [
+            ("long", long_leg, lambda factor: long_short_returns(factor, fwd)),
+            ("short", short_leg, lambda factor: -long_short_returns(factor, fwd)),
+        ]
+    )
+
+    assert shared == separate
+    # The best tree is evaluated once for IC; every other trial once for both strategies.
+    assert sorted(calls) == sorted(to_json(tree) for tree in trials)

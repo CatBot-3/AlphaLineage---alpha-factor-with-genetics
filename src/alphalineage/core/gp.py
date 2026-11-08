@@ -2556,6 +2556,25 @@ class GP:
         tuner: WorkerTuner | None = None,
     ) -> GP:
         state = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_checkpoint_state(
+            state, panel, fwd, recorder=recorder, allowed_operators=allowed_operators,
+            workers=workers, memory_budget_bytes=memory_budget_bytes, tuner=tuner,
+        )
+
+    @classmethod
+    def from_checkpoint_state(
+        cls,
+        state: dict[str, Any],
+        panel: Panel,
+        fwd: pd.DataFrame | None = None,
+        *,
+        recorder: Any | None = None,
+        allowed_operators: set[str] | None = None,
+        workers: int = 1,
+        memory_budget_bytes: int | None = None,
+        tuner: WorkerTuner | None = None,
+    ) -> GP:
+        """Restore an already-read recovery snapshot without a second large JSON allocation."""
         gp = cls(
             GPConfig.from_dict(state["config"]),
             panel,

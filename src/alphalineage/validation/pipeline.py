@@ -29,6 +29,14 @@ from alphalineage.validation.pbo import (
 from alphalineage.validation.performance import long_short_returns, tree_returns
 from alphalineage.validation.splits import Split
 
+# CSCV blocks used for PBO when the caller does not choose.
+DEFAULT_PBO_BLOCKS = 16
+
+
+def summary_cache_key(tree_key: str, variant_id: str, n_variants: int) -> str:
+    """Key of one (tree, strategy) entry in a report summary cache."""
+    return tree_key if n_variants == 1 else f"{tree_key}\x1fstrategy={variant_id}"
+
 
 class LockedTestSet:
     """Guards the locked test split: scoring against it before ``unlock()`` raises."""
@@ -82,7 +90,7 @@ def judge(
     execution: str = "close",
     fwd: pd.DataFrame | None = None,
     min_names: int = 5,
-    n_blocks: int = 16,
+    n_blocks: int = DEFAULT_PBO_BLOCKS,
     returns_fn: Callable[[Node], pd.Series] | None = None,
     returns_from_factor: Callable[[pd.DataFrame], pd.Series] | None = None,
     return_variants: Sequence[
@@ -159,6 +167,25 @@ def judge(
             return best_variant_returns[variant_index]
         return variants[variant_index][1](tree)
 
+    # With several strategies, each variant's ``tree -> returns`` function evaluates the tree
+    # again. When every variant also offers ``factor -> returns`` (the contract the best tree
+    # already relies on above), evaluate a trial once and derive every strategy from that one
+    # factor frame. Non-panel results keep the per-variant path, which returns its own empty
+    # series, so the summaries are identical either way.
+    share_factor = len(variants) > 1 and all(item[2] is not None for item in variants)
+
+    def returns_from_shared(tree: Node, variant_index: int, shared: dict[str, Any]) -> pd.Series:
+        if not share_factor or to_json(tree) == best_key:
+            return cached_returns_of(tree, variant_index)
+        if "factor" not in shared:
+            shared["factor"] = evaluate(tree, panel)
+        trial_factor = shared["factor"]
+        if not isinstance(trial_factor, pd.DataFrame):
+            return variants[variant_index][1](tree)
+        from_factor = variants[variant_index][2]
+        assert from_factor is not None
+        return from_factor(trial_factor)
+
     def ic_on(dates: pd.DatetimeIndex) -> float:
         return mean_ic(
             factor.loc[factor.index.isin(dates)],
@@ -201,7 +228,14 @@ def judge(
             total = len(trials) * len(variants)
             completed = 0
             for tree in trials:
-                tree_key = key_of(tree)
+                try:
+                    tree_key: str | None = key_of(tree)
+                except ValueError:
+                    # A tree that cannot be keyed (for example one whose expansion is rejected)
+                    # is summarised without a cache entry. Failing here used to abandon every
+                    # cached summary and recompute all trials through the streamed path.
+                    tree_key = None
+                shared: dict[str, Any] = {}
                 for variant_index, (variant_id, _returns, _factor_returns) in enumerate(
                     variants
                 ):
@@ -210,18 +244,19 @@ def judge(
                             "report cancelled before locked-test finalization"
                         )
                     key = (
-                        tree_key
-                        if len(variants) == 1
-                        else f"{tree_key}\x1fstrategy={variant_id}"
+                        None
+                        if tree_key is None
+                        else summary_cache_key(tree_key, variant_id, len(variants))
                     )
-                    summary = summary_cache.get(key)
+                    summary = None if key is None else summary_cache.get(key)
                     if summary is None:
                         summary = summarize_report_returns(
-                            research(cached_returns_of(tree, variant_index)),
+                            research(returns_from_shared(tree, variant_index, shared)),
                             research_index,
                             n_blocks=n_blocks,
                         )
-                        summary_cache[key] = summary
+                        if key is not None:
+                            summary_cache[key] = summary
                     summaries.append(summary)
                     trial_sharpe_values.append(float(summary["sharpe"]))
                     completed += 1

@@ -7,15 +7,18 @@ swapping in RQ + Redis for production is a localized change.
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from alphalineage.api.errors import error_payload
 from alphalineage.api.resources import TrainingLeaseCancelled
 from alphalineage.core.gp import TrainingCancelled
-from alphalineage.api.errors import error_payload
+
+_logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
@@ -61,6 +64,8 @@ class JobStore:
         )
         with self._lock:
             self._jobs[job.id] = job
+        if progress is not None and hasattr(progress, "bind_cancellation"):
+            progress.bind_cancellation(job.cancel.is_set)
 
         def _run() -> None:
             with self._lock:
@@ -74,6 +79,7 @@ class JobStore:
                 if progress is not None and hasattr(progress, "finish"):
                     progress.finish("user_stopped")
             except Exception as exc:  # noqa: BLE001 - record any failure for the caller
+                _logger.exception("Background job %s failed", job.id)
                 with self._lock:
                     job.error_info = error_payload(exc)
                     job.error = job.error_info["message"]
@@ -89,7 +95,7 @@ class JobStore:
                         on_success(job.id, result)
                     except Exception:
                         # Persistence callbacks are best-effort; the run itself succeeded.
-                        pass
+                        _logger.exception("Cannot persist completion for background job %s", job.id)
                 with self._lock:
                     job.result = result
                     job.termination_reason = termination_reason

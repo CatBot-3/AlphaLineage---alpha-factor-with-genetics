@@ -17,9 +17,18 @@ import type {
   SessionState,
 } from "../api/types";
 
-export type SessionPhase = "idle" | "running" | "done" | "stopped" | "failed";
+export type SessionPhase = "idle" | "running" | "done" | "stopped" | "failed" | "interrupted";
+export type SessionConnection = "connecting" | "connected" | "reconnecting";
 
 const POLL_MS = 1000;
+const RETRY_MS = [1000, 2000, 4000, 8000, 15000];
+
+function retryableConnection(error: unknown): boolean {
+  const name = error && typeof error === "object" && "name" in error ? error.name : null;
+  return error instanceof TypeError ||
+    name === "ConnectionError" || name === "AbortError" || name === "TypeError" ||
+    (error instanceof ApiError && error.status >= 500);
+}
 
 export function useSession(
   onComplete?: (result: RunResult) => void,
@@ -30,6 +39,11 @@ export function useSession(
   const [state, setState] = useState<SessionState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState<"start" | "continue" | null>(null);
+  const submissionRef = useRef(false);
+  const [connection, setConnection] = useState<SessionConnection>(
+    initialSessionId ? "connecting" : "connected",
+  );
   const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
   const firedRef = useRef(false);
@@ -39,6 +53,7 @@ export function useSession(
     setSessionId(null);
     setState(null);
     setError(null);
+    setConnection("connected");
     setPollToken((t) => t + 1);
   }, []);
 
@@ -46,11 +61,14 @@ export function useSession(
     if (!sessionId) return;
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
 
     const tick = async () => {
       try {
         const next = await getSession(sessionId);
         if (!active) return;
+        failures = 0;
+        setConnection("connected");
         setState(next);
         const status = next.job?.status;
         const finalizationStatus = next.finalization_job?.status;
@@ -74,6 +92,7 @@ export function useSession(
           setError(next.job?.error ?? "the run failed; see the backend logs");
           return;
         }
+        setError(null);
         if (finalizationStatus === "failed") {
           setError(next.finalization_job?.error ?? "holdout finalization failed");
           return;
@@ -86,12 +105,17 @@ export function useSession(
         if (!active) return;
         // A 404 means the session no longer exists (e.g. its data was cleared) - drop back to
         // the idle form rather than trapping the user on a dead error page.
-        if (e instanceof ApiError && e.status === 404) {
+        if (retryableConnection(e)) {
+          setConnection("reconnecting");
+          timer = setTimeout(tick, RETRY_MS[Math.min(failures++, RETRY_MS.length - 1)]);
+          return;
+        } else if (e instanceof ApiError && e.status === 404) {
           firedRef.current = false;
           setSessionId(null);
           setState(null);
           setError(null);
           setNotice("That session no longer exists - start a new one.");
+          setConnection("connected");
         } else {
           setError(String(e));
         }
@@ -108,29 +132,49 @@ export function useSession(
   }, [sessionId, pollToken]);
 
   const start = useCallback(async (req: SessionCreateRequest) => {
+    if (submissionRef.current) return;
+    submissionRef.current = true;
+    setSubmitting("start");
     setError(null);
     setNotice(null);
     setState(null);
     firedRef.current = false;
     try {
       const handle = await createSession(req);
+      setConnection("connecting");
       setSessionId(handle.session_id);
       setPollToken((t) => t + 1);
     } catch (e) {
       setError(String(e));
+    } finally {
+      submissionRef.current = false;
+      setSubmitting(null);
     }
   }, []);
 
   const cont = useCallback(
     async (req: SessionContinueRequest) => {
-      if (!sessionId) return;
+      if (!sessionId || submissionRef.current) return;
+      submissionRef.current = true;
+      setSubmitting("continue");
       setError(null);
       firedRef.current = false;
       try {
         await continueSession(sessionId, req);
+        setConnection("connecting");
         setPollToken((t) => t + 1); // restart polling for the new segment
       } catch (e) {
         setError(String(e));
+        // Reconcile a lost continuation response using GET only. The POST may already
+        // have claimed a job; replaying it could submit work the user never intended.
+        if ((retryableConnection(e) && !(e instanceof ApiError)) ||
+            (e instanceof ApiError && e.status === 409)) {
+          setConnection("reconnecting");
+          setPollToken((t) => t + 1);
+        }
+      } finally {
+        submissionRef.current = false;
+        setSubmitting(null);
       }
     },
     [sessionId],
@@ -149,6 +193,8 @@ export function useSession(
     firedRef.current = false;
     setError(null);
     setNotice(null);
+    setState(null);
+    setConnection("connecting");
     setSessionId(id);
     setPollToken((t) => t + 1);
   }, []);
@@ -157,9 +203,9 @@ export function useSession(
     setPollToken((token) => token + 1);
   }, []);
 
-  const phase: SessionPhase = error
-    ? "failed"
-    : (state?.job?.status as SessionPhase | undefined) ?? (sessionId ? "running" : "idle");
+  const status = state?.job?.status;
+  const phase: SessionPhase = status === "queued" ? "running" :
+    (status as SessionPhase | undefined) ?? (sessionId ? "running" : "idle");
   const finalizationStatus = state?.finalization_job?.status ?? null;
   const finalizing = finalizationStatus === "queued" || finalizationStatus === "running";
 
@@ -168,6 +214,8 @@ export function useSession(
     state,
     error,
     notice,
+    connection,
+    submitting,
     phase,
     finalizationStatus,
     finalizing,

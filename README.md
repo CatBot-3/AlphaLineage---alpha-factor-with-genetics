@@ -156,6 +156,24 @@ the API and web app at
 [http://localhost:8000](http://localhost:8000), and opens a browser. Use **Quit** in the application
 header or press `Ctrl+C` in the launcher terminal to stop it.
 
+For overnight runs, use `start.cmd -Background`. This creates an on-demand Windows task
+under your signed-in account, with normal privileges and no saved password. It keeps the app
+running when the submitting terminal, Codex, or browser closes. Repeating the command reuses
+the running app. Use in-app **Quit** or `start.cmd -StopBackground` to stop it. The task has
+no execution time limit or automatic startup trigger; foreground launching remains the default.
+Background registration must run outside the Codex sandbox as the normal Windows user.
+Process ownership, exit codes, and backend tracebacks are recorded under `.runtime/`.
+
+Connection loss preserves the last displayed progress and automatically retries status reads.
+After an app restart, interrupted sessions offer **Resume** from their committed checkpoint.
+Choose **Additional generations** to set how much more work to run; the form shows the
+resulting total. Resume acknowledges the job before market-data preparation and shows the
+saved generation throughout reference rebuilding. **Stop** also cancels reference rebuilding.
+Starting or resuming requires at least 2 GiB available RAM and 2 GiB system commit headroom
+on Windows. This is a startup safety margin for data loading and checkpoint restoration,
+rather than an estimate of the run's total memory use; a low-memory response leaves the
+saved run unchanged.
+
 Application scratch files live in `data_cache/tmp` by default. The Windows launcher sets
 `TEMP`, `TMP`, and `TMPDIR` before starting Python or frontend tools, so this checkout keeps
 those temporary files on F:. Set `ALPHALINEAGE_TEMP_DIR` to choose another writable directory.

@@ -9,13 +9,29 @@
 param(
     [int]$Port = 8000,
     [switch]$NoBuild,   # reuse an existing frontend/dist instead of rebuilding
-    [switch]$NoOpen     # do not open the browser automatically
+    [switch]$NoOpen,    # do not open the browser automatically
+    [switch]$Background,
+    [switch]$StopBackground,
+    [switch]$BackgroundWorker,  # internal Task Scheduler entrypoint
+    [string]$BackgroundConfig
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = $PSScriptRoot
 $FrontendDir = Join-Path $RepoRoot "frontend"
 $DistDir = Join-Path $FrontendDir "dist"
+Set-Location -LiteralPath $RepoRoot
+if ($Background -and $StopBackground) { throw 'Choose -Background or -StopBackground.' }
+if ($BackgroundWorker) {
+    $config = Get-Content -LiteralPath $BackgroundConfig -Raw | ConvertFrom-Json
+    if ($config.repo_root -ne $RepoRoot -or $config.port -ne $Port) {
+        throw 'The background configuration does not match this workspace/port.'
+    }
+    $NoBuild = [bool]$config.no_build
+    foreach ($name in @('ALPHALINEAGE_DATA_DIR', 'ALPHALINEAGE_TEMP_DIR')) {
+        [Environment]::SetEnvironmentVariable($name, $config.environment.$name, 'Process')
+    }
+}
 
 # Configure scratch before any Python/npm child starts (including installation and probes).
 if (-not $env:ALPHALINEAGE_DATA_DIR) {
@@ -40,6 +56,10 @@ $env:ALPHALINEAGE_TEMP_DIR = $TempRoot
 $env:TEMP = $TempRoot
 $env:TMP = $TempRoot
 $env:TMPDIR = $TempRoot
+if ($Background -or $StopBackground) {
+    & (Join-Path $RepoRoot 'scripts\background_app.ps1') -Port $Port -NoBuild:$NoBuild -NoOpen:$NoOpen -Stop:$StopBackground
+    exit $LASTEXITCODE
+}
 
 # --- locate python + npm ----------------------------------------------------------
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
@@ -68,6 +88,19 @@ $env:PYTHONPATH = Join-Path $RepoRoot "src"
 $RuntimeDir = Join-Path $RepoRoot ".runtime"
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 $LogPath = Join-Path $RuntimeDir "app.log"
+$LaunchId = [guid]::NewGuid().ToString('N')
+$env:ALPHALINEAGE_INSTANCE_ID = $LaunchId
+$env:ALPHALINEAGE_LAUNCH_MODE = if ($BackgroundWorker) { 'background' } else { 'foreground' }
+$env:ALPHALINEAGE_LAUNCHER_PID = "$PID"
+$env:ALPHALINEAGE_RUNTIME_DIR = $RuntimeDir
+$StatePath = Join-Path $RuntimeDir "server-$Port.json"
+function Write-LaunchEvent([string]$Event, $Details) {
+    [ordered]@{ time = [DateTime]::UtcNow.ToString('o'); event = $Event;
+        launch_id = $LaunchId; launcher_pid = $PID; port = $Port; details = $Details } |
+        ConvertTo-Json -Depth 4 -Compress |
+        Add-Content -LiteralPath (Join-Path $RuntimeDir "launcher-$Port.events.jsonl") -Encoding UTF8
+}
+Write-LaunchEvent 'launcher_started' @{ background = [bool]$BackgroundWorker; temp_root = $TempRoot }
 
 # --- pre-flight: can the app even be imported? -------------------------------------
 # uvicorn imports the app before it binds a port, so a missing dependency exits instantly
@@ -112,7 +145,8 @@ if ($Probe.ExitCode -ne 0) {
         Write-Host ""
     }
     Write-Host "The full output was saved to $LogPath"
-    if ($Host.Name -eq "ConsoleHost") { Read-Host "Press Enter to close" }
+    Write-LaunchEvent 'import_failed' @{ exit_code = $Probe.ExitCode }
+    if (-not $BackgroundWorker -and $Host.Name -eq "ConsoleHost") { Read-Host "Press Enter to close" }
     exit 1
 }
 
@@ -129,24 +163,14 @@ if ($AgentProbe.ExitCode -eq 0 -and $AgentCheck -and ($AgentCheck -join "").Trim
     Write-Host ""
 }
 
-# --- free the port if a previous AlphaLineage instance was left running ------------
-# Closing the window (instead of Ctrl+C) can orphan the foreground uvicorn, which keeps
-# holding the port; the next launch would then boot, fail to bind, and exit immediately.
-# Detect that here: stop a stale AlphaLineage instance automatically, but never kill
-# an unrelated process that happens to own the port.
+# Refuse an occupied port. An existing background app may be doing valuable work.
 foreach ($conn in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
     $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
-    if ($proc -and $proc.Name -eq "python.exe" -and $proc.CommandLine -match "alphalineage\.api\.app") {
-        Write-Host "Stopping a stale AlphaLineage instance on port $Port (PID $($proc.ProcessId))..."
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 300
-    }
-    else {
-        $who = if ($proc) { "$($proc.Name) (PID $($proc.ProcessId))" } else { "PID $($conn.OwningProcess)" }
-        Write-Host "Port $Port is already in use by $who."
-        Write-Host "Stop it, or relaunch on another port:  start.cmd -Port <other>"
-        exit 1
-    }
+    $who = if ($proc) { "$($proc.Name) (PID $($proc.ProcessId))" } else { "PID $($conn.OwningProcess)" }
+    Write-Host "Port $Port is already in use by $who."
+    Write-Host "Use -Background to reopen an existing background app, or choose -Port <other>."
+    Write-LaunchEvent 'port_in_use' @{ owning_pid = $conn.OwningProcess }
+    exit 1
 }
 
 # --- open the browser once the server is healthy ----------------------------------
@@ -172,7 +196,7 @@ Write-Host ""
 
 # --- run the server in the foreground (Quit / Ctrl+C ends it) ---------------------
 try {
-    $ServerArgs = @("-m", "uvicorn", "alphalineage.api.app:app", "--host", "127.0.0.1", "--port", "$Port")
+    $ServerArgs = @("-m", "alphalineage.api.launcher", "--port", "$Port")
     $EnvFile = Join-Path $PSScriptRoot ".env"
     if (Test-Path -LiteralPath $EnvFile) {
         $ServerArgs += @("--env-file", $EnvFile)
@@ -186,8 +210,10 @@ try {
     # and Ctrl+C behaving normally.
     $Transcribing = $false
     try {
-        Start-Transcript -LiteralPath $LogPath -Append -Force | Out-Null
-        $Transcribing = $true
+        if (-not $BackgroundWorker) {
+            Start-Transcript -LiteralPath $LogPath -Append -Force | Out-Null
+            $Transcribing = $true
+        }
     } catch {
         Write-Host "(could not open $LogPath for logging; continuing without it)" -ForegroundColor DarkGray
     }
@@ -200,8 +226,19 @@ try {
         $PSNativeCommandUseErrorActionPreference = $false
     }
     try {
-        & $Python @ServerArgs
-        $ServerExit = $LASTEXITCODE
+        if ($BackgroundWorker) {
+            $QuotedArgs = ($ServerArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
+            $ServerProcess = Start-Process -FilePath $Python -ArgumentList $QuotedArgs -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RuntimeDir "server-$Port.stdout.log") -RedirectStandardError (Join-Path $RuntimeDir "server-$Port.stderr.log")
+            # Retain the process handle before it exits so Windows PowerShell can read its code.
+            $null = $ServerProcess.Handle
+            Write-LaunchEvent 'backend_launched' @{ backend_launcher_pid = $ServerProcess.Id }
+            $ServerProcess.WaitForExit()
+            $ServerExit = $ServerProcess.ExitCode
+        } else {
+            & $Python @ServerArgs
+            $ServerExit = $LASTEXITCODE
+        }
+        Write-LaunchEvent 'backend_exited' @{ exit_code = $ServerExit }
     }
     finally {
         if ($null -ne $PreviousNativeErrorAction) {
@@ -216,16 +253,25 @@ try {
     if ($CleanExits -notcontains $ServerExit) {
         Write-Host ""
         Write-Host "The server exited with code $ServerExit. See $LogPath" -ForegroundColor Red
-        if ($Host.Name -eq "ConsoleHost") { Read-Host "Press Enter to close" }
+        if (-not $BackgroundWorker -and $Host.Name -eq "ConsoleHost") { Read-Host "Press Enter to close" }
     }
 }
 finally {
-    # Best-effort: if this run's server is somehow still bound on exit, reclaim the port
-    # so the next launch starts cleanly. (The pre-flight check above is the primary guard.)
-    foreach ($conn in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
-        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
-        if ($p -and $p.Name -eq "python.exe" -and $p.CommandLine -match "alphalineage\.api\.app") {
-            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    # Match this launch and the exact process creation time; never stop a replacement app.
+    if (Test-Path -LiteralPath $StatePath) {
+        $owned = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+        if ($owned.launch_id -eq $LaunchId) {
+            $process = Get-Process -Id $owned.backend_pid -ErrorAction SilentlyContinue
+            if ($process -and $owned.backend_creation_filetime -and
+                $process.StartTime.ToFileTimeUtc().ToString() -eq $owned.backend_creation_filetime) {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                Write-LaunchEvent 'owned_backend_stopped' @{ backend_pid = $process.Id }
+            }
+            $owned.status = 'stopped'
+            $owned | Add-Member -NotePropertyName stopped_at -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+            $owned | Add-Member -NotePropertyName exit_code -NotePropertyValue $ServerExit -Force
+            $owned | ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8
         }
     }
 }
+if ($BackgroundWorker -and $null -ne $ServerExit) { exit $ServerExit }

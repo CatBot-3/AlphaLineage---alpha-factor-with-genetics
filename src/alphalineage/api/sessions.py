@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
@@ -36,7 +40,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from alphalineage.api.resources import TRAINING_SCHEDULER, ResolvedResources, TrainingScheduler
+from alphalineage.api.resources import (
+    TRAINING_SCHEDULER,
+    ResolvedResources,
+    TrainingScheduler,
+    available_memory_bytes,
+    worker_capacity,
+)
 from alphalineage.api.service import (
     build_report,
     report_context,
@@ -48,7 +58,7 @@ from alphalineage.backtest.portfolio import (
     PortfolioStrategySpec,
     default_strategy_spec,
 )
-from alphalineage.core.extensions import expand_all
+from alphalineage.core import cpp
 from alphalineage.core.fitness import forward_returns
 from alphalineage.core.gp import (
     EVOLUTION_VERSION,
@@ -63,7 +73,13 @@ from alphalineage.core.tuning import WorkerTuner
 from alphalineage.data import paths
 from alphalineage.data.identifiers import atomic_write_text, child_path
 from alphalineage.library.store import LineageStore
+from alphalineage.validation.parallel_summaries import (
+    SummaryJob,
+    precompute_summaries,
+    report_expansion,
+)
 from alphalineage.validation.pbo import ReportReturnSummary
+from alphalineage.validation.pipeline import DEFAULT_PBO_BLOCKS
 from alphalineage.validation.selection import (
     VALIDATION_SELECTION_VERSION,
     ValidationSelection,
@@ -144,6 +160,17 @@ def split_from_boundaries(dates: pd.DatetimeIndex, boundaries: Boundaries) -> Sp
 # --- session file I/O ------------------------------------------------------------
 _SESSION_IO_LOCK = threading.RLock()
 _REPORT_CACHE_VERSION = 1
+# Seconds between partial report-cache saves while a finalization computes trial summaries.
+_REPORT_CACHE_SAVE_INTERVAL_S = 600.0
+_LOG = logging.getLogger(__name__)
+# Report summaries run in worker processes (see validation/parallel_summaries.py). Each holds
+# its own copy of the panel: about 0.6 GiB per worker was measured with twelve workers on the
+# 497-name, 26-year S&P panel. Budgeting 768 MiB each within 75% of available physical memory
+# leaves room for larger trees and for the rest of the desktop.
+REPORT_WORKER_MEMORY_BYTES = 768 * 1024**2
+REPORT_MEMORY_FRACTION = 0.75
+MAX_REPORT_WORKERS = 12
+REPORT_WORKERS_ENV = "ALPHALINEAGE_REPORT_WORKERS"
 SESSION_SCHEMA_VERSION = 3
 ROUND_SCHEMA_VERSION = 3
 FINALIZATION_SCHEMA_VERSION = 2
@@ -194,7 +221,7 @@ def _report_cache_context(
 
 
 def _report_tree_key(tree: Node) -> str:
-    expanded = to_json(expand_all(tree))
+    expanded = to_json(report_expansion(tree))
     return hashlib.sha256(expanded.encode("utf-8")).hexdigest()
 
 
@@ -213,12 +240,93 @@ def _load_report_cache(path: Path, context: str) -> dict[str, ReportReturnSummar
 
 
 def _save_report_cache(path: Path, context: str, entries: dict[str, ReportReturnSummary]) -> None:
-    payload = {
-        "version": _REPORT_CACHE_VERSION,
-        "context": context,
-        "entries": entries,
-    }
-    atomic_write_text(path, json.dumps(payload, separators=(",", ":"), allow_nan=False))
+    """Atomically write the cache, streaming one entry at a time.
+
+    The file has the same JSON layout as before, but the text is never built as one string:
+    a long finalization holds tens of thousands of summaries, and encoding them in one piece
+    needs several times the cache's size in free memory at the very end of the job.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
+            version = json.dumps(_REPORT_CACHE_VERSION)
+            stream.write(f'{{"version":{version},"context":{json.dumps(context)},"entries":{{')
+            for index, (key, value) in enumerate(list(entries.items())):
+                if index:
+                    stream.write(",")
+                stream.write(json.dumps(key))
+                stream.write(":")
+                stream.write(json.dumps(value, separators=(",", ":"), allow_nan=False))
+            stream.write("}}")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def report_worker_count(available: int | None = None, cpus: int | None = None) -> int:
+    """Worker processes for report summaries: bounded by cores, memory and a desktop cap.
+
+    ``ALPHALINEAGE_REPORT_WORKERS`` overrides the choice (1 keeps the sequential path).
+    """
+    override = os.environ.get(REPORT_WORKERS_ENV, "").strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            _LOG.warning("ignoring %s=%r (not an integer)", REPORT_WORKERS_ENV, override)
+    memory = available if available is not None else available_memory_bytes()
+    by_memory = int(memory * REPORT_MEMORY_FRACTION // REPORT_WORKER_MEMORY_BYTES)
+    return max(1, min(worker_capacity(cpus), MAX_REPORT_WORKERS, by_memory))
+
+
+def _try_save_report_cache(
+    path: Path, context: str, entries: dict[str, ReportReturnSummary]
+) -> bool:
+    """Save the cache, but never let a cache write fail the finalization it belongs to."""
+    try:
+        _save_report_cache(path, context, entries)
+    except (MemoryError, OSError, ValueError, TypeError) as exc:
+        _LOG.warning("report cache not saved to %s: %r", path, exc)
+        return False
+    return True
+
+
+class _PeriodicReportCache(dict):
+    """Summary cache that also saves itself every few minutes while summaries are added.
+
+    A finalization can run for days. Without partial saves, a crash near the end (for
+    example running out of memory) loses every computed trial summary, and a retry starts
+    from zero. Entries are research-period statistics keyed by formula, so a partial cache
+    is valid to reuse; the locked test split is never part of it.
+    """
+
+    def __init__(
+        self,
+        entries: dict[str, ReportReturnSummary],
+        save: Callable[[dict[str, ReportReturnSummary]], bool],
+        interval_s: float = _REPORT_CACHE_SAVE_INTERVAL_S,
+    ) -> None:
+        super().__init__(entries)
+        self._save = save
+        self._interval_s = interval_s
+        self._last_save = time.monotonic()
+        self._unsaved = 0
+
+    def __setitem__(self, key: str, value: ReportReturnSummary) -> None:
+        super().__setitem__(key, value)
+        self._unsaved += 1
+        if time.monotonic() - self._last_save >= self._interval_s:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._unsaved:
+            self._save(self)
+        self._unsaved = 0
+        self._last_save = time.monotonic()
 
 
 def _slug(name: str) -> str:
@@ -1116,10 +1224,16 @@ def panel_fingerprint(panel: Panel) -> str:
 
 def continuation_restart_reason(session_id: str) -> str | None:
     """Return why a checkpoint cannot safely continue under current semantics."""
-    checkpoint = _read_result(session_dir(session_id) / "checkpoint.json")
-    if checkpoint is None:
-        return None
-    saved_evolution = _int_or(checkpoint.get("evolution_version"), 1)
+    summary = checkpoint_summary(session_id)
+    if summary is None:
+        return "The recovery checkpoint cannot be read." if (
+            session_dir(session_id) / "checkpoint.json"
+        ).exists() else None
+    return _continuation_restart_reason(session_id, summary)
+
+
+def _continuation_restart_reason(session_id: str, summary: dict[str, Any]) -> str | None:
+    saved_evolution = _int_or(summary.get("evolution_version"), 1)
     if saved_evolution != EVOLUTION_VERSION:
         return (
             "This checkpoint uses an older evolution algorithm and cannot be continued "
@@ -1129,6 +1243,88 @@ def continuation_restart_reason(session_id: str) -> str | None:
     if rounds and rounds[-1].get("restart_required"):
         return str(rounds[-1].get("invalid_reason") or "This session requires a clean restart.")
     return None
+
+
+# Cache only a few scalars, never the large population/reference/lineage payload. The file
+# identity changes on atomic replacement. Serialize cold reads to avoid concurrent allocations.
+_checkpoint_summary_lock = threading.RLock()
+_checkpoint_summaries: OrderedDict[str, tuple[tuple[int, ...], dict[str, int]]] = OrderedDict()
+
+
+def _checkpoint_identity(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+
+def _summary_from_checkpoint(payload: dict[str, Any]) -> dict[str, int]:
+    recovery = payload.get("session_state") or {}
+    return {
+        "generation": int(payload["generation"]),
+        "trials": int(payload.get("trials", 0)),
+        "target_generations": int(recovery.get("target_generations") or
+                                  (payload.get("config") or {}).get("generations", 0)),
+        "evolution_version": int(payload.get("evolution_version", 1)),
+    }
+
+
+def _cache_checkpoint_summary(path: Path, summary: dict[str, int]) -> None:
+    with _checkpoint_summary_lock:
+        key = str(path.resolve())
+        _checkpoint_summaries[key] = (_checkpoint_identity(path), dict(summary))
+        _checkpoint_summaries.move_to_end(key)
+        while len(_checkpoint_summaries) > 128:
+            _checkpoint_summaries.popitem(last=False)
+
+
+def checkpoint_summary(session_id: str) -> dict[str, int] | None:
+    """Read compact metadata; legacy snapshots are decoded once per file revision."""
+    path = session_dir(session_id) / "checkpoint.json"
+    with _checkpoint_summary_lock:
+        try:
+            identity = _checkpoint_identity(path)
+            key = str(path.resolve())
+            cached = _checkpoint_summaries.get(key)
+            if cached is not None and cached[0] == identity:
+                _checkpoint_summaries.move_to_end(key)
+                return dict(cached[1])
+            with path.open(encoding="utf-8") as stream:
+                prefix = stream.read(16 * 1024)
+            header = re.match(r'\s*\{\s*"recovery_summary"\s*:\s*', prefix)
+            if header:
+                raw, _ = json.JSONDecoder().raw_decode(prefix, header.end())
+                summary = {field: int(raw[field]) for field in (
+                    "generation", "trials", "target_generations", "evolution_version"
+                )}
+            else:
+                payload = _read_result(path)
+                if payload is None:
+                    return None
+                summary = _summary_from_checkpoint(payload)
+            # Keep the identity captured before opening the file. A concurrent replace will
+            # invalidate this entry on the next read rather than tag old data as new.
+            _checkpoint_summaries[key] = (identity, summary)
+            _checkpoint_summaries.move_to_end(key)
+            while len(_checkpoint_summaries) > 128:
+                _checkpoint_summaries.popitem(last=False)
+            return dict(summary)
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
+
+def recovery_view(session_id: str) -> dict[str, Any] | None:
+    summary = checkpoint_summary(session_id)
+    if summary is None:
+        return None
+    reason = _continuation_restart_reason(session_id, summary)
+    intent = load_session(session_id).get("last_job") or {}
+    intended_target = _int_or(intent.get("target_generations"), 0)
+    if intended_target:
+        # A continuation may deliberately shorten an older checkpoint's planned run.
+        summary["target_generations"] = max(summary["generation"], intended_target)
+    return {key: value for key, value in summary.items() if key != "evolution_version"} | {
+        "can_resume": reason is None,
+        "restart_reason": reason,
+    }
 
 
 def _selected_lineage_node_id(store: LineageStore, tree: Node, generation: int) -> int | None:
@@ -1329,6 +1525,8 @@ def claim_job(
         session = load_session(session_id)
         if session.get("active_job_id"):
             return False
+        recovery = checkpoint_summary(session_id)
+        start_generation = recovery["generation"] if recovery else 0
         now = _utc_now()
         session["active_job_id"] = job_id
         session["last_job_id"] = job_id
@@ -1340,6 +1538,8 @@ def claim_job(
             "started_at": None,
             "completed_at": None,
             "requested_generations": requested_generations,
+            "start_generation": start_generation,
+            "target_generations": start_generation + int(requested_generations or 0),
             "config": dict(config or {}),
             "resources": dict(resources or {}),
             "error": None,
@@ -1529,9 +1729,16 @@ def run_segment(
         lineage_path = directory / "lineage.json"
         warm = checkpoint.exists()
         checkpoint_payload = _read_result(checkpoint) if warm else None
+        if warm and checkpoint_payload is None:
+            raise ValueError(
+                "The recovery checkpoint cannot be read; saved session data is retained."
+            )
         recovery = (checkpoint_payload or {}).get("session_state") or {}
+        segment_target = int((checkpoint_payload or {}).get("generation", 0)) + generations
         if warm:
-            restart_reason = continuation_restart_reason(session_id)
+            restart_reason = _continuation_restart_reason(
+                session_id, _summary_from_checkpoint(checkpoint_payload)
+            )
             if restart_reason:
                 raise RuntimeError(f"Restart with the same setup: {restart_reason}")
             completed_rounds = list_rounds(session_id)
@@ -1561,21 +1768,27 @@ def run_segment(
                 "version": 1,
                 "panel_fingerprint": panel_fingerprint,
                 "lineage": store.to_dict(),
+                "target_generations": segment_target,
             }
+            summary = _summary_from_checkpoint(payload)
             try:
-                atomic_write_text(checkpoint, json.dumps(payload))
+                atomic_write_text(checkpoint, json.dumps({"recovery_summary": summary, **payload}))
             except OSError as exc:
                 raise OSError(
                     f"Cannot save training recovery checkpoint at {checkpoint}; "
                     f"the previous complete snapshot is preserved: {exc}"
                 ) from exc
+            _cache_checkpoint_summary(checkpoint, summary)
 
         recorder: Any = store
         if progress is not None:
             progress.attach(store)
             recorder = progress
 
-        prev_cumulative = int(session["cumulative_trials"])
+        prev_cumulative = max(int(session["cumulative_trials"]),
+                              int((checkpoint_payload or {}).get("trials", 0)))
+        if warm and progress is not None and hasattr(progress, "restore_checkpoint"):
+            progress.restore_checkpoint(checkpoint_payload, target_generations=segment_target)
         started = time.monotonic()
         lease_context = scheduler.acquire(resources, cancel=stop) if resources is not None else None
         if progress is not None and hasattr(progress, "set_phase"):
@@ -1591,6 +1804,7 @@ def run_segment(
             int,
             dict[str, float],
         ]:
+            nonlocal checkpoint_payload, recovery
             workers = int(lease.max_workers) if lease is not None else 1
             memory_budget = int(lease.memory_budget_bytes) if lease is not None else None
             # The lease reserves the ceiling; the tuner decides how much of it each batch is worth.
@@ -1607,8 +1821,8 @@ def run_segment(
             if warm:
                 store.continue_from(_last_generation(store))
                 gp = training_contexts.enter_context(
-                    GP.from_checkpoint(
-                        checkpoint,
+                    GP.from_checkpoint_state(
+                        checkpoint_payload,
                         train_panel,
                         recorder=recorder,
                         allowed_operators=allowed_operators,
@@ -1617,6 +1831,9 @@ def run_segment(
                         tuner=tuner,
                     )
                 )
+                # Release raw JSON trees and lineage as soon as their runtime forms exist.
+                checkpoint_payload = None
+                recovery = {}
                 gp.config = config  # apply any continue-time overrides
                 if rescore:
                     gp.rescore_population()
@@ -1940,6 +2157,11 @@ def finalize_round(
             slippage_bps=float(pinned_costs.get("slippage_bps", 5.0)),
         )
 
+    # Keep only what the commit needs: the round file also holds the full search history, and
+    # holding it for the whole (possibly multi-day) report only adds memory pressure.
+    selection = dict(round_payload.get("selection") or {})
+    round_payload = None
+
     if progress is not None and hasattr(progress, "set_phase"):
         progress.set_phase("reporting")
     report_cache_path = session_dir(session_id) / "report_stats.json"
@@ -1966,7 +2188,10 @@ def finalize_round(
             )
         ).encode("utf-8")
     ).hexdigest()
-    report_summaries = _load_report_cache(report_cache_path, cache_context)
+    report_summaries = _PeriodicReportCache(
+        _load_report_cache(report_cache_path, cache_context),
+        lambda entries: _try_save_report_cache(report_cache_path, cache_context, entries),
+    )
     report_progress = (
         progress.set_report_progress
         if progress is not None and hasattr(progress, "set_report_progress")
@@ -1978,6 +2203,25 @@ def finalize_round(
             progress.set_phase("finalizing")
 
     try:
+        # Fill the summary cache in worker processes first; build_report then only reads it.
+        precompute_summaries(
+            trials,
+            report_summaries,
+            SummaryJob(
+                panel=panel,
+                horizon=config.horizon,
+                execution=config.execution,
+                strategies=tuple(item.to_dict() for item in strategy_specs),
+                commission_bps=cost_model.commission_bps,
+                slippage_bps=cost_model.slippage_bps,
+                research_dates=pd.DatetimeIndex(split.research),
+                n_blocks=DEFAULT_PBO_BLOCKS,
+                evaluator=cpp.selected_backend(),
+            ),
+            workers=report_worker_count(),
+            progress=report_progress,
+            stop=stop,
+        )
         report = build_report(
             best_tree,
             trials,
@@ -2000,9 +2244,9 @@ def finalize_round(
             fwd=forward_returns(panel, config.horizon, config.execution),
         )
     finally:
-        _save_report_cache(report_cache_path, cache_context, report_summaries)
+        # A cache write must never discard a finished report; see _try_save_report_cache.
+        report_summaries.flush()
 
-    selection = dict(round_payload.get("selection") or {})
     report["validation_passed"] = bool(selection.get("validated"))
     report["validation_reason"] = selection.get("reason")
     if not report["validation_passed"]:

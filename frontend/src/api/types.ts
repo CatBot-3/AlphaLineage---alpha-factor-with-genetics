@@ -511,7 +511,7 @@ export interface SessionFinalizationHandle {
 export interface SessionJob {
   id: string;
   job_id?: string;
-  status: string; // queued | running | done | stopped | failed
+  status: string; // queued | running | done | stopped | failed | interrupted
   progress: ProgressSnapshot | null;
   termination_reason?: string | null;
   metadata?: Record<string, unknown>;
@@ -593,6 +593,13 @@ export interface SessionState {
   finalization_job?: SessionJob | null;
   last_finalization_job?: SessionJob | null;
   result: RunResult | null;
+  recovery?: {
+    generation: number;
+    trials: number;
+    target_generations: number;
+    can_resume: boolean;
+    restart_reason: string | null;
+  } | null;
 }
 
 export interface SessionSummary {

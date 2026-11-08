@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass
 from types import TracebackType
 from typing import Any, Literal, TypeVar
 
+from alphalineage.api.errors import ActionError
+
 ResourceProfile = Literal["light", "auto", "maximum", "custom"]
 
 MAX_TRAINING_WORKERS = 32
@@ -27,6 +29,7 @@ MEMORY_FRACTION = 0.25
 MIN_MEMORY_BUDGET = 256 * 1024 * 1024
 MAX_MEMORY_BUDGET = 4 * 1024 * 1024 * 1024
 _FALLBACK_AVAILABLE_MEMORY = 4 * 1024 * 1024 * 1024
+MIN_TRAINING_HEADROOM = 2 * 1024**3
 
 _T = TypeVar("_T")
 
@@ -44,7 +47,7 @@ def detected_cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def _windows_available_memory() -> int | None:
+def _windows_memory_headroom() -> tuple[int, int] | None:
     if os.name != "nt":
         return None
 
@@ -67,7 +70,12 @@ def _windows_available_memory() -> int | None:
         ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))  # type: ignore[attr-defined]
     except (AttributeError, OSError):
         return None
-    return int(status.available_physical) if ok else None
+    return (int(status.available_physical), int(status.available_page_file)) if ok else None
+
+
+def _windows_available_memory() -> int | None:
+    headroom = _windows_memory_headroom()
+    return headroom[0] if headroom is not None else None
 
 
 def available_memory_bytes() -> int:
@@ -85,6 +93,38 @@ def available_memory_bytes() -> int:
         except (OSError, TypeError, ValueError):
             pass
     return _FALLBACK_AVAILABLE_MEMORY
+
+
+def memory_headroom_bytes() -> tuple[int, int | None]:
+    """Available physical RAM and Windows system commit capacity (not page-file free space)."""
+    windows = _windows_memory_headroom()
+    return windows if windows is not None else (available_memory_bytes(), None)
+
+
+def ensure_training_memory() -> None:
+    """Reject a new search before loading recovery state or reserving an active job."""
+    physical, commit = memory_headroom_bytes()
+    if physical >= MIN_TRAINING_HEADROOM and (
+        commit is None or commit >= MIN_TRAINING_HEADROOM
+    ):
+        return
+    available = f"{physical / 1024**3:.2f} GiB RAM"
+    if commit is not None:
+        available += f" and {commit / 1024**3:.2f} GiB system memory headroom"
+    error = ActionError(
+        "low_training_memory",
+        f"Not enough memory to start or resume training: {available} available. "
+        "At least 2 GiB of each is required. Free memory in other applications, then retry; "
+        "your saved checkpoint is unchanged.",
+        action="Free memory and retry",
+        retryable=True,
+    )
+    error.payload["details"] = {
+        "available_memory_bytes": physical,
+        "commit_headroom_bytes": commit,
+        "required_bytes": MIN_TRAINING_HEADROOM,
+    }
+    raise error
 
 
 def worker_capacity(cpus: int | None = None) -> int:

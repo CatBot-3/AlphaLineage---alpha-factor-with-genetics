@@ -12,9 +12,10 @@ Drives the frontend progress view; the inner store is untouched so lineage is un
 from __future__ import annotations
 
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
+from alphalineage.core.gp import TrainingCancelled
 from alphalineage.core.tree import Node, to_json
 
 
@@ -43,6 +44,11 @@ class RunProgress:
         self._termination_reason: str | None = None
         self._tuning: dict[str, Any] | None = None
         self._novelty: dict[str, Any] | None = None
+        self._cancel: Callable[[], bool] | None = None
+
+    def bind_cancellation(self, cancel: Callable[[], bool]) -> None:
+        """Allow lengthy checkpoint reference rebuilding to observe the job's Stop flag."""
+        self._cancel = cancel
 
     def attach(self, inner: Any) -> None:
         """Set the inner recorder (the persisting LineageStore) calls are forwarded to."""
@@ -51,6 +57,13 @@ class RunProgress:
     def set_target(self, target_generations: int) -> None:
         with self._lock:
             self._target = target_generations
+
+    def restore_checkpoint(self, state: dict[str, Any], *, target_generations: int) -> None:
+        """Show committed progress while reference arrays are being rebuilt."""
+        with self._lock:
+            self._generation = int(state["generation"])
+            self._target = target_generations
+            self._history = [dict(entry) for entry in state.get("history", [])]
 
     def set_phase(self, phase: str) -> None:
         """Expose a coarse job phase without coupling the scorer to the API."""
@@ -77,6 +90,8 @@ class RunProgress:
             self._novelty = dict(novelty)
 
     def on_reference_preparation(self, done: int, total: int) -> None:
+        if self._cancel is not None and self._cancel():
+            raise TrainingCancelled("training cancelled during reference preparation")
         with self._lock:
             self._phase = "preparing_references"
             self._candidate_done = done

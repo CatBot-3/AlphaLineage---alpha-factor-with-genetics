@@ -121,6 +121,54 @@ afterEach(() => {
 });
 
 describe("TrainPanel (B2)", () => {
+  it("shows the shorter target and disables Resume while its submission is pending", async () => {
+    const interrupted = {
+      ...DONE_SESSION, segments: [], result: null,
+      recovery: { generation: 15, trials: 21916, target_generations: 50,
+        can_resume: true, restart_reason: null },
+      job: { id: "j1", status: "interrupted", progress: {
+        generation: 15, target_generations: 50, history: [], best: null, phase: "interrupted",
+      } },
+    };
+    getSession.mockResolvedValue(interrupted);
+    let finish!: (value: { session_id: string; job_id: string }) => void;
+    continueSession.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    render(<TrainPanel restoreSessionId="s1" />);
+    const resume = await screen.findByRole("button", { name: "Resume" });
+    fireEvent.change(screen.getByLabelText("Additional generations"), { target: { value: "25" } });
+    expect(screen.getByTestId("continue-target")).toHaveTextContent("generation 40");
+    fireEvent.click(resume);
+    expect(await screen.findByRole("button", { name: "Resuming…" })).toBeDisabled();
+    expect(screen.getByLabelText("Additional generations")).toBeDisabled();
+    getSession.mockResolvedValue({ ...interrupted, job: { ...interrupted.job, id: "j2",
+      status: "running", progress: { ...interrupted.job.progress,
+        target_generations: 40, phase: "preparing_data" } } });
+    finish({ session_id: "s1", job_id: "j2" });
+    await waitFor(() => expect(screen.getByTestId("progress-generation")).toHaveTextContent("15 / 40"));
+    expect(continueSession).toHaveBeenCalledWith("s1", { generations: 25 });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("offers resume from an interrupted checkpoint with the remaining generations", async () => {
+    getSession.mockResolvedValue({
+      ...DONE_SESSION,
+      segments: [], cumulative_trials: 21916, result: null,
+      recovery: { generation: 15, trials: 21916, target_generations: 50,
+        can_resume: true, restart_reason: null },
+      job: { id: "j1", status: "interrupted", progress: {
+        generation: 15, target_generations: 50, history: [], best: null, phase: "interrupted",
+      } },
+    });
+    continueSession.mockResolvedValue({ session_id: "s1", job_id: "j2" });
+    render(<TrainPanel restoreSessionId="s1" />);
+    const resume = await screen.findByRole("button", { name: "Resume" });
+    expect(screen.getByLabelText("Additional generations")).toHaveValue(35);
+    expect(screen.getByTestId("progress-generation")).toHaveTextContent("15 / 50");
+    fireEvent.click(resume);
+    await waitFor(() => expect(continueSession).toHaveBeenCalledWith("s1", { generations: 35 }));
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("shows why a run failed instead of pointing at a log the user cannot open", async () => {
     createSession.mockResolvedValue({ session_id: "s1", job_id: "j1" });
     getSession.mockResolvedValue(FAILED_SESSION);
@@ -175,6 +223,18 @@ describe("TrainPanel (B2)", () => {
     // instead of a dead error page, the notice + the form come back
     expect(await screen.findByTestId("train-notice")).toHaveTextContent(/no longer exists/i);
     expect(await screen.findByTestId("run-config-form")).toBeInTheDocument();
+  });
+
+  it("explains an interruption before the first checkpoint without offering resume", async () => {
+    getSession.mockResolvedValue({
+      ...DONE_SESSION,
+      job: { ...DONE_SESSION.job!, status: "interrupted" },
+      recovery: null,
+      result: null,
+    });
+    render(<TrainPanel restoreSessionId="s1" />);
+    expect(await screen.findByText(/stopped before a recovery checkpoint/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("continue-run")).not.toBeInTheDocument();
   });
 
   it("keeps a stopped pre-report session resumable without publishing it", async () => {

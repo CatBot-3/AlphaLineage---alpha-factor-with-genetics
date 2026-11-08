@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -26,7 +27,7 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 from dotenv import find_dotenv, load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -54,6 +55,7 @@ from alphalineage.api.resources import (
     ResolvedResources,
     ResourcePolicy,
     TrainingLeaseCancelled,
+    ensure_training_memory,
     resolve_resources,
     training_capabilities,
 )
@@ -3323,7 +3325,11 @@ def _formula_test_job_payload(job: Any) -> dict[str, Any]:
 
 # --- endpoints -------------------------------------------------------------------
 @app.get("/health")
-def health() -> dict[str, str]:
+def health(response: Response) -> dict[str, str]:
+    response.headers["X-AlphaLineage-Pid"] = str(os.getpid())
+    instance = os.environ.get("ALPHALINEAGE_INSTANCE_ID")
+    if instance:
+        response.headers["X-AlphaLineage-Instance"] = instance
     return {"status": "ok"}
 
 
@@ -4079,11 +4085,19 @@ def get_training_capabilities() -> dict[str, Any]:
     }
 
 
-@app.post("/runs", response_model=JobResponse)
+def _training_memory_preflight() -> None:
+    try:
+        ensure_training_memory()
+    except ActionError as exc:
+        raise HTTPException(status_code=503, detail=exc.payload) from exc
+
+
+@app.post("/runs", response_model=JobResponse, dependencies=[Depends(_training_memory_preflight)])
 def submit_run(
     req: RunRequest,
     panel: Panel | None = Depends(get_panel),  # noqa: B008
 ) -> JobResponse:
+    _training_memory_preflight()
     config = _gp_config_from_request(req.config)
     resources = _resolve_training_resources(req.resources, ic_method=config.ic_method)
     universe_definition = _universe_definition_pin(req.universe)
@@ -4789,16 +4803,26 @@ def _session_job_view(session: dict[str, Any]) -> dict[str, Any] | None:
             "termination_reason": job.termination_reason,
             "progress": job.progress.snapshot() if job.progress is not None else None,
         }
+    session = sessions.load_session(session["id"])
     persisted = session.get("last_job")
     if isinstance(persisted, dict):
         segments = session.get("segments") or []
         segment = segments[-1] if segments else {}
-        generation = next((item.get("generation_end") or item.get("gen_end")
-                           for item in reversed(segments)
-                           if item.get("generation_end") is not None or item.get("gen_end") is not None), 0)
-        return {**persisted, "progress": {"phase": persisted.get("status", "done"),
-            "generation": generation, "target_generations": segment.get("target_generation") or generation,
-            "history": [], "checkpoint": (sessions.session_dir(session["id"]) / "checkpoint.json").exists()}}
+        generation = max((int(item.get("gen_end") or item.get("generation_end") or 0)
+                          for item in segments), default=0)
+        recovery = sessions.recovery_view(session["id"])
+        return {
+            **persisted,
+            "progress": {
+                "phase": persisted.get("status", "done"),
+                "generation": recovery["generation"] if recovery else generation,
+                "target_generations": recovery["target_generations"] if recovery else (
+                    segment.get("target_generation") or generation
+                ),
+                "history": [],
+                "checkpoint": recovery is not None,
+            },
+        }
     return None
 
 
@@ -4846,11 +4870,12 @@ def _session_finalization_job_view(
     return normalized(dict(persisted)) if isinstance(persisted, dict) else None
 
 
-@app.post("/sessions")
+@app.post("/sessions", dependencies=[Depends(_training_memory_preflight)])
 def create_session(
     req: SessionCreateRequest,
     panel: Panel | None = Depends(get_panel),  # noqa: B008
 ) -> dict[str, str]:
+    _training_memory_preflight()
     name = _session_name(req)
     config = _gp_config_from_request(req.config)
     requested_resources = _requested_resources(req.resources)
@@ -4967,12 +4992,13 @@ def create_session(
     return {"session_id": session_id, "job_id": job_id}
 
 
-@app.post("/sessions/{session_id}/continue")
+@app.post("/sessions/{session_id}/continue", dependencies=[Depends(_training_memory_preflight)])
 def continue_session(
     session_id: str,
     req: SessionContinueRequest,
     panel: Panel | None = Depends(get_panel),  # noqa: B008
 ) -> dict[str, str]:
+    _training_memory_preflight()
     _load_persisted_formulas()
     if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="unknown session")
@@ -5085,8 +5111,7 @@ def continue_session(
     requested_universe = req.universe or session["universe"]
     universe_definition = _universe_definition_pin(requested_universe)
     universe = str(universe_definition["name"])
-    new_panel = _panel_for_universe(requested_universe, session["as_of"], panel)
-    _validate_panel_config(config, new_panel)
+    _validate_formula_budget(config)
     stored_universe_definition = session.get("universe_definition") or {}
     universe_changed = (
         universe != session["universe"]
@@ -5137,12 +5162,24 @@ def continue_session(
         target_generations=req.generations,
         resources=resources.to_dict(),
     )
+    summary = sessions.checkpoint_summary(session_id)
+    generation = summary["generation"] if summary else 0
+    progress.restore_checkpoint(
+        {"generation": generation}, target_generations=generation + req.generations
+    )
     cancel = threading.Event()
 
     def _task() -> dict[str, Any]:
         sessions.update_job_status(session_id, job_id, "running")
-        progress.set_phase("initializing")
+        progress.set_phase("preparing_data")
         try:
+            if cancel.is_set():
+                raise TrainingCancelled("training cancelled before data preparation")
+            new_panel = _panel_for_universe(requested_universe, session["as_of"], panel)
+            if cancel.is_set():
+                raise TrainingCancelled("training cancelled during data preparation")
+            _validate_panel_config(config, new_panel)
+            progress.set_phase("initializing")
             result = sessions.run_segment(
                 session_id,
                 job_id=job_id,
@@ -5200,6 +5237,7 @@ def list_sessions() -> list[dict[str, Any]]:
         rounds = sessions.list_rounds(session["id"])
         finalizations = sessions.list_finalizations(session["id"])
         last_job = session.get("last_job") or {}
+        recovery = sessions.checkpoint_summary(session["id"])
         current_generation = max(
             (
                 int(segment["gen_end"])
@@ -5218,7 +5256,8 @@ def list_sessions() -> list[dict[str, Any]]:
                 "segments": len(segments),
                 "rounds": len(rounds),
                 "latest_completed_round": rounds[-1]["index"] if rounds else None,
-                "current_generation": current_generation,
+                "current_generation": max(current_generation,
+                                          recovery["generation"] if recovery else 0),
                 "last_status": last_job.get("status")
                 or (segments[-1].get("status") if segments else "created"),
                 "has_checkpoint": (
@@ -5228,7 +5267,8 @@ def list_sessions() -> list[dict[str, Any]]:
                 "finalizations": len(finalizations),
                 "requested_generations": session.get("last_requested_generations")
                 or session.get("config", {}).get("generations"),
-                "cumulative_trials": session.get("cumulative_trials", 0),
+                "cumulative_trials": max(session.get("cumulative_trials", 0),
+                                         recovery["trials"] if recovery else 0),
                 "test_reads": session.get("test_reads", 0),
                 # A session's frozen label definition. Callers that offer its rounds for use
                 # need it to say when a signal is tradable; a missing key means legacy `close`.
@@ -5254,6 +5294,9 @@ def get_session(session_id: str) -> dict[str, Any]:
     # an already-cleared active reservation to a reconnecting client.
     session = sessions.load_session(session_id)
     session["rounds"] = sessions.list_rounds(session_id)
+    recovery = sessions.recovery_view(session_id)
+    if recovery is not None:
+        session["cumulative_trials"] = max(session["cumulative_trials"], recovery["trials"])
     result_path = sessions.session_dir(session_id) / "result.json"
     result = None
     if result_path.exists():
@@ -5268,6 +5311,7 @@ def get_session(session_id: str) -> dict[str, Any]:
         "job": job,
         "finalization_job": finalization_job,
         "result": result,
+        "recovery": recovery,
     }
 
 
@@ -6315,7 +6359,16 @@ def apply_agent_config(session_id: str, proposal_id: str) -> dict[str, Any]:
 # --- static frontend (single-image Docker serving) -------------------------------
 def _schedule_shutdown() -> None:
     """Exit the process shortly, after the HTTP response has flushed. Patched out in tests."""
-    threading.Timer(0.4, lambda: os._exit(0)).start()
+    logging.getLogger("uvicorn.error").info(
+        "Application shutdown requested through the API; PID %s", os.getpid()
+    )
+    def exit_app() -> None:
+        from alphalineage.api.launcher import record_shutdown
+
+        record_shutdown("API shutdown", 0)
+        logging.shutdown()
+        os._exit(0)
+    threading.Timer(0.4, exit_app).start()
 
 
 @app.post("/shutdown")

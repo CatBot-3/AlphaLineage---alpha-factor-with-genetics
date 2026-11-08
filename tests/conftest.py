@@ -14,6 +14,14 @@ os.environ.setdefault("ALPHALINEAGE_SKIP_DOTENV", "1")
 
 
 @pytest.fixture(autouse=True)
+def training_memory_headroom(monkeypatch):
+    """Synthetic training must not depend on other applications open on the test machine."""
+    from alphalineage.api import resources
+
+    monkeypatch.setattr(resources, "memory_headroom_bytes", lambda: (8 << 30, 8 << 30))
+
+
+@pytest.fixture(autouse=True)
 def temp_data_dir(tmp_path, monkeypatch):
     """Redirect the local data store to a per-test temp directory."""
     data_dir = tmp_path / "data_cache"

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  ConnectionError,
   clearData,
   continueSession,
   createFinalizationPlan,
@@ -50,6 +51,28 @@ afterEach(() => {
 });
 
 describe("session client", () => {
+  it("classifies a lost submission response without replaying the request", async () => {
+    const fetchSpy = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    globalThis.fetch = fetchSpy;
+    await expect(createSession({ as_of: "2026-07-26" })).rejects.toBeInstanceOf(ConnectionError);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds a hung session read and clears its timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      globalThis.fetch = vi.fn((_url, init) => new Promise<Response>((_resolve, reject) => {
+        init!.signal!.addEventListener("abort", () => reject(new DOMException("timeout", "AbortError")));
+      }));
+      const assertion = expect(getSession("overnight")).rejects.toBeInstanceOf(ConnectionError);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("loads benchmark metadata and an explicitly bounded cached series", async () => {
     let fetchSpy = mockFetch([{ id: "sp500", symbol: "^GSPC" }]);
     await listBenchmarks();

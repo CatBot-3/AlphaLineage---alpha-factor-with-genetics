@@ -79,6 +79,37 @@ export class ApiError extends Error {
   }
 }
 
+export class ConnectionError extends Error {
+  constructor(message = "Connection lost—reconnecting.") {
+    super(message);
+    this.name = "ConnectionError";
+  }
+}
+
+async function sessionRequest<T>(path: string, action: string, body?: unknown): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    return await jsonOrThrow<T>(await fetch(`${BASE}${path}`, {
+      signal: controller.signal,
+      ...(body === undefined ? {} : {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    }), action);
+  } catch (error) {
+    const name = error && typeof error === "object" && "name" in error ? error.name : null;
+    if (error instanceof TypeError || name === "TypeError" || name === "AbortError") {
+      throw new ConnectionError(body === undefined ? undefined :
+        "The submission response was lost. Check your saved session before trying again.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function jsonOrThrow<T>(res: Response, action: string): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -473,18 +504,18 @@ export interface SessionHandle {
 }
 
 export async function createSession(req: SessionCreateRequest): Promise<SessionHandle> {
-  return jsonOrThrow(await POST("/sessions", req), "create session");
+  return sessionRequest("/sessions", "create session", req);
 }
 
 export async function continueSession(
   sessionId: string,
   req: SessionContinueRequest,
 ): Promise<SessionHandle> {
-  return jsonOrThrow(await POST(`/sessions/${encodeURIComponent(sessionId)}/continue`, req), "continue session");
+  return sessionRequest(`/sessions/${encodeURIComponent(sessionId)}/continue`, "continue session", req);
 }
 
 export async function getSession(sessionId: string): Promise<SessionState> {
-  return jsonOrThrow(await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`), "load session");
+  return sessionRequest(`/sessions/${encodeURIComponent(sessionId)}`, "load session");
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {

@@ -852,3 +852,39 @@ def test_report_summary_cache_roundtrip_and_context_invalidation(signal_panel, t
     )
     assert changed != context
     assert sessions._load_report_cache(path, changed) == {}
+
+
+def test_report_cache_saves_periodically_and_never_fails_the_caller(tmp_path, monkeypatch):
+    from alphalineage.api import sessions
+
+    path = tmp_path / "report_stats.json"
+    saved: list[int] = []
+
+    def save(entries):
+        saved.append(len(entries))
+        return sessions._try_save_report_cache(path, "ctx", entries)
+
+    cache = sessions._PeriodicReportCache({}, save, interval_s=0.0)
+    summary = {
+        "n_obs": 2,
+        "block_counts": [1, 1],
+        "block_sums": [0.1, 0.2],
+        "block_sum_squares": [0.01, 0.04],
+        "sharpe": 1.0,
+        "constant_value": None,
+    }
+    cache["a"] = summary
+    cache["b"] = summary
+    assert saved == [1, 2]
+    assert sessions._load_report_cache(path, "ctx") == {"a": summary, "b": summary}
+
+    cache.flush()  # nothing new since the last save
+    assert saved == [1, 2]
+
+    def out_of_memory(*_args, **_kwargs):
+        raise MemoryError
+
+    monkeypatch.setattr(sessions, "_save_report_cache", out_of_memory)
+    assert sessions._try_save_report_cache(path, "ctx", {"a": summary}) is False
+    # The previous complete file is left in place.
+    assert sessions._load_report_cache(path, "ctx") == {"a": summary, "b": summary}

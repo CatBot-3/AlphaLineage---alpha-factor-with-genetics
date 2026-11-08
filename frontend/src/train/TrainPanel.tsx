@@ -41,7 +41,7 @@ export function TrainPanel({
   // The local controller keeps TrainPanel independently testable and compatible for embeds.
   const localController = useSession(controller ? undefined : onComplete);
   const {
-    sessionId, state, error, notice, phase, start, cont, stop, attach, reset,
+    sessionId, state, error, notice, phase, connection, submitting, start, cont, stop, attach, reset,
   } = controller ?? localController;
   const [moreGenerations, setMoreGenerations] = useState(5);
   const [overrideResources, setOverrideResources] = useState(false);
@@ -63,8 +63,8 @@ export function TrainPanel({
 
   // Surface whether a search is in progress (and which session) so Quit can warn / stop it.
   useEffect(() => {
-    onRunningChange?.(phase === "running", sessionId);
-  }, [phase, sessionId, onRunningChange]);
+    onRunningChange?.(phase === "running" || Boolean(submitting), sessionId);
+  }, [phase, submitting, sessionId, onRunningChange]);
 
   useEffect(() => {
     let active = true;
@@ -94,7 +94,10 @@ export function TrainPanel({
   const running = phase === "running";
   // A run can stop before its first report exists; its persisted checkpoint/session is still
   // valid and must remain resumable.
-  const done = phase === "done" || phase === "stopped";
+  const interrupted = phase === "interrupted";
+  const done = phase === "done" || phase === "stopped" ||
+    ((interrupted || phase === "failed") && state?.recovery?.can_resume === true);
+  const connected = connection === "connected";
   const hasCompletedRound = Boolean(
     state?.rounds?.length || state?.result?.selection || state?.result?.report,
   );
@@ -104,6 +107,11 @@ export function TrainPanel({
   const reportCancelled = phase === "stopped" && Boolean(lastSegment?.report_cancelled);
 
   useEffect(() => {
+    if (interrupted && state?.recovery) {
+      setMoreGenerations(Math.max(1,
+        state.recovery.target_generations - state.recovery.generation));
+      return;
+    }
     if (!lastSegment) return;
     const generationDelta =
       Number.isFinite(lastSegment.gen_end) && Number.isFinite(lastSegment.gen_start)
@@ -113,7 +121,8 @@ export function TrainPanel({
       lastSegment.requested_generations ??
       Math.max(1, generationDelta);
     setMoreGenerations(previousSize);
-  }, [lastSegment?.index, lastSegment?.requested_generations]);
+  }, [interrupted, state?.recovery?.generation, state?.recovery?.target_generations,
+      lastSegment?.index, lastSegment?.requested_generations]);
 
   function handleStart(req: RunRequestForm) {
     void start({
@@ -129,6 +138,19 @@ export function TrainPanel({
   return (
     <div className="train-panel" data-testid="train-panel">
       {notice && <p className="surface-message" data-testid="train-notice">{notice}</p>}
+      {connection === "reconnecting" && (
+        <p className="surface-message" role="status" data-testid="connection-notice">
+          Connection lost—reconnecting. Your last reported progress is shown below.
+        </p>
+      )}
+      {interrupted && (
+        <p className="surface-message" role="status">
+          {state?.recovery?.can_resume
+            ? "The app stopped during training. Your saved checkpoint is available to resume."
+            : state?.recovery?.restart_reason ??
+              "The app stopped before a recovery checkpoint was available. Start a new session with the saved settings."}
+        </p>
+      )}
 
       {recentSessions.length > 0 && (
         <label className="field recent-session-picker">
@@ -159,7 +181,7 @@ export function TrainPanel({
           initialSeedIds={seedIds}
           initialSession={defaultSession}
           onStart={handleStart}
-          disabled={running}
+          disabled={running || !connected || Boolean(submitting)}
           onEditUniverse={onOpenUniverseEditor}
           onOpenDataSync={onOpenDataSync}
           onOpenFormulaEditor={onOpenFormulaEditor}
@@ -171,11 +193,12 @@ export function TrainPanel({
       {sessionId && (
         <section className="train-status">
           <div className="train-status-head">
-            <ProgressView progress={state?.job?.progress ?? null} phase={phase} onStop={stop} />
+            <ProgressView progress={state?.job?.progress ?? null} phase={phase} onStop={stop} connected={connected} />
             <button
               type="button"
               className="ghost"
               data-testid="new-session"
+              disabled={Boolean(submitting)}
               onClick={() => {
                 if (state?.segments.length) setDefaultSession(state);
                 reset();
@@ -223,7 +246,7 @@ export function TrainPanel({
               <h4>
                 {restartRequired
                   ? "Restart under the corrected training semantics"
-                  : "Continue training from this generation"}
+                  : interrupted ? "Resume from the saved generation" : "Continue training from this generation"}
               </h4>
               {restartRequired && (
                 <p className="oos-warning" role="alert">
@@ -240,9 +263,14 @@ export function TrainPanel({
                   min={1}
                   aria-label="Additional generations"
                   value={moreGenerations}
+                  disabled={!connected || Boolean(submitting)}
                   onChange={(e) => setMoreGenerations(Number(e.target.value))}
                 />
               </label>
+              <p className="hint" data-testid="continue-target">
+                Will finish at generation {(state?.recovery?.generation ??
+                  state?.job?.progress?.generation ?? 0) + moreGenerations}.
+              </p>
               <label className="seed-option resource-override-toggle">
                 <input
                   type="checkbox"
@@ -265,6 +293,7 @@ export function TrainPanel({
                   type="button"
                   className="ghost"
                   data-testid="continue-run"
+                  disabled={!connected || Boolean(submitting)}
                   onClick={() =>
                     void cont({
                       generations: moreGenerations,
@@ -272,7 +301,7 @@ export function TrainPanel({
                     })
                   }
                 >
-                  Continue
+                  {submitting === "continue" ? "Resuming…" : interrupted ? "Resume" : "Continue"}
                 </button>
                 {hasCompletedRound && (
                   <button type="button" className="primary-action" onClick={onOpenDashboard}>

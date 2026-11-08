@@ -8,10 +8,12 @@ export function ProgressView({
   progress,
   phase,
   onStop,
+  connected = true,
 }: {
   progress: ProgressSnapshot | null;
   phase: string;
   onStop: () => void;
+  connected?: boolean;
 }) {
   const generation = progress?.generation ?? 0;
   const target = progress?.target_generations ?? 0;
@@ -28,7 +30,7 @@ export function ProgressView({
       ? Math.round((generation / target) * 100)
       : 0;
   const canStop =
-    phase === "running" &&
+    connected && phase === "running" &&
     !["finalizing", "stopping", "done", "stopped", "failed"].includes(activePhase);
 
   return (
@@ -76,7 +78,7 @@ export function ProgressView({
         <p className="progress-detail" data-testid="candidate-progress">
           {activePhase === "preparing_references" ? "preparing references" : "scoring candidates"} {progress?.candidate_done ?? 0} / {progress?.candidate_total}
           {progress?.factors_per_second
-            ? ` · ${progress.factors_per_second.toFixed(1)} factors/s`
+            ? ` · ${progress.factors_per_second.toLocaleString(undefined, { maximumSignificantDigits: 2 })} factors/s`
             : ""}
         </p>
       )}
